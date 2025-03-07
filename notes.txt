@@ -1,0 +1,9 @@
+https://medium.com/@clairenyz/attention-based-convolutional-neural-network-a719693058a7
+
+# Adding Self Attention to a convolutionalNeural Network 
+https://www.youtube.com/watch?v=-N-NBerVBrQ&t=22s
+
+https://github.com/LukeDitria/pytorch_tutorials/blob/main/section13_attention/solutions/Pytorch3_CNN_Self_Attention.ipynb
+
+# Great Resource for understanding attention
+https://www.youtube.com/watch?v=mMa2PmYJlCo
