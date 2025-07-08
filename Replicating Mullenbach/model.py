@@ -1,5 +1,7 @@
 import torch.nn            as nn
 import torch.nn.functional as F
+import torch
+from gensim.models import Word2Vec
 
 from math import floor
 
@@ -24,3 +26,22 @@ class ConvAttnPool(nn.Module):
         m     = alpha.matmul(x)
         y     = self.final.weight.mul(m).sum(dim=2).add(self.final.bias)
         return y, alpha
+    
+
+def GenerateModel():
+    # This requires the other .w2v files as well.
+    model = Word2Vec.load('processed_full.w2v')
+    vocab_size, embed_size = model.wv.vectors.shape
+    # print(f'{vocab_size=}', f'{embed_size=}')
+    embedding_table = torch.from_numpy(model.wv.vectors).type(torch.float32)
+    embedding_table = torch.concat([embedding_table,torch.zeros(size = (1,embed_size))], dim = 0)
+    # print(f'{vocab_size=}', f'{embed_size=}') # Keep the since vocab_size refers to the last index, our padding index)
+
+    return ConvAttnPool(
+            drop_out       = 0.2,
+            embed_table   = embedding_table,
+            vocab_size    = vocab_size,
+            num_of_filters = 15, # Filters in paper -> 10
+            label_space    = 50, 
+            kernel_size    = 5,
+            embed_d        = embed_size)
