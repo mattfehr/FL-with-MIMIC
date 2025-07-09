@@ -1,9 +1,8 @@
+from gensim.models import Word2Vec
 import torch.nn            as nn
 import torch.nn.functional as F
-import torch
-from gensim.models import Word2Vec
-
 from math import floor
+import torch
 
 class ConvAttnPool(nn.Module):
     def __init__(self, label_space, embed_table,vocab_size, embed_d, num_of_filters, kernel_size,drop_out):
@@ -28,7 +27,7 @@ class ConvAttnPool(nn.Module):
         return y, alpha
     
 
-def GenerateModel():
+def GenerateModel(num_of_filters = 15,kernel_size = 5):
     # This requires the other .w2v files as well.
     model = Word2Vec.load('processed_full.w2v')
     vocab_size, embed_size = model.wv.vectors.shape
@@ -41,7 +40,7 @@ def GenerateModel():
             drop_out       = 0.2,
             embed_table   = embedding_table,
             vocab_size    = vocab_size,
-            num_of_filters = 15, # Filters in paper -> 10
+            num_of_filters = num_of_filters, # Filters in paper -> 10
             label_space    = 50, 
-            kernel_size    = 5,
+            kernel_size    = kernel_size,
             embed_d        = embed_size)
