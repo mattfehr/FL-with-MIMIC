@@ -5,8 +5,16 @@ from math import floor
 import torch
 
 class ConvAttnPool(nn.Module):
-    def __init__(self, label_space, embed_table,vocab_size, embed_d, num_of_filters, kernel_size,drop_out):
+    def __init__(self, label_space = 50, embed_table = None,vocab_size = None, embed_d = None, num_of_filters = 10, kernel_size = 3, drop_out = 0.2):
         super().__init__()
+        #
+        model = Word2Vec.load('/home/drew/FL-with-MIMIC/Replicating Mullenbach/processed_full.w2v')
+        vocab_size, embed_d = model.wv.vectors.shape
+        # print(f'{vocab_size=}', f'{embed_size=}')
+        embed_table = torch.from_numpy(model.wv.vectors).type(torch.float32)
+        embed_table = torch.concat([embed_table,torch.zeros(size = (1,embed_d))], dim = 0)
+
+        #
         #self.embed = nn.Embedding(num_embeddings = num_of_words ,embedding_dim=embed_d, padding_idx=0)
         self.embed  = nn.Embedding.from_pretrained(embeddings=embed_table,padding_idx=vocab_size)
         self.conv  = nn.Conv1d(embed_d, num_of_filters, kernel_size = kernel_size, padding = int(floor(kernel_size//2)))
@@ -38,8 +46,8 @@ def GenerateModel(num_of_filters = 15,kernel_size = 5):
 
     return ConvAttnPool(
             drop_out       = 0.2,
-            embed_table   = embedding_table,
-            vocab_size    = vocab_size,
+            embed_table    = embedding_table,
+            vocab_size     = vocab_size,
             num_of_filters = num_of_filters, # Filters in paper -> 10
             label_space    = 50, 
             kernel_size    = kernel_size,
