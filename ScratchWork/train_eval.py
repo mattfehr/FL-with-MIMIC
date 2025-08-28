@@ -5,7 +5,7 @@ import torch
 def train_model(model,device, optimizer ,data_loader, loss_module, num_epochs=100):
     model.train()
     train_losses  = []
-    for epoch in tqdm(range(num_epochs)):
+    for epoch in (range(num_epochs)):
         for data_inputs, data_labels in data_loader:
             # Put training data into GPU
             data_inputs = data_inputs.to(device)
