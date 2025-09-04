@@ -8,7 +8,7 @@ class ConvAttnPool(nn.Module):
     def __init__(self, label_space = 50, embed_table = None,vocab_size = None, embed_d = None, num_of_filters = 10, kernel_size = 3, drop_out = 0.2):
         super().__init__()
         #
-        model = Word2Vec.load('/home/drew/FL-with-MIMIC/Replicating Mullenbach/processed_full.w2v')
+        model = Word2Vec.load('processed_full.w2v')
         vocab_size, embed_d = model.wv.vectors.shape
         # print(f'{vocab_size=}', f'{embed_size=}')
         embed_table = torch.from_numpy(model.wv.vectors).type(torch.float32)
