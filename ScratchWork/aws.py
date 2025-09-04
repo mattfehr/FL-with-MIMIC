@@ -1,7 +1,7 @@
-import sagemaker
+from sagemaker.inputs     import TrainingInput
 from sagemaker.tensorflow import TensorFlow
+import sagemaker
 import boto3
-from sagemaker.inputs import TrainingInput
  
 # Define your SageMaker session and role
 sagemaker_session = sagemaker.Session()
