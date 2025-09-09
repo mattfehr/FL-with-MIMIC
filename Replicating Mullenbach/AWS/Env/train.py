@@ -89,7 +89,8 @@ def federate_model(config: dict):
         epochs
         rounds
     """
-    curr_dir = os.path.split(os.getcwd())[0]
+    # curr_dir = os.path.split(os.getcwd())[0]
+    curr_dir = "/home/drew/FL-with-MIMIC/Replicating Mullenbach/AWS"
     model_param_path = os.path.join(curr_dir,"Model",'processed_full.w2v')
     # Training Data
     X_train = torch.load(os.path.join(curr_dir,"Data","X_train.pt"))
