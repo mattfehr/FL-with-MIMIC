@@ -2,7 +2,7 @@ import subprocess
 # subprocess.check_call(["pip", "install", "gensim"])
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from gensim.models    import Word2Vec
-
+from tqdm import tqdm
 import torch.nn.functional as F
 import torch.nn as nn
 import argparse
@@ -109,7 +109,7 @@ def federate_model(config: dict):
     Global_Model = GenerateModel(table_path     = model_param_path,
                                  num_of_filters = config['n_filters'], 
                                  kernel_size    = config['window_size'])
-    for rnds in range(config['rounds']):
+    for rnds in (range(config['rounds'])):
         client = GenerateModel(table_path     = model_param_path,
                                num_of_filters = config['n_filters'], 
                                kernel_size    = config['window_size'])
