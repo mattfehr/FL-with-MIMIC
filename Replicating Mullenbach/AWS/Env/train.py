@@ -78,7 +78,7 @@ def GenerateModel(table_path, num_of_filters = 15,kernel_size = 5):
             kernel_size    = kernel_size
             )
 
-def federate_model(config: dict):
+def federate_model(config: dict, model_param: dict):
     """
     config
         batch_size
@@ -108,6 +108,10 @@ def federate_model(config: dict):
     Global_Model = GenerateModel(table_path     = model_param_path,
                                  num_of_filters = config['n_filters'], 
                                  kernel_size    = config['window_size'])
+    if model_param:
+        # Loads the pretrained model before starting training.
+        Global_Model.load_state_dict(model_param)
+
     for rnds in (range(config['rounds'])):
         client = GenerateModel(table_path     = model_param_path,
                                num_of_filters = config['n_filters'], 

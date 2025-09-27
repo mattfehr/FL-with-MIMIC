@@ -24,7 +24,7 @@ def load_data():
     return DataLoader(TensorDataset(X_val,Y_val),batch_size=32,shuffle=False)
 
 def train_model(config):
-    trained_model = federate_model(config)
+    trained_model = federate_model(config,None)
     working_dir  = "/home/drew/FL-with-MIMIC/Replicating Mullenbach/AWS" 
     model = GenerateModel(table_path = os.path.join(working_dir,"Model","processed_full.w2v"),
                       num_of_filters = config['n_filters'],
@@ -45,18 +45,19 @@ if __name__ == '__main__':
     config = {
             "batch_size" : tune.choice([8, 16, 32]),
             "lr"         : tune.loguniform(0.0001, 0.1),
-            "n_filters"  : tune.choice([i for i in range(5,25)]),
+            "n_filters"  : tune.choice([i for i in range(5,21)]),
             "window_size": tune.choice([3,4,5,6,7]),
             "epochs"     : tune.choice([2,3,4,5,6]),
-            "rounds"     : 1_000
+            "rounds"     : 2_500
     }
     scheduler = ASHAScheduler(
-        metric = "auc_macro",
+        metric = "f1_macro",
         mode   = "max",
-        max_t  = 14400, # Max time in seconds
+        max_t  = 24400,
         grace_period     = 100,
         reduction_factor = 2
     )
+    
 
     result = tune.run(
         partial(train_model),
@@ -65,5 +66,5 @@ if __name__ == '__main__':
         num_samples = 200, # Number of different combinations
         scheduler   = scheduler,
         storage_path="/home/drew/FL-with-MIMIC/Replicating Mullenbach/AWS/S3_Bucket/results",
-        resume=True
+        resume=False
     )
