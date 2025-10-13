@@ -29,7 +29,7 @@ def client_update(model : nn.Module ,
     model.train()
     
     optimizer = torch.optim.Adam(model.parameters(), lr = lr, betas =  (0.9,0.99)) #(0.1,0.3)
-    loss_fn   = nn.CrossEntropyLoss()
+    loss_fn   = nn.BCEWithLogitsLoss()
 
     for _ in (range(epochs)):
         for X_batch, y_batch in train_loader:
@@ -112,13 +112,14 @@ def federate_model(config: dict, model_param: dict):
         # Loads the pretrained model before starting training.
         Global_Model.load_state_dict(model_param)
 
-    for rnds in (range(config['rounds'])):
-        client = GenerateModel(table_path     = model_param_path,
+    client = GenerateModel(table_path     = model_param_path,
                                num_of_filters = config['n_filters'], 
                                kernel_size    = config['window_size'])
-        client.load_state_dict(Global_Model.state_dict())
+    
+    for rnds in (range(config['rounds'])):
         c_parameters = []
         for c_idx in range(3): # Static since we have n = 3 clients
+            client.load_state_dict(Global_Model.state_dict())
             c_param = client_update(model  = client,
                                     epochs = config['epochs'],
                                     lr     = config['lr'],

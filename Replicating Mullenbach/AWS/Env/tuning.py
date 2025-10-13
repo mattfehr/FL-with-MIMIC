@@ -14,8 +14,8 @@ import os
 
 
 working_dir  = "/home/drew/FL-with-MIMIC/Replicating Mullenbach/AWS" 
-X_test = torch.load(os.path.join(working_dir,"Data","X_test.pt"))
-Y_test = torch.load(os.path.join(working_dir,"Data","Y_test.pt"))
+# X_test = torch.load(os.path.join(working_dir,"Data","X_test.pt"))
+# Y_test = torch.load(os.path.join(working_dir,"Data","Y_test.pt"))
 
 def load_data():
     working_dir  = "/home/drew/FL-with-MIMIC/Replicating Mullenbach/AWS" 
@@ -48,7 +48,7 @@ if __name__ == '__main__':
             "n_filters"  : tune.choice([i for i in range(5,21)]),
             "window_size": tune.choice([3,4,5,6,7]),
             "epochs"     : tune.choice([2,3,4,5,6]),
-            "rounds"     : 2_500
+            "rounds"     : 2_000
     }
     scheduler = ASHAScheduler(
         metric = "f1_macro",
@@ -63,7 +63,7 @@ if __name__ == '__main__':
         partial(train_model),
         resources_per_trial={"cpu": 5, "gpu": 1},
         config      = config,
-        num_samples = 200, # Number of different combinations
+        num_samples = 50, # Number of different combinations
         scheduler   = scheduler,
         storage_path="/home/drew/FL-with-MIMIC/Replicating Mullenbach/AWS/S3_Bucket/results",
         resume=False
