@@ -311,12 +311,37 @@ def compute_pos_weight(train_loader, n_labels):
     return (neg / pos.clamp_min(1.0)).float()
 
 # %%
+# Create focal loss function
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction="mean"):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        probs = torch.sigmoid(logits)
+        pt = probs * targets + (1 - probs) * (1 - targets)
+        focal_term = (1 - pt).pow(self.gamma)
+
+        if self.alpha is not None:
+            alpha_term = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+            focal_term = alpha_term * focal_term
+
+        loss = focal_term * bce_loss
+        return loss.mean() if self.reduction == "mean" else loss.sum()
+
+
+# %%
 def client_update(
     model: nn.Module,
     train_loader: DataLoader,
     epochs: int = 1,
     lr: float = 0.1,
-    device: str = "cpu"
+    device: str = "cpu",
+    use_focal: bool = False
 ) -> tuple[float, dict]:
     """
     Perform local training for a single client using weighted BCE loss.
@@ -342,7 +367,12 @@ def client_update(
 
     # ---- Optimizer and Loss ----
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.99))
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # ---- Choose between BCE and Focal ----
+    if use_focal:
+        alpha = (pos_weight / pos_weight.max()).to(device)
+        loss_fn = FocalLoss(alpha=alpha, gamma=2.0)
+    else:
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     # ---- Local Training ----
     for _ in range(epochs):
@@ -398,7 +428,8 @@ config = {
     "n_filters": 21,
     "window_size": 6,
     "epochs": 3,            #how many times clint will go through its own local dataset each round
-    "rounds": 100           #for centralized, this is the epochs
+    "rounds": 100,           #for centralized, this is the epochs
+    "use_focal" : True
 }
 
 model_param_path = os.path.join("..", "Model", "processed_full.w2v")
@@ -677,7 +708,8 @@ for rnd in tqdm(range(config["rounds"]), colour="blue"):
             train_loader=loader,
             epochs=config["epochs"],
             lr=config["lr"],
-            device=device
+            device=device,
+            use_focal=config("use_focal")
         )
 
         client_params.append(c_param)
@@ -873,7 +905,11 @@ cent_max_f1_micro = 0.0
 
 # ---- Initialize optimizer and loss ----
 optimizer = torch.optim.Adam(central_model.parameters(), lr=central_config["lr"], betas=(0.9, 0.99))
-loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+if central_config.get("use_focal", False):
+    alpha = (pos_weight / pos_weight.max()).to(device)
+    loss_fn = FocalLoss(alpha=alpha, gamma=2.0)
+else:
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 # ---- Centralized training loop ----
 central_config["rounds"] = 100
