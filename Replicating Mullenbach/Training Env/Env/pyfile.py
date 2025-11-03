@@ -211,7 +211,7 @@ def GenerateModel(table_path: str, num_of_filters: int = 15, kernel_size: int = 
 
 
 # Example: Instantiate the model
-model = GenerateModel(table_path=os.path.join("..", "Model", "processed_full.w2v"))
+model = GenerateModel(table_path=os.path.join("..", "Model", "processed_full.w2v")).to(device)
 model
 
 # %% [markdown]
@@ -341,7 +341,8 @@ def client_update(
     epochs: int = 1,
     lr: float = 0.1,
     device: str = "cpu",
-    use_focal: bool = False
+    use_focal: bool = False,
+    gamma: float = 2.0
 ) -> tuple[float, dict]:
     """
     Perform local training for a single client using weighted BCE loss.
@@ -370,7 +371,7 @@ def client_update(
     # ---- Choose between BCE and Focal ----
     if use_focal:
         alpha = (pos_weight / pos_weight.max()).to(device)
-        loss_fn = FocalLoss(alpha=alpha, gamma=2.0)
+        loss_fn = FocalLoss(alpha=alpha, gamma=gamma)
     else:
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
@@ -419,6 +420,9 @@ print("🔧 Example Parameter (embed.weight):\n", local_params["embed.weight"])
 # Metrics are saved incrementally to `../History/logs/metric_history.json`, and the best models (by AUC and F1) are checkpointed.
 # 
 
+# %% [markdown]
+# ### Set up
+
 # %%
 # Config
 
@@ -429,7 +433,8 @@ config = {
     "window_size": 6,
     "epochs": 3,            #how many times clint will go through its own local dataset each round
     "rounds": 100,           #for centralized, this is the epochs
-    "use_focal" : True
+    "use_focal" : True,
+    "gamma" : 2.0
 }
 
 model_param_path = os.path.join("..", "Model", "processed_full.w2v")
@@ -496,6 +501,9 @@ with torch.no_grad():
     prior_logit = torch.log(p / (1 - p))
     Global_Model.final.bias.copy_(prior_logit.clamp(-10, 10))
     client.final.bias.copy_(prior_logit.clamp(-10, 10))  # for symmetry
+
+# %% [markdown]
+# ### Eval stuff
 
 # %%
 # Auto tuning to find best global threshold
@@ -676,6 +684,73 @@ def eval_model(
     return avg_loss, metrics
 
 
+# %% [markdown]
+# ### Gamma tuning Experiment
+
+# %%
+# --- Quick gamma tuning experiment ---
+gamma_values = [1.0, 1.5, 2.0, 2.5, 3.0]
+results = {}
+
+for gamma in gamma_values:
+    print(f"\n===== Testing gamma={gamma} =====")
+    config["gamma"] = gamma
+
+    # Reinitialize model fresh each run
+    model = GenerateModel(
+        table_path=model_param_path,
+        num_of_filters=config["n_filters"],
+        kernel_size=config["window_size"]
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], betas=(0.9, 0.99))
+
+    alpha = (pos_weight / pos_weight.max()).to(device)
+    loss_fn = FocalLoss(alpha=alpha, gamma=gamma)
+
+    # --- Short training run ---
+    for epoch in range(5):  # small number for speed
+        model.train()
+        total_loss = 0.0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            preds, _ = model(X_batch)
+            loss = loss_fn(preds, y_batch)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        avg_train_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/5 | Train Loss: {avg_train_loss:.4f}")
+
+    # --- Evaluate F1 on validation set ---
+    _, per_label_thr = find_best_thresholds_per_label(model, val_loader, device)
+    val_loss, metrics = eval_model(model, device, val_loader, per_label_thr=per_label_thr)
+    results[gamma] = metrics["f1_micro"]
+
+print("\nGamma tuning results:")
+for g, f1 in results.items():
+    print(f"γ={g}: F1_micro={f1:.4f}")
+
+best_gamma = max(results, key=results.get)
+print(f"\nBest gamma: {best_gamma} (F1_micro={results[best_gamma]:.4f})")
+config["gamma"] = best_gamma
+
+# %%
+# Gamma plot
+
+plt.figure(figsize=(8, 4))
+plt.plot(list(results.keys()), list(results.values()), marker='o')
+plt.title("Gamma vs F1_micro")
+plt.xlabel("Gamma (γ)")
+plt.ylabel("F1_micro")
+plt.grid(alpha=0.3)
+plt.show()
+
+# %% [markdown]
+# ### Main training loop
+
 # %%
 # Federated history setup
 
@@ -709,7 +784,7 @@ for rnd in tqdm(range(config["rounds"]), colour="blue"):
             epochs=config["epochs"],
             lr=config["lr"],
             device=device,
-            use_focal=config("use_focal")
+            use_focal=config["use_focal"]
         )
 
         client_params.append(c_param)
@@ -907,7 +982,7 @@ cent_max_f1_micro = 0.0
 optimizer = torch.optim.Adam(central_model.parameters(), lr=central_config["lr"], betas=(0.9, 0.99))
 if central_config.get("use_focal", False):
     alpha = (pos_weight / pos_weight.max()).to(device)
-    loss_fn = FocalLoss(alpha=alpha, gamma=2.0)
+    loss_fn = FocalLoss(alpha=alpha, gamma=central_config.get("gamma", 2.0))
 else:
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
