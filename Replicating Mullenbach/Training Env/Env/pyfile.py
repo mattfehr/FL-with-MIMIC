@@ -301,7 +301,6 @@ print("\n🌐 Global Model (After FedAvg):\n", g_param["layer1"])
 # %%
 # fix multi label collapsing to all 0s problem by having positive class weighting
 def compute_pos_weight(train_loader, n_labels):
-    import torch
     pos = torch.zeros(n_labels)
     total = 0
     for _, y in train_loader:
@@ -1079,11 +1078,13 @@ plt.show()
 
 # %%
 for X_batch, y_batch in train_loader:
-    print("Pred shape:", model(X_batch)[0].shape)
+    X_batch = X_batch.to(device)
+    y_batch = y_batch.to(device)
+    preds, _ = model(X_batch)
+    print("Pred shape:", preds.shape)
     print("Label shape:", y_batch.shape)
     print("Unique label values:", torch.unique(y_batch))
     break
-
 
 # %%
 # Validaton Metrics Overview
