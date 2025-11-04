@@ -369,7 +369,8 @@ def client_update(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.99))
     # ---- Choose between BCE and Focal ----
     if use_focal:
-        alpha = (pos_weight / pos_weight.max()).to(device)
+         # Smooth alpha to prevent extreme imbalance
+        alpha = torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device)
         loss_fn = FocalLoss(alpha=alpha, gamma=gamma)
     else:
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -433,7 +434,7 @@ config = {
     "epochs": 3,            #how many times clint will go through its own local dataset each round
     "rounds": 100,           #for centralized, this is the epochs
     "use_focal" : True,
-    "gamma" : 2.0
+    "gamma" : 2.5
 }
 
 model_param_path = os.path.join("..", "Model", "processed_full.w2v")
@@ -598,7 +599,10 @@ def eval_model(
     tune_threshold=False,
     fixed_thr=0.3,
     sigmoid=False,
-    per_label_thr=None  # <-- new argument
+    per_label_thr=None,  # <-- new argument
+    use_focal=False,
+    alpha=None,
+    gamma=2.5
 ):
     """
     Evaluate model performance on a given dataset using BCEWithLogitsLoss.
@@ -610,7 +614,10 @@ def eval_model(
     model.eval()
     model.to(device)
 
-    loss_fn = nn.BCEWithLogitsLoss()
+    if use_focal:
+        loss_fn = FocalLoss(alpha=alpha, gamma=gamma)
+    else:
+        loss_fn = nn.BCEWithLogitsLoss()
     all_pred_raw = torch.empty(0, dtype=torch.float32, device=device)
     all_labels = torch.empty(0, dtype=torch.float32, device=device)
     total_loss = 0.0
@@ -803,7 +810,13 @@ for rnd in tqdm(range(config["rounds"]), colour="blue"):
 
         # Compute per-label thresholds dynamically for this checkpoint
         _, per_label_thr = find_best_thresholds_per_label(Global_Model, val_loader, device)
-        g_loss, metrics = eval_model(Global_Model, device, val_loader, per_label_thr=per_label_thr)
+        g_loss, metrics = eval_model(
+            Global_Model, device, val_loader,
+            per_label_thr=per_label_thr,
+            use_focal=config["use_focal"],
+            alpha=(pos_weight / pos_weight.max()).to(device),
+            gamma=config["gamma"]
+        )
 
         history["global_loss"].append(g_loss)
         history["global_metrics"].append(metrics)
@@ -980,7 +993,8 @@ cent_max_f1_micro = 0.0
 # ---- Initialize optimizer and loss ----
 optimizer = torch.optim.Adam(central_model.parameters(), lr=central_config["lr"], betas=(0.9, 0.99))
 if central_config.get("use_focal", False):
-    alpha = (pos_weight / pos_weight.max()).to(device)
+    # Smooth alpha to prevent excessive weighting of rare labels
+    alpha = torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device)
     loss_fn = FocalLoss(alpha=alpha, gamma=central_config.get("gamma", 2.0))
 else:
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -1015,7 +1029,13 @@ for rnd in tqdm(range(central_config["rounds"]), colour="green"):
         #Evaluate model per label thresh
         # Compute per-label thresholds dynamically for this checkpoint
         _, per_label_thr = find_best_thresholds_per_label(central_model, val_loader, device)
-        val_loss, metrics = eval_model(central_model, device, val_loader, per_label_thr=per_label_thr)
+        val_loss, metrics = eval_model(
+            central_model, device, val_loader,
+            per_label_thr=per_label_thr,
+            use_focal=central_config["use_focal"],
+            alpha=(pos_weight / pos_weight.max()).to(device),
+            gamma=central_config["gamma"]
+        )
 
         central_history["val_loss"].append(val_loss)
         central_history["metrics"].append(metrics)
