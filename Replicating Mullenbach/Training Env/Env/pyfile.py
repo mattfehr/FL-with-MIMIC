@@ -814,7 +814,7 @@ for rnd in tqdm(range(config["rounds"]), colour="blue"):
             Global_Model, device, val_loader,
             per_label_thr=per_label_thr,
             use_focal=config["use_focal"],
-            alpha=(pos_weight / pos_weight.max()).to(device),
+            alpha= torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device), 
             gamma=config["gamma"]
         )
 
@@ -1033,7 +1033,7 @@ for rnd in tqdm(range(central_config["rounds"]), colour="green"):
             central_model, device, val_loader,
             per_label_thr=per_label_thr,
             use_focal=central_config["use_focal"],
-            alpha=(pos_weight / pos_weight.max()).to(device),
+            alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
             gamma=central_config["gamma"]
         )
 
@@ -1267,7 +1267,16 @@ print(central_history["metrics"][-3:])
 
 # %%
 macro_f1, per_label_thr = find_best_thresholds_per_label(central_model, val_loader, device)
-val_loss, metrics = eval_model(central_model, device, val_loader, per_label_thr=per_label_thr, sigmoid=True)
+val_loss, metrics = eval_model(
+    central_model,
+    device,
+    val_loader,
+    per_label_thr=per_label_thr,
+    sigmoid=True,
+    use_focal=central_config["use_focal"],
+    alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
+    gamma=central_config["gamma"]
+)
 
 # %%
 print("Per-label thresholds:\n", per_label_thr)
@@ -1292,5 +1301,50 @@ macro_f1_per_label, _ = find_best_thresholds_per_label(central_model, val_loader
 
 print(f"Global tuned F1: {macro_f1_global:.4f}")
 print(f"Per-label tuned F1: {macro_f1_per_label:.4f}")
+
+# %% [markdown]
+# ## Test Set Comparison
+
+# %%
+# --- Test set evaluation (for paper comparison) ---
+test_loader = load_data(split="test")
+
+# Load best-performing models (by val F1 or AUC)
+central_model.load_state_dict(torch.load("../History/logs/max_central_f1.pt"))
+Global_Model.load_state_dict(torch.load("../History/logs/max_f1_micro.pt"))
+
+# Compute per-label thresholds from validation set (to keep protocol consistent)
+_, per_label_thr = find_best_thresholds_per_label(central_model, val_loader, device)
+
+# ---- Centralized Test Evaluation ----
+test_loss_c, test_metrics_c = eval_model(
+    central_model,
+    device,
+    test_loader,
+    per_label_thr=per_label_thr,
+    use_focal=central_config["use_focal"],
+    alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
+    gamma=central_config["gamma"]
+)
+print(f"Centralized Test — F1_micro={test_metrics_c['f1_micro']:.3f}, "
+      f"F1_macro={test_metrics_c['f1_macro']:.3f}, "
+      f"AUC_micro={test_metrics_c['auc_micro']:.3f}, "
+      f"AUC_macro={test_metrics_c['auc_macro']:.3f}")
+
+# ---- Federated Test Evaluation ----
+test_loss_f, test_metrics_f = eval_model(
+    Global_Model,
+    device,
+    test_loader,
+    per_label_thr=per_label_thr,
+    use_focal=config["use_focal"],
+    alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
+    gamma=config["gamma"]
+)
+print(f"Federated Test — F1_micro={test_metrics_f['f1_micro']:.3f}, "
+      f"F1_macro={test_metrics_f['f1_macro']:.3f}, "
+      f"AUC_micro={test_metrics_f['auc_micro']:.3f}, "
+      f"AUC_macro={test_metrics_f['auc_macro']:.3f}")
+
 
 
