@@ -31,6 +31,8 @@ import math
 import json
 import os
 import copy
+import pandas as pd    # NEW – to store experiment results
+import time             # NEW – to track runtime for each config
 
 # Optional: to ensure reproducibility
 torch.manual_seed(42)
@@ -210,10 +212,6 @@ def GenerateModel(table_path: str, num_of_filters: int = 15, kernel_size: int = 
     )
 
 
-# Example: Instantiate the model
-model = GenerateModel(table_path=os.path.join("..", "Model", "processed_full.w2v")).to(device)
-model
-
 # %% [markdown]
 # ## Federated Learning Components
 # 
@@ -262,87 +260,67 @@ def FedAvg(global_model: dict, client_state_dicts: list[dict]) -> dict:
     return global_model
 
 # %%
-# === FedProx (adds proximal term) ===
-def FedProx_update(model, global_params, mu=0.01):
+# --- FedProx and SCAFFOLD Aggregation Methods ---
+
+def FedProx(global_model_dict, client_state_dicts, mu=0.01):
     """
-    Compute the FedProx proximal term.
-    Args:
-        model: Local model (nn.Module)
-        global_params: Global model parameters (Iterable[Tensor])
-        mu: Regularization strength (float)
-    Returns:
-        torch.Tensor: Proximal regularization loss term
-    """
-    prox_loss = 0.0
-    for p, g in zip(model.parameters(), global_params):
-        prox_loss += ((p - g.detach()) ** 2).sum()
-    return mu / 2 * prox_loss
-
-# %%
-# === SCAFFOLD (with control variates) ===
-class ScaffoldController:
-    """
-    Implements SCAFFOLD correction using control variates.
-    Tracks c_global and each client's c_local.
-    """
-    def __init__(self, model):
-        # initialize control variates for global and each client
-        self.c_global = {k: torch.zeros_like(v) for k, v in model.state_dict().items()}
-        self.c_local = {}  # {client_id: {param_name: tensor}}
-
-    def init_client(self, client_id, model):
-        """Initialize local control variates for a client."""
-        self.c_local[client_id] = {k: torch.zeros_like(v) for k, v in model.state_dict().items()}
-
-    def apply_update(self, client_id, model, global_model, lr):
-        """
-        Apply SCAFFOLD correction to model gradients before local update.
-        """
-        for (name, param), (name_g, param_g) in zip(model.named_parameters(), global_model.named_parameters()):
-            if param.grad is not None:
-                param.grad += self.c_global[name_g] - self.c_local[client_id][name]
-
-
-    def update_controls(self, client_id, old_state, new_state, lr, local_epochs):
-        """
-        Update both local and global control variates after client training.
-        """
-        c_local_old = self.c_local[client_id]
-        delta_c = {}
-        for key in new_state.keys():
-            delta_w = new_state[key] - old_state[key]
-            delta_c[key] = -(1.0 / (local_epochs * lr)) * delta_w
-            c_local_old[key] = c_local_old[key] + delta_c[key] - self.c_global[key]
-
-        # global update = mean of all local updates (to be done on server side)
-        return delta_c
+    FedProx aggregation (same averaging as FedAvg, 
+    since proximal regularization happens in local training).
     
-# Example instantiation (used during training setup)
-# scaffold_ctrl = ScaffoldController(Global_Model)
-# scaffold_ctrl.init_client(0, Global_Model)
+    Args:
+        global_model_dict (dict): Global model parameters.
+        client_state_dicts (list[dict]): List of client parameter dicts.
+        mu (float): Proximal term weight (applied during local updates).
+    """
+    # FedProx uses FedAvg-style aggregation; proximal term affects client training only.
+    return FedAvg(global_model_dict, client_state_dicts)
 
-# %%
-# Example of Fed Averaging
 
-g_param = {
-    "layer1": torch.zeros(size=(4, 4))
-}
+def Scaffold(global_model_dict, client_state_dicts, c_global, c_clients, lr, num_clients):
+    """
+    SCAFFOLD server update rule:
+        w_{t+1} = w_t + (1/K) * Σ [Δw_k - lr * (c_k - c)]
+    
+    Args:
+        global_model_dict: current global weights (dict of tensors)
+        client_state_dicts: list of client state_dicts after local updates
+        c_global: global control variate dict
+        c_clients: list of local control variate dicts
+        lr: learning rate
+        num_clients: number of clients participating this round
+    
+    Returns:
+        Updated (global_model_dict, c_global, c_clients)
+    """
+    new_global = copy.deepcopy(global_model_dict)
 
-# Simulate 3 clients with random local parameters
-c_param = [
-    {"layer1": torch.randint(low=0, high=10, size=(4, 4))}
-    for _ in range(3)
-]
+    # Average model deltas with control variate correction
+    for key in global_model_dict.keys():
+        # Δw_k = w_k - w_global
+        deltas = torch.stack(
+            [client_state_dicts[k][key] - global_model_dict[key] for k in range(num_clients)],
+            dim=0
+        )
+        mean_delta = torch.mean(deltas, dim=0)
 
-print("🧱 Global Model (Before Aggregation):\n", g_param["layer1"])
-print("\nClient Models:")
-for i, client in enumerate(c_param, start=1):
-    print(f"Client {i}:\n", client["layer1"])
+        # correction term from c_k - c
+        correction = torch.stack(
+            [c_clients[k][key] - c_global[key] for k in range(num_clients)],
+            dim=0
+        ).mean(dim=0)
 
-# Perform federated averaging
-g_param = FedAvg(global_model=g_param, client_state_dicts=c_param)
+        # apply update
+        new_global[key] = global_model_dict[key] + mean_delta - lr * correction
 
-print("\n🌐 Global Model (After FedAvg):\n", g_param["layer1"])
+    # update global control variate
+    for key in c_global.keys():
+        delta_cs = torch.stack(
+            [c_clients[k][key] - c_global[key] for k in range(num_clients)],
+            dim=0
+        )
+        c_global[key] = c_global[key] + (1 / num_clients) * delta_cs.mean(dim=0)
+
+    return new_global, c_global, c_clients
 
 
 # %% [markdown]
@@ -402,81 +380,57 @@ def client_update(
     device: str = "cpu",
     use_focal: bool = False,
     gamma: float = 2.5,
-    # --- Added for FedProx / SCAFFOLD ---
-    global_model: nn.Module = None,
-    use_fedprox: bool = False,
-    mu: float = 0.01,
-    scaffold_ctrl=None,
-    client_id: int = None
-) -> tuple[float, dict]:
+    mu: float = 0.01,                   # FedProx proximal coefficient
+    global_params: dict = None,         # for FedProx / SCAFFOLD
+    c_global: dict = None,              # for SCAFFOLD
+    c_local: dict = None,               # for SCAFFOLD
+    algorithm: str = "FedAvg"           # which algorithm is being used
+) -> tuple[float, dict, dict]:
     """
     Perform local training for a single client.
-    Supports:
-        - FedAvg (default)
-        - FedProx (proximal regularization)
-        - SCAFFOLD (control variate correction)
+    Supports FedAvg, FedProx, and SCAFFOLD.
+    Returns (final_loss, updated_model_state, updated_c_local)
     """
     model.to(device)
     model.train()
 
-    # ---- Compute pos_weight (to handle imbalance) ----
     n_labels = train_loader.dataset[0][1].shape[0]
     pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
-
-    # ---- Optimizer and Loss ----
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.99))
+
     if use_focal:
         alpha = torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device)
         loss_fn = FocalLoss(alpha=alpha, gamma=gamma)
     else:
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # ---- Store initial weights (for SCAFFOLD) ----
-    old_state = copy.deepcopy(model.state_dict()) if scaffold_ctrl else None
-
-    # ---- Local Training ----
+    # --- Training loop ---
     for _ in range(epochs):
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-
             preds, _ = model(X_batch)
             loss = loss_fn(preds, y_batch)
 
             # --- FedProx proximal term ---
-            if use_fedprox and global_model is not None:
-                loss += FedProx_update(model, global_model.parameters(), mu)
+            if algorithm == "FedProx" and global_params is not None:
+                prox_term = 0.0
+                for w, w_global in zip(model.parameters(), global_params.values()):
+                    prox_term += (w - w_global.to(device)).norm(2) ** 2
+                loss += (mu / 2) * prox_term
 
             optimizer.zero_grad()
             loss.backward()
 
-            # --- SCAFFOLD gradient correction ---
-            if scaffold_ctrl is not None and client_id is not None:
-                scaffold_ctrl.apply_update(client_id, model, global_model, lr)
+            # --- SCAFFOLD correction ---
+            if algorithm == "SCAFFOLD" and c_global is not None and c_local is not None:
+                with torch.no_grad():
+                    for w, cg, cl in zip(model.parameters(), c_global.values(), c_local.values()):
+                        if w.grad is not None:
+                            w.grad -= (cg.to(device) - cl.to(device))
 
             optimizer.step()
 
-    # ---- Update SCAFFOLD control variates ----
-    if scaffold_ctrl is not None and client_id is not None:
-        new_state = copy.deepcopy(model.state_dict())
-        scaffold_ctrl.update_controls(client_id, old_state, new_state, lr, epochs)
-
-    return loss.item(), model.state_dict()
-
-
-# %%
-# Example of local client update
-
-train_loader = load_data(split="train")
-
-local_loss, local_params = client_update(
-    model=model,
-    train_loader=train_loader,
-    epochs=1,
-    device="cpu"
-)
-
-print(f"📉 Local Training Loss: {local_loss:.4f}")
-print("🔧 Example Parameter (embed.weight):\n", local_params["embed.weight"])
+    return loss.item(), model.state_dict(), c_local
 
 
 # %% [markdown]
@@ -504,78 +458,28 @@ config = {
     "lr": 0.002,
     "n_filters": 21,
     "window_size": 6,
-    "epochs": 3,            #how many times clint will go through its own local dataset each round
-    "rounds": 100,           #for centralized, this is the epochs
-    "use_focal" : False,
-    "gamma" : 2.5,
-    "algorithm": "FedAvg",  # choose from: "FedAvg", "FedProx", "SCAFFOLD"
-    "mu": 0.01,             # FedProx regularization (only used if algorithm == "FedProx")
+    "epochs": 3,             # default (overridden per experiment)
+    "rounds": 10,            # communication rounds per experiment
+    "use_focal": False,      
+    "gamma": 2.5,            # focal loss focusing parameter
+    "mu": 0.01,              # FedProx proximal term coefficient
+    "algorithm": "FedAvg"    # will be updated in loop to FedAvg, FedProx, or SCAFFOLD
 }
 
+# Path to pretrained embedding table
 model_param_path = os.path.join("..", "Model", "processed_full.w2v")
 
 # %%
-# Client data partitioning
-
-# Load full training data
+# Load full training dataset (clients will be split dynamically later)
 X_train = torch.load(os.path.join("..", "Data", "X_train.pt"))
 Y_train = torch.load(os.path.join("..", "Data", "Y_train.pt"))
 train_dataset = TensorDataset(X_train, Y_train)
 
-# Split dataset into three clients
-c1, c2, c3 = random_split(train_dataset, lengths=[0.33, 0.33, 0.34])
-c_loaders = [
-    DataLoader(c, batch_size=config["batch_size"], shuffle=True)
-    for c in [c1, c2, c3]
-]
-
-# Display data distribution
-print(f"Global train size: {train_dataset.tensors[1].shape}")
-for i, c in enumerate([c1, c2, c3], start=1):
-    print(f"Client {i} size: {Y_train[c.indices].shape}")
-
-# Plot label distributions for each client
-for idx, c in enumerate([c1, c2, c3]):
-    all_codes = [code for instance in Y_train[c.indices]
-                 for code in torch.where(instance > 0)[0].tolist()]
-    counts = Counter(all_codes)
-    labels, values = zip(*counts.items())
-
-    plt.figure(figsize=(15, 5))
-    plt.title(f"Client {idx + 1} Label Distribution")
-    plt.bar(range(len(labels)), values, 1)
-    plt.xticks(range(len(labels)), labels)
-    plt.show()
+print(f"Loaded full training dataset: {len(train_dataset)} samples.")
 
 # %%
-# Model intialization
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
-Global_Model = GenerateModel(
-    table_path=model_param_path,
-    num_of_filters=config["n_filters"],
-    kernel_size=config["window_size"]
-).to(device)
-
-client = GenerateModel(
-    table_path=model_param_path,
-    num_of_filters=config["n_filters"],
-    kernel_size=config["window_size"]
-).to(device)
-
+# Validation loader (used for per-label thresholding and evaluation)
 val_loader = load_data(split="val")
-
-# ---- Optional but recommended: bias init for fairness ----
-n_labels = val_loader.dataset[0][1].shape[0]
-pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
-
-with torch.no_grad():
-    p = pos_weight / (pos_weight + 1.0)
-    prior_logit = torch.log(p / (1 - p))
-    Global_Model.final.bias.copy_(prior_logit.clamp(-10, 10))
-    client.final.bias.copy_(prior_logit.clamp(-10, 10))  # for symmetry
 
 # %% [markdown]
 # ### Eval stuff
@@ -674,10 +578,7 @@ def eval_model(
     tune_threshold=False,
     fixed_thr=0.3,
     sigmoid=False,
-    per_label_thr=None,  # <-- new argument
-    use_focal=False,
-    alpha=None,
-    gamma=2.5
+    per_label_thr=None
 ):
     """
     Evaluate model performance on a given dataset using BCEWithLogitsLoss.
@@ -685,14 +586,15 @@ def eval_model(
         - Fixed threshold (fixed_thr)
         - Tuned global threshold (tune_threshold)
         - Per-label thresholds (per_label_thr)
+    Returns:
+        avg_loss (float), metrics (dict) including:
+        auc_macro, auc_micro, f1_macro, f1_micro,
+        pr_auc_macro, pr_auc_micro, best_f1_micro, best_thr
     """
     model.eval()
     model.to(device)
 
-    if use_focal:
-        loss_fn = FocalLoss(alpha=alpha, gamma=gamma)
-    else:
-        loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.BCEWithLogitsLoss()
     all_pred_raw = torch.empty(0, dtype=torch.float32, device=device)
     all_labels = torch.empty(0, dtype=torch.float32, device=device)
     total_loss = 0.0
@@ -709,40 +611,28 @@ def eval_model(
 
     avg_loss = total_loss / len(data_loader)
 
-    # ---- Diagnostics: logit + sigmoid range ----
+    # ---- Diagnostics ----
     logit_min, logit_max = all_pred_raw.min().item(), all_pred_raw.max().item()
     sigmoid_vals = torch.sigmoid(all_pred_raw)
     print(f"[Eval Debug] Logit range: {logit_min:.2f} to {logit_max:.2f} | "
           f"Sigmoid mean={sigmoid_vals.mean():.3f}, std={sigmoid_vals.std():.3f}")
 
-    # Optional visualization (uncomment if needed)
-    if sigmoid:
-        plt.hist(sigmoid_vals.cpu().numpy().flatten(), bins=50)
-        plt.title("Sigmoid Output Distribution")
-        plt.xlabel("Predicted Probability")
-        plt.ylabel("Count")
-        plt.show()
-
     # ---- Apply thresholds ----
     if per_label_thr is not None:
-        # Use per-label thresholds vector
         pred_labels = (sigmoid_vals >= per_label_thr.to(device)).long()
-        used_thr = "per-label"
         best_f1, best_thr = None, "per-label"
     else:
-        # Use fixed or tuned global threshold
         pred_labels = (sigmoid_vals >= fixed_thr).long()
         metrics = all_metrics(
             yhat=pred_labels.cpu().numpy(),
             y=all_labels.cpu().numpy(),
             yhat_raw=all_pred_raw.cpu().numpy()
         )
-
         best_f1, best_thr = metrics["f1_micro"], fixed_thr
         if tune_threshold:
             best_f1, best_thr = find_best_threshold(model, data_loader, device)
 
-    # ---- Compute metrics (recomputed if per_label_thr used) ----
+    # ---- Compute metrics if per_label_thr used ----
     if per_label_thr is not None:
         metrics = all_metrics(
             yhat=pred_labels.cpu().numpy(),
@@ -750,19 +640,20 @@ def eval_model(
             yhat_raw=all_pred_raw.cpu().numpy()
         )
 
-    # ---- Avg predicted labels per sample ----
+    # ---- Add PR-AUC and F1 info ----
+    pr_macro = metrics.get("pr_auc_macro", None)
+    pr_micro = metrics.get("pr_auc_micro", None)
+    auc_macro = metrics.get("auc_macro", None)
+    auc_micro = metrics.get("auc_micro", None)
+
     avg_pred_labels = pred_labels.sum(dim=1).float().mean().item()
 
-    # ---- Print evaluation summary ----
     print(
-        f"[Eval] Loss={avg_loss:.4f} | "
-        f"F1_micro={metrics.get('f1_micro', 0):.4f} | "
-        f"F1_macro={metrics.get('f1_macro', 0):.4f} | "
-        f"AUC_micro={metrics.get('auc_micro', 0):.4f} | "
-        f"AUC_macro={metrics.get('auc_macro', 0):.4f} | "
-        f"PR_micro={metrics.get('prauc_micro', 0):.4f} | "
-        f"PR_macro={metrics.get('prauc_macro', 0):.4f} | "
-        f"Best_F1={best_f1 if best_f1 else metrics.get('f1_micro', 0):.4f} @ thr={best_thr} | "
+        f"[Eval] Avg loss={avg_loss:.4f} | "
+        f"F1_micro={metrics['f1_micro']:.4f} | F1_macro={metrics['f1_macro']:.4f} | "
+        f"AUC_macro={auc_macro:.4f} | AUC_micro={auc_micro:.4f} | "
+        f"PR-AUC_macro={pr_macro:.4f} | PR-AUC_micro={pr_micro:.4f} | "
+        f"Best_F1={best_f1 if best_f1 else metrics['f1_micro']:.4f} @ thr={best_thr} | "
         f"Avg labels/sample={avg_pred_labels:.2f}"
     )
 
@@ -774,809 +665,152 @@ def eval_model(
 
 
 # %% [markdown]
-# ### Gamma tuning Experiment
+# ## Full test plan loop
 
 # %%
-# # --- Quick gamma tuning experiment ---
-# gamma_values = [1.0, 1.5, 2.0, 2.5, 3.0]
-# results = {}
-
-# for gamma in gamma_values:
-#     print(f"\n===== Testing gamma={gamma} =====")
-#     config["gamma"] = gamma
-
-#     # Reinitialize model fresh each run
-#     model = GenerateModel(
-#         table_path=model_param_path,
-#         num_of_filters=config["n_filters"],
-#         kernel_size=config["window_size"]
-#     ).to(device)
-
-#     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], betas=(0.9, 0.99))
-
-#     alpha = (pos_weight / pos_weight.max()).to(device)
-#     loss_fn = FocalLoss(alpha=alpha, gamma=gamma)
-
-#     # --- Short training run ---
-#     for epoch in range(5):  # small number for speed
-#         model.train()
-#         total_loss = 0.0
-#         for X_batch, y_batch in train_loader:
-#             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-#             optimizer.zero_grad()
-#             preds, _ = model(X_batch)
-#             loss = loss_fn(preds, y_batch)
-#             loss.backward()
-#             optimizer.step()
-#             total_loss += loss.item()
-
-#         avg_train_loss = total_loss / len(train_loader)
-#         print(f"Epoch {epoch+1}/5 | Train Loss: {avg_train_loss:.4f}")
-
-#     # --- Evaluate F1 on validation set ---
-#     _, per_label_thr = find_best_thresholds_per_label(model, val_loader, device)
-#     val_loss, metrics = eval_model(model, device, val_loader, per_label_thr=per_label_thr)
-#     results[gamma] = metrics["f1_micro"]
-
-# print("\nGamma tuning results:")
-# for g, f1 in results.items():
-#     print(f"γ={g}: F1_micro={f1:.4f}")
-
-# best_gamma = max(results, key=results.get)
-# print(f"\nBest gamma: {best_gamma} (F1_micro={results[best_gamma]:.4f})")
-# config["gamma"] = best_gamma
-
-# %%
-# # Gamma plot
-
-# plt.figure(figsize=(8, 4))
-# plt.plot(list(results.keys()), list(results.values()), marker='o')
-# plt.title("Gamma vs F1_micro")
-# plt.xlabel("Gamma (γ)")
-# plt.ylabel("F1_micro")
-# plt.grid(alpha=0.3)
-# plt.show()
-
-# %% [markdown]
-# ### Main training loop
-
-# %%
-# Federated history setup
-
-history = {
-    "local_loss": {0: [], 1: [], 2: []},
-    "global_loss": [],
-    "global_metrics": []
-}
-
-max_auc_macro = 0.0
-max_f1_micro = 0.0
-
-# %%
-# Federated training loop 
-
-config["rounds"] = 100  # important for testing time
-target_evals = 100
-eval_interval = max(1, round(config["rounds"] / target_evals))
-
-# Optional: Initialize SCAFFOLD controller if selected
-scaffold_ctrl = None
-if config.get("algorithm", "FedAvg") == "SCAFFOLD":
-    scaffold_ctrl = ScaffoldController(Global_Model)
-    for cid in range(len(c_loaders)):
-        scaffold_ctrl.init_client(cid, Global_Model)
-
-for rnd in tqdm(range(config["rounds"]), colour="blue"):
-    client_params = []
-    total_local_loss = 0.0  # for averaging client losses
-
-    # ---- Local training on each client ----
-    for c_idx, loader in enumerate(c_loaders):
-        client.load_state_dict(Global_Model.state_dict())
-
-        local_loss, c_param = client_update(
-            model=client,
-            train_loader=loader,
-            epochs=config["epochs"],
-            lr=config["lr"],
-            device=device,
-            # algorithm selection
-            global_model=Global_Model if config["algorithm"] in ["FedProx", "SCAFFOLD"] else None,
-            use_fedprox=(config["algorithm"] == "FedProx"),
-            mu=config.get("mu", 0.01),
-            scaffold_ctrl=scaffold_ctrl if config["algorithm"] == "SCAFFOLD" else None,
-            client_id=c_idx if config["algorithm"] == "SCAFFOLD" else None,
-            use_focal=config["use_focal"]
-        )
-
-        client_params.append(c_param)
-        history["local_loss"][c_idx].append(local_loss)
-        total_local_loss += local_loss
-
-    avg_local_loss = total_local_loss / len(c_loaders)
-
-    # ---- Aggregation step (FedAvg base) ----
-    new_param = FedAvg(Global_Model.state_dict(), client_params)
-    Global_Model.load_state_dict(new_param)
-
-    # ---- Update control variates (SCAFFOLD only) ----
-    if config["algorithm"] == "SCAFFOLD":
-        delta_cs = [scaffold_ctrl.c_local[cid] for cid in range(len(c_loaders))]
-        for key in scaffold_ctrl.c_global.keys():
-            scaffold_ctrl.c_global[key] = torch.mean(
-                torch.stack([d[key] for d in delta_cs]), dim=0
-            )
-
-    # ---- Evaluation phase (same as centralized) ----
-    if (rnd + 1) % eval_interval == 0 or rnd == config["rounds"] - 1:
-        _, per_label_thr = find_best_thresholds_per_label(Global_Model, val_loader, device)
-        g_loss, metrics = eval_model(
-            Global_Model, device, val_loader,
-            per_label_thr=per_label_thr,
-            use_focal=config["use_focal"],
-            alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device), 
-            gamma=config["gamma"]
-        )
-
-        history["global_loss"].append(g_loss)
-        history["global_metrics"].append(metrics)
-
-        # ---- Save checkpoints ----
-        save_json(history, "../History/logs/metric_history.json")
-        torch.save(Global_Model.state_dict(), "../History/logs/latest_model.pt")
-
-        # Track best-performing models
-        if metrics["auc_macro"] > max_auc_macro:
-            max_auc_macro = metrics["auc_macro"]
-            torch.save(Global_Model.state_dict(), "../History/logs/max_auc.pt")
-
-        if metrics["f1_micro"] > max_f1_micro:
-            max_f1_micro = metrics["f1_micro"]
-            torch.save(Global_Model.state_dict(), "../History/logs/max_f1_micro.pt")
-
-        # Print progress (unchanged)
-        thr_display = metrics["best_thr"] if isinstance(metrics["best_thr"], str) else f"{metrics['best_thr']:.2f}"
-        print(f"Round {rnd+1}/{config['rounds']} | "
-              f"Avg Local Loss: {avg_local_loss:.4f} | "
-              f"Global Val Loss: {g_loss:.4f} | "
-              f"F1_micro: {metrics['f1_micro']:.4f} | "
-              f"Best_F1: {metrics['best_f1_micro']:.4f} (thr={thr_display})")
-
-print("Federated training complete!")
-
-best_f1, best_thr = find_best_threshold(Global_Model, val_loader, device)
-print(f"Best threshold on validation set: {best_thr} (F1={best_f1:.4f})")
-
-
-# %% [markdown]
-# ### Federated Training Results Visualization
-# 
-# This section loads the saved federated training history (`metric_history.json`) and visualizes:
-# 
-# 1. **Global Loss** progression across rounds.  
-# 2. **Local Client Losses** for each client.  
-# 3. **Validation Metrics** (AUC, F1, etc.) of the global model over time.
-# 
-# The plots help assess:
-# - Training stability across clients  
-# - Convergence of global loss  
-# - Improvements in evaluation metrics
-
-# %%
-# Load training history
-
-history = load_json(filepath="../History/logs/metric_history.json")
-print(f"Total Global Rounds Logged: {len(history['global_loss'])}")
-
-# %%
-#Global loss progression 
-
-plt.figure(figsize=(10, 4))
-plt.plot(history["global_loss"], label="Global Loss", linewidth=2)
-plt.title("Global Loss Progression")
-plt.xlabel("Rounds")
-plt.ylabel("Loss")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-# %%
-# Client local losses
-
-plt.figure(figsize=(12, 5))
-for c_idx in range(3):
-    plt.plot(history["local_loss"][str(c_idx)], label=f"Client {c_idx}")
-plt.title("Client Local Losses Over Rounds")
-plt.xlabel("Rounds")
-plt.ylabel("Loss")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-# %%
-# Global validation metric overview
-
-plt.figure(figsize=(15, 5))
-plt.title("Validation History from Global Model")
-
-# Plot each metric individually
-for key in history["global_metrics"][0].keys():
-    plt.plot([v[key] for v in history["global_metrics"]], label=key)
-
-plt.xlabel("Evaluation Checkpoints")
-plt.ylabel("Metric Value")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-# %%
-# F1 Score trends
-
-plt.figure(figsize=(15, 5))
-plt.title("F1 Score Progression (Macro & Micro)")
-plt.plot([v["f1_macro"] for v in history["global_metrics"]], label="F1 Macro", linewidth=2)
-plt.plot([v["f1_micro"] for v in history["global_metrics"]], label="F1 Micro", linewidth=2)
-plt.xlabel("Evaluation Checkpoints")
-plt.ylabel("Score")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-
-# %%
-# AUC trends 
-
-plt.figure(figsize=(15, 5))
-plt.title("AUC Progression (Macro & Micro)")
-plt.plot([v["auc_macro"] for v in history["global_metrics"]], label="AUC Macro", linewidth=2)
-plt.plot([v["auc_micro"] for v in history["global_metrics"]], label="AUC Micro", linewidth=2)
-plt.xlabel("Evaluation Checkpoints")
-plt.ylabel("Score")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-# %% [markdown]
-# ## Centralized Training (Baseline)
-# 
-# This section trains a **single centralized model** on all data combined,
-# using the **same configuration, metrics, and visualization pipeline** as the federated setup.
-# 
-# The centralized model acts as an upper performance bound for comparison.
-
-# %%
-# Config - same as FL
-
-central_config = config.copy()  # same parameters as FL
-print(central_config)
-
-# %%
-# Centralized model initialization
-
-central_model = GenerateModel(
-    table_path=os.path.join("..", "Model", "processed_full.w2v"),
-    num_of_filters=central_config["n_filters"],
-    kernel_size=central_config["window_size"]
-)
-
-central_model.to(device)
-val_loader = load_data(split="val")
-train_loader = load_data(split="train")
-
-# ---- Optional but recommended: bias init for fairness ----
-n_labels = val_loader.dataset[0][1].shape[0]
-pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
-
-with torch.no_grad():
-    p = pos_weight / (pos_weight + 1.0)
-    prior_logit = torch.log(p / (1 - p))
-    central_model.final.bias.copy_(prior_logit.clamp(-10, 10))
-
-print("Centralized model and data ready.")
-
-
-# %%
-# Centralized training history set up
-
-central_history = {
-    "train_loss": [],
-    "val_loss": [],
-    "metrics": []
-}
-
-cent_max_auc_macro = 0.0
-cent_max_f1_micro = 0.0
-
-# %%
-# Centralized Training Loop
-
-# ---- Initialize optimizer and loss ----
-optimizer = torch.optim.Adam(central_model.parameters(), lr=central_config["lr"], betas=(0.9, 0.99))
-if central_config.get("use_focal", False):
-    # Smooth alpha to prevent excessive weighting of rare labels
-    alpha = torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device)
-    loss_fn = FocalLoss(alpha=alpha, gamma=central_config.get("gamma", 2.0))
-else:
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-# ---- Centralized training loop ----
-central_config["rounds"] = 100
-target_evals = 100
-eval_interval = max(1, round(central_config["rounds"] / target_evals))
-
-for rnd in tqdm(range(central_config["rounds"]), colour="green"):
-    central_model.train()
-    total_loss = 0.0
-
-    # ---- Training phase ----
-    for X_batch, y_batch in train_loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        optimizer.zero_grad()
-        preds, _ = central_model(X_batch)
-        loss = loss_fn(preds, y_batch)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-
-    avg_train_loss = total_loss / len(train_loader)
-    central_history["train_loss"].append(avg_train_loss)
-
-    # ---- Evaluation + saving ----
-    if (rnd + 1) % eval_interval == 0 or rnd == central_config["rounds"] - 1:
-        # Evaluate model global
-        # val_loss, metrics = eval_model(central_model, device, val_loader)
-
-        #Evaluate model per label thresh
-        # Compute per-label thresholds dynamically for this checkpoint
-        _, per_label_thr = find_best_thresholds_per_label(central_model, val_loader, device)
-        val_loss, metrics = eval_model(
-            central_model, device, val_loader,
-            per_label_thr=per_label_thr,
-            use_focal=central_config["use_focal"],
-            alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
-            gamma=central_config["gamma"]
-        )
-
-        central_history["val_loss"].append(val_loss)
-        central_history["metrics"].append(metrics)
-
-        # Save checkpoints and logs
-        save_json(central_history, "../History/logs/central_metric_history.json")
-        torch.save(central_model.state_dict(), "../History/logs/latest_central_model.pt")
-
-        # Track best-performing centralized models
-        if metrics["auc_macro"] > cent_max_auc_macro:
-            cent_max_auc_macro = metrics["auc_macro"]
-            torch.save(central_model.state_dict(), "../History/logs/max_central_auc.pt")
-
-        if metrics["f1_micro"] > cent_max_f1_micro:
-            cent_max_f1_micro = metrics["f1_micro"]
-            torch.save(central_model.state_dict(), "../History/logs/max_central_f1.pt")
-
-        # Print progress
-        thr_display = metrics["best_thr"] if isinstance(metrics["best_thr"], str) else f"{metrics['best_thr']:.2f}"
-        print(f"Round {rnd+1}/{central_config['rounds']} | "
-            f"Train Loss: {avg_train_loss:.4f} | "
-            f"Val Loss: {val_loss:.4f} | "
-            f"F1_micro: {metrics['f1_micro']:.4f} | "
-            f"Best_F1: {metrics['best_f1_micro']:.4f} (thr={thr_display})")
-
-print("Centralized training complete!")
-
-best_f1, best_thr = find_best_threshold(central_model, val_loader, device)
-print(f"Best threshold on validation set: {best_thr} (F1={best_f1:.4f})")
-
-
-# %% [markdown]
-# ### Centralized Training Results Visualization
-# 
-# Plots below mirror the federated section for one-to-one comparison:
-# 1. Training & validation loss  
-# 2. Validation metrics overview  
-# 3. F1 score trends  
-# 4. AUC trends
-# 
-
-# %%
-# Load centralized history
-
-central_history = load_json(filepath="../History/logs/central_metric_history.json")
-print(f"Total Rounds Logged: {len(central_history['val_loss'])}")
-
-# %%
-# Train and validation loss
-
-plt.figure(figsize=(10, 4))
-plt.plot(central_history["train_loss"], label="Train Loss")
-plt.plot(central_history["val_loss"], label="Validation Loss")
-plt.title("Centralized Model — Loss Progression")
-plt.xlabel("Rounds")
-plt.ylabel("Loss")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-# %%
-for X_batch, y_batch in train_loader:
-    X_batch = X_batch.to(device)
-    y_batch = y_batch.to(device)
-    preds, _ = model(X_batch)
-    print("Pred shape:", preds.shape)
-    print("Label shape:", y_batch.shape)
-    print("Unique label values:", torch.unique(y_batch))
-    break
-
-# %%
-# Validaton Metrics Overview
-
-plt.figure(figsize=(15, 5))
-plt.title("Centralized Model — Validation Metrics")
-
-for key in central_history["metrics"][0].keys():
-    plt.plot([v[key] for v in central_history["metrics"]], label=key)
-
-plt.xlabel("Evaluation Checkpoints")
-plt.ylabel("Metric Value")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-# %%
-# F1 Score Trends
-
-plt.figure(figsize=(15, 5))
-plt.title("Centralized Model — F1 Trends")
-plt.plot([v["f1_macro"] for v in central_history["metrics"]], label="F1 Macro", linewidth=2)
-plt.plot([v["f1_micro"] for v in central_history["metrics"]], label="F1 Micro", linewidth=2)
-plt.xlabel("Evaluation Checkpoints")
-plt.ylabel("Score")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-# %%
-# AUC trends
-
-plt.figure(figsize=(15, 5))
-plt.title("Centralized Model — AUC Trends")
-plt.plot([v["auc_macro"] for v in central_history["metrics"]], label="AUC Macro", linewidth=2)
-plt.plot([v["auc_micro"] for v in central_history["metrics"]], label="AUC Micro", linewidth=2)
-plt.xlabel("Evaluation Checkpoints")
-plt.ylabel("Score")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-# %% [markdown]
-# ## Federated vs Centralized Comparison
-# 
-# This section compares the **Federated Learning (FL)** and **Centralized Training (CL)** experiments:
-# 
-# - Overlayed loss curves
-# - Validation metric trends
-# - Best-performing metrics summary (F1, AUC, etc.)
-# 
-# The goal is to analyze the trade-offs between distributed vs. centralized optimization.
-# 
-
-# %%
-# Load Both Training Histories
-
-fed_history = load_json(filepath="../History/logs/metric_history.json")
-central_history = load_json(filepath="../History/logs/central_metric_history.json")
-
-print(f"FL rounds logged: {len(fed_history['global_loss'])}")
-print(f"CL rounds logged: {len(central_history['val_loss'])}")
-
-
-# %%
-# FL vs Certralized - Loss Comparison
-
-plt.figure(figsize=(10, 5))
-plt.plot(fed_history["global_loss"], label="Federated (Global Loss)", linewidth=2)
-plt.plot(central_history["val_loss"], label="Centralized (Val Loss)", linewidth=2, linestyle="--")
-plt.title("Federated vs Centralized — Loss Progression")
-plt.xlabel("Rounds")
-plt.ylabel("Loss")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-
-# %%
-
-# Federated vs Centralized — Validation Metric Trends
-
-plt.figure(figsize=(15, 5))
-plt.title("Federated vs Centralized — Validation Metric Trends")
-
-fed_keys = fed_history["global_metrics"][0].keys()
-cent_keys = central_history["metrics"][0].keys()
-
-# Only plot overlapping metrics
-shared_metrics = [k for k in fed_keys if k in cent_keys]
-
-for key in shared_metrics:
-    plt.plot([m[key] for m in fed_history["global_metrics"]],
-             label=f"FL {key}", linewidth=2)
-    plt.plot([m[key] for m in central_history["metrics"]],
-             label=f"CL {key}", linestyle="--")
-
-plt.xlabel("Evaluation Checkpoints")
-plt.ylabel("Metric Value")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-
-# %%
-# F1 Comparison (Macro & Micro)
-
-plt.figure(figsize=(15, 5))
-plt.title("F1 Score Comparison — Federated vs Centralized")
-
-plt.plot([v["f1_macro"] for v in fed_history["global_metrics"]], label="FL F1 Macro", linewidth=2)
-plt.plot([v["f1_micro"] for v in fed_history["global_metrics"]], label="FL F1 Micro", linewidth=2)
-plt.plot([v["f1_macro"] for v in central_history["metrics"]], label="CL F1 Macro", linestyle="--", linewidth=2)
-plt.plot([v["f1_micro"] for v in central_history["metrics"]], label="CL F1 Micro", linestyle="--", linewidth=2)
-
-plt.xlabel("Evaluation Checkpoints")
-plt.ylabel("F1 Score")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-# %%
-# AUC Comparison (Macro & Micro)
-
-plt.figure(figsize=(15, 5))
-plt.title("AUC Comparison — Federated vs Centralized")
-
-plt.plot([v["auc_macro"] for v in fed_history["global_metrics"]], label="FL AUC Macro", linewidth=2)
-plt.plot([v["auc_micro"] for v in fed_history["global_metrics"]], label="FL AUC Micro", linewidth=2)
-plt.plot([v["auc_macro"] for v in central_history["metrics"]], label="CL AUC Macro", linestyle="--", linewidth=2)
-plt.plot([v["auc_micro"] for v in central_history["metrics"]], label="CL AUC Micro", linestyle="--", linewidth=2)
-
-plt.xlabel("Evaluation Checkpoints")
-plt.ylabel("AUC Score")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.show()
-
-
-# %%
-# Quantitative Comparison — Best Scores
-
-fed_best_f1 = max([m["f1_micro"] for m in fed_history["global_metrics"]])
-fed_best_auc = max([m["auc_macro"] for m in fed_history["global_metrics"]])
-
-cent_best_f1 = max([m["f1_micro"] for m in central_history["metrics"]])
-cent_best_auc = max([m["auc_macro"] for m in central_history["metrics"]])
-
-print("Federated vs Centralized Results Summary")
-print(f"Federated  → Best F1 (micro): {fed_best_f1:.4f} | Best AUC (macro): {fed_best_auc:.4f}")
-print(f"Centralized → Best F1 (micro): {cent_best_f1:.4f} | Best AUC (macro): {cent_best_auc:.4f}")
-
-
-# %% [markdown]
-# ## Metric Stuff
-
-# %%
-print(history["global_metrics"][-3:])
-print(central_history["metrics"][-3:])
-
-# %%
-macro_f1, per_label_thr = find_best_thresholds_per_label(central_model, val_loader, device)
-val_loss, metrics = eval_model(
-    central_model,
-    device,
-    val_loader,
-    per_label_thr=per_label_thr,
-    sigmoid=True,
-    use_focal=central_config["use_focal"],
-    alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
-    gamma=central_config["gamma"]
-)
-
-# %%
-print("Per-label thresholds:\n", per_label_thr)
-print(f"Min threshold: {per_label_thr.min():.3f}")
-print(f"Max threshold: {per_label_thr.max():.3f}")
-print(f"Mean threshold: {per_label_thr.mean():.3f}")
-print(f"Std dev: {per_label_thr.std():.3f}")
-
-torch.save(per_label_thr, "../History/logs/per_label_thresholds.pt")
-
-plt.figure(figsize=(12, 4))
-plt.bar(np.arange(len(per_label_thr)), per_label_thr.cpu().numpy(), color='skyblue')
-plt.title("Per-Label Optimal Thresholds")
-plt.xlabel("Label Index")
-plt.ylabel("Threshold Value")
-plt.grid(axis='y', alpha=0.3)
-plt.show()
-
-# %%
-macro_f1_global, _ = find_best_threshold(central_model, val_loader, device)
-macro_f1_per_label, _ = find_best_thresholds_per_label(central_model, val_loader, device)
-
-print(f"Global tuned F1: {macro_f1_global:.4f}")
-print(f"Per-label tuned F1: {macro_f1_per_label:.4f}")
-
-# %% [markdown]
-# ## Test Set Comparison
-
-# %%
-# --- Test set evaluation (for paper comparison) ---
-test_loader = load_data(split="test")
-
-# Load best-performing models (by val F1 or AUC)
-central_model.load_state_dict(torch.load("../History/logs/max_central_f1.pt"))
-Global_Model.load_state_dict(torch.load("../History/logs/max_f1_micro.pt"))
-
-# Compute per-label thresholds from validation set (to keep protocol consistent)
-_, per_label_thr = find_best_thresholds_per_label(central_model, val_loader, device)
-
-# ---- Centralized Test Evaluation ----
-test_loss_c, test_metrics_c = eval_model(
-    central_model,
-    device,
-    test_loader,
-    per_label_thr=per_label_thr,
-    use_focal=central_config["use_focal"],
-    alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
-    gamma=central_config["gamma"]
-)
-print(f"Centralized Test — F1_micro={test_metrics_c['f1_micro']:.3f}, "
-      f"F1_macro={test_metrics_c['f1_macro']:.3f}, "
-      f"AUC_micro={test_metrics_c['auc_micro']:.3f}, "
-      f"AUC_macro={test_metrics_c['auc_macro']:.3f}")
-
-# ---- Federated Test Evaluation ----
-test_loss_f, test_metrics_f = eval_model(
-    Global_Model,
-    device,
-    test_loader,
-    per_label_thr=per_label_thr,
-    use_focal=config["use_focal"],
-    alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
-    gamma=config["gamma"]
-)
-print(f"Federated Test — F1_micro={test_metrics_f['f1_micro']:.3f}, "
-      f"F1_macro={test_metrics_f['f1_macro']:.3f}, "
-      f"AUC_micro={test_metrics_f['auc_micro']:.3f}, "
-      f"AUC_macro={test_metrics_f['auc_macro']:.3f}")
-
-
-# %%
-## Fed Loop
-
-import time
-import pandas as pd
-
-results_path = "../History/results_summary.csv"
-results = []
-
-for algo in ["FedAvg", "FedProx", "SCAFFOLD"]:
-    for num_clients in [2, 3, 4]:
-        for local_epochs in [1, 2, 3]:
-            print(f"\n=== Running {algo} | Clients={num_clients} | Local Epochs={local_epochs} ===")
-
-            # --- 1. Configure ---
-            config["algorithm"] = algo
-            config["epochs"] = local_epochs
-
-            # --- 2. Partition data ---
-            if num_clients == 2:
-                c1, c2 = random_split(train_dataset, lengths=[0.5, 0.5])
-                c_loaders = [DataLoader(c, batch_size=config["batch_size"], shuffle=True) for c in [c1, c2]]
-            elif num_clients == 3:
-                c1, c2, c3 = random_split(train_dataset, lengths=[0.33, 0.33, 0.34])
-                c_loaders = [DataLoader(c, batch_size=config["batch_size"], shuffle=True) for c in [c1, c2, c3]]
-            elif num_clients == 4:
-                c1, c2, c3, c4 = random_split(train_dataset, lengths=[0.25]*4)
-                c_loaders = [DataLoader(c, batch_size=config["batch_size"], shuffle=True) for c in [c1, c2, c3, c4]]
-
-            # --- 3. Re-initialize models ---
-            Global_Model = GenerateModel(
-                table_path=model_param_path,
-                num_of_filters=config["n_filters"],
-                kernel_size=config["window_size"]
-            ).to(device)
-
-            client = GenerateModel(
-                table_path=model_param_path,
-                num_of_filters=config["n_filters"],
-                kernel_size=config["window_size"]
-            ).to(device)
-
-            # ---- Bias init ----
-            with torch.no_grad():
-                p = pos_weight / (pos_weight + 1.0)
-                prior_logit = torch.log(p / (1 - p))
-                Global_Model.final.bias.copy_(prior_logit.clamp(-10, 10))
-                client.final.bias.copy_(prior_logit.clamp(-10, 10))
-
-            # --- 4. Run training ---
-            start_time = time.time()
-
-            scaffold_ctrl = None
-            if config["algorithm"] == "SCAFFOLD":
-                scaffold_ctrl = ScaffoldController(Global_Model)
-                for cid in range(len(c_loaders)):
-                    scaffold_ctrl.init_client(cid, Global_Model)
-
-            history = {"local_loss": {cid: [] for cid in range(len(c_loaders))},
-                       "global_loss": [], "global_metrics": []}
-            max_auc_macro = 0.0
-            max_f1_micro = 0.0
-
-            for rnd in tqdm(range(config["rounds"]), colour="blue", leave=False):
-                client_params = []
-                total_local_loss = 0.0
-                for c_idx, loader in enumerate(c_loaders):
-                    client.load_state_dict(Global_Model.state_dict())
-                    local_loss, c_param = client_update(
-                        model=client,
-                        train_loader=loader,
-                        epochs=config["epochs"],
-                        lr=config["lr"],
-                        device=device,
-                        global_model=Global_Model if config["algorithm"] in ["FedProx", "SCAFFOLD"] else None,
-                        use_fedprox=(config["algorithm"] == "FedProx"),
-                        mu=config.get("mu", 0.01),
-                        scaffold_ctrl=scaffold_ctrl if config["algorithm"] == "SCAFFOLD" else None,
-                        client_id=c_idx if config["algorithm"] == "SCAFFOLD" else None,
-                        use_focal=config["use_focal"]
-                    )
-                    client_params.append(c_param)
-                    total_local_loss += local_loss
-
-                avg_local_loss = total_local_loss / len(c_loaders)
-                new_param = FedAvg(Global_Model.state_dict(), client_params)
-                Global_Model.load_state_dict(new_param)
-
-                # SCAFFOLD update
-                if config["algorithm"] == "SCAFFOLD":
-                    delta_cs = [scaffold_ctrl.c_local[cid] for cid in range(len(c_loaders))]
-                    for key in scaffold_ctrl.c_global.keys():
-                        scaffold_ctrl.c_global[key] = torch.mean(
-                            torch.stack([d[key] for d in delta_cs]), dim=0
-                        )
-
-            train_time = round(time.time() - start_time, 2)
-            print(f"Training finished in {train_time} sec")
-
-            # --- 5. Validation thresholding ---
-            _, per_label_thr = find_best_thresholds_per_label(Global_Model, val_loader, device)
-
-            # --- 6. Evaluate on Test Set ---
-            test_loss, test_metrics = eval_model(
-                Global_Model, device, load_data("test"),
-                per_label_thr=per_label_thr,
+def run_federated_experiment(algo, num_clients, local_epochs, config, train_dataset, val_loader, test_loader, device):
+    """
+    Runs one federated configuration (FedAvg, FedProx, or SCAFFOLD)
+    and returns evaluation metrics on the test set.
+    """
+    start_time = time.time()
+
+    # --- Split dataset into clients dynamically ---
+    splits = [1 / num_clients] * num_clients
+    lengths = [int(len(train_dataset) * s) for s in splits[:-1]]
+    lengths.append(len(train_dataset) - sum(lengths))
+    client_datasets = random_split(train_dataset, lengths=lengths)
+    c_loaders = [DataLoader(c, batch_size=config["batch_size"], shuffle=True) for c in client_datasets]
+
+    # --- Initialize global and client models ---
+    global_model = GenerateModel(
+        model_param_path,
+        num_of_filters=config["n_filters"],
+        kernel_size=config["window_size"]
+    ).to(device)
+
+    client_model = copy.deepcopy(global_model)
+
+    # --- Initialize control variates if SCAFFOLD ---
+    if algo == "SCAFFOLD":
+        c_global = {k: torch.zeros_like(v) for k, v in global_model.state_dict().items()}
+        c_clients = [{k: torch.zeros_like(v) for k, v in global_model.state_dict().items()} for _ in range(num_clients)]
+    else:
+        c_global = c_clients = None
+
+    # --- Federated training rounds ---
+    for rnd in tqdm(range(config["rounds"]), colour="blue", desc=f"{algo} | Clients={num_clients} | Epochs={local_epochs}"):
+        client_params = []
+        new_c_clients = []
+
+        # ---- Each client trains locally ----
+        for idx, loader in enumerate(c_loaders):
+            client_model.load_state_dict(global_model.state_dict())
+
+            local_loss, client_state, c_local = client_update(
+                model=client_model,
+                train_loader=loader,
+                epochs=local_epochs,
+                lr=config["lr"],
+                device=device,
                 use_focal=config["use_focal"],
-                alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
-                gamma=config["gamma"]
+                gamma=config["gamma"],
+                mu=config["mu"],
+                global_params=global_model.state_dict(),
+                c_global=c_global if algo == "SCAFFOLD" else None,
+                c_local=c_clients[idx] if algo == "SCAFFOLD" else None,
+                algorithm=algo
             )
 
-            # --- 7. Record results ---
-            results.append({
-                "Function": algo,
-                "Clients": num_clients,
-                "Local Epochs": local_epochs,
-                "AUC Macro": round(test_metrics.get("auc_macro", 0), 4),
-                "AUC Micro": round(test_metrics.get("auc_micro", 0), 4),
-                "F1 Macro": round(test_metrics.get("f1_macro", 0), 4),
-                "F1 Micro": round(test_metrics.get("f1_micro", 0), 4),
-                "PR-AUC Macro": round(test_metrics.get("prauc_macro", 0), 4),
-                "PR-AUC Micro": round(test_metrics.get("prauc_micro", 0), 4),
-                "Time": train_time
-            })
+            client_params.append(client_state)
+            new_c_clients.append(c_local)
 
-            # Save interim results after each run
-            pd.DataFrame(results).to_csv(results_path, index=False)
+        # ---- Aggregate updates ----
+        if algo == "FedAvg":
+            new_params = FedAvg(global_model.state_dict(), client_params)
+            global_model.load_state_dict(new_params)
 
-print("\n✅ All 27 configurations complete!")
-print(f"Results saved to {results_path}")
+        elif algo == "FedProx":
+            new_params = FedProx(global_model.state_dict(), client_params, mu=config["mu"])
+            global_model.load_state_dict(new_params)
+
+        elif algo == "SCAFFOLD":
+            new_params, c_global, c_clients = Scaffold(
+                global_model.state_dict(),
+                client_params,
+                c_global,
+                c_clients,
+                lr=config["lr"],
+                num_clients=num_clients
+            )
+            global_model.load_state_dict(new_params)
+
+    # --- Evaluate on test set using per-label thresholds from validation ---
+    _, per_label_thr = find_best_thresholds_per_label(global_model, val_loader, device)
+    _, metrics = eval_model(global_model, device, test_loader, per_label_thr=per_label_thr)
+
+    elapsed = time.time() - start_time
+    return metrics, elapsed
+
+
+# %%
+# === Federated Experiment Grid: FedAvg, FedProx, SCAFFOLD ===
+
+results = pd.DataFrame(columns=[
+    "Function", "Clients", "Local Epochs",
+    "AUC Macro", "AUC Micro",
+    "F1 Macro", "F1 Micro",
+    "PR-AUC Macro", "PR-AUC Micro",
+    "Time"
+])
+
+# Load datasets
+train_dataset = TensorDataset(
+    torch.load(os.path.join("..", "Data", "X_train.pt")),
+    torch.load(os.path.join("..", "Data", "Y_train.pt"))
+)
+val_loader = load_data("val")
+test_loader = load_data("test")
+
+algorithms = ["FedAvg", "FedProx", "SCAFFOLD"]
+client_counts = [2, 3, 4]
+local_epochs = [1, 2, 3]
+
+for algo in algorithms:
+    for n_clients in client_counts:
+        for epochs in local_epochs:
+            print(f"\n=== Running {algo} | Clients={n_clients} | Local Epochs={epochs} ===")
+            config["algorithm"] = algo
+            config["epochs"] = epochs
+
+            metrics, elapsed = run_federated_experiment(
+                algo=algo,
+                num_clients=n_clients,
+                local_epochs=epochs,
+                config=config.copy(),
+                train_dataset=train_dataset,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                device=device
+            )
+
+            results.loc[len(results)] = [
+                algo, n_clients, epochs,
+                metrics.get("auc_macro", None),
+                metrics.get("auc_micro", None),
+                metrics.get("f1_macro", None),
+                metrics.get("f1_micro", None),
+                metrics.get("pr_auc_macro", None),
+                metrics.get("pr_auc_micro", None),
+                elapsed
+            ]
+
+            # Save after each run to preserve progress
+            results.to_csv("../History/summary_results.csv", index=False)
+            print(f"✅ Completed: {algo} | Clients={n_clients} | Epochs={epochs}\n")
+
+print("\n🎯 All 27 configurations complete!")
+print(results)
 
 
 
