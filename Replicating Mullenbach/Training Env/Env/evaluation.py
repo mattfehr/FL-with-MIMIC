@@ -72,18 +72,18 @@ from sklearn.metrics import average_precision_score
 def pr_auc_metrics(yhat_raw, y):
     """
     Compute Precision-Recall AUC (macro and micro).
-    Returns a dict: {'prauc_macro': val, 'prauc_micro': val}
+    Returns a dict: {'pr_auc_macro': val, 'pr_auc_micro': val}
     """
     y = np.array(y)
     yhat_raw = np.array(yhat_raw)
     metrics = {}
 
     try:
-        metrics["prauc_macro"] = average_precision_score(y, yhat_raw, average="macro")
-        metrics["prauc_micro"] = average_precision_score(y, yhat_raw, average="micro")
+        metrics["pr_auc_macro"] = average_precision_score(y, yhat_raw, average="macro")
+        metrics["pr_auc_micro"] = average_precision_score(y, yhat_raw, average="micro")
     except Exception as e:
         print("[Warning] PR-AUC calculation failed:", e)
-        metrics["prauc_macro"], metrics["prauc_micro"] = 0.0, 0.0
+        metrics["pr_auc_macro"], metrics["pr_auc_micro"] = 0.0, 0.0
 
     return metrics
 
