@@ -165,6 +165,19 @@ config = {
 
 model_param_path = os.path.join("..", "Model", "processed_full.w2v")
 
+# %% [markdown]
+# ### Recover Tokens from Input Sequences
+
+# %%
+from gensim.models import Word2Vec
+
+# Load your W2V model to get the mapping index → token
+w2v = Word2Vec.load(model_param_path)
+idx_to_token = w2v.wv.index_to_key   # list where index maps to actual word
+
+PAD_INDEX = len(idx_to_token)  # from ConvAttnPool padding_idx
+
+
 # %%
 # Load Trained Models and Test Data
 
@@ -225,9 +238,11 @@ def build_batch_from_indices(dataset, indices):
     return torch.stack(X_list), torch.stack(Y_list)
 
 # pick some label indices you care about
-label_indices = [3, 7]   # example; change to interesting labels
+label_indices = [3, 7]     # example; change to interesting labels
+N_PER_LABEL   = 200        # <-- average over many positives (raise/lower as needed)
+
 sample_indices_by_label = collect_positive_samples_for_labels(
-    test_dataset, label_indices, n_per_label=5
+    test_dataset, label_indices, n_per_label=N_PER_LABEL
 )
 sample_indices_by_label
 
@@ -305,41 +320,171 @@ def cosine_sim(a, b):
     # a, b: (seq_len,)
     return F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
 
+model_names = list(models.keys())
+
 for lbl in label_indices:
-    print(f"\nLabel {lbl}")
+    print(f"\n=== Label {lbl} ===")
     idx0 = sample_indices_by_label[lbl][0]
     X_batch, _ = build_batch_from_indices(test_dataset, [idx0])
 
-    # collect alpha for this single sample
+    # collect one attention vector per model
     alpha_single = {}
     for name, model in models.items():
         _, alpha_lbl = get_attention_for_label(model, X_batch, lbl)
         alpha_single[name] = alpha_lbl[0]  # (seq_len,)
 
-    # compare every model to Centralized
-    base = alpha_single["Centralized"]
-    for name, vec in alpha_single.items():
-        if name == "Centralized":
-            continue
-        sim = cosine_sim(base, vec)
-        print(f"  cos(attn Centralized, {name}) = {sim:.4f}")
+    # build similarity matrix
+    sims = np.zeros((len(model_names), len(model_names)))
+    for i, name_i in enumerate(model_names):
+        for j, name_j in enumerate(model_names):
+            sims[i, j] = cosine_sim(alpha_single[name_i], alpha_single[name_j])
+
+    sim_df = pd.DataFrame(sims, index=model_names, columns=model_names)
+    print(f"Cosine similarity of attention vectors for label {lbl}, sample idx {idx0}:")
+    display(sim_df)
+
+
+# %%
+# --- Jaccard similarity helpers (PAD + context-window trimming) ---
+
+def get_nonpad_len(x_1d: torch.Tensor, pad_index: int) -> int:
+    """
+    Returns number of non-PAD tokens assuming PAD fills from the end.
+    """
+    x = x_1d.detach().cpu()
+    pad_pos = (x == pad_index).nonzero(as_tuple=False)
+    return int(pad_pos[0].item()) if len(pad_pos) > 0 else int(x.numel())
+
+def get_valid_positions(x_1d: torch.Tensor, pad_index: int, window_size: int | None) -> np.ndarray:
+    """
+    Valid attention positions:
+      - exclude PAD region
+      - optionally trim 'half window' tokens at both ends to reduce conv padding artifacts
+    """
+    L = get_nonpad_len(x_1d, pad_index)
+    if L <= 0:
+        return np.array([], dtype=int)
+
+    left, right = 0, L  # right is exclusive
+    if window_size is not None and window_size > 1:
+        half = window_size // 2
+        left = min(left + half, L)
+        right = max(right - half, left)
+
+    return np.arange(left, right, dtype=int)
+
+def topk_positions(att_vec_1d: torch.Tensor, valid_pos: np.ndarray, k: int) -> set[int]:
+    """
+    Return set of token positions corresponding to top-k attention weights within valid_pos.
+    """
+    if valid_pos.size == 0:
+        return set()
+
+    att = att_vec_1d.detach().cpu().numpy()
+    att_valid = att[valid_pos]
+    if att_valid.size == 0:
+        return set()
+
+    k_eff = min(k, att_valid.size)
+    idx_part = np.argpartition(att_valid, -k_eff)[-k_eff:]
+    idx_sorted = idx_part[np.argsort(att_valid[idx_part])[::-1]]
+
+    return set(valid_pos[idx_sorted].tolist())
+
+def jaccard(a: set[int], b: set[int]) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+# %%
+# --- Average Jaccard similarity across many positive samples (per label) ---
+
+@torch.no_grad()
+def attention_vec_for_label_single(model, x_1d, label_idx):
+    """
+    x_1d: (seq_len,)
+    returns: attention vec (seq_len,)
+    """
+    _, alpha_lbl = get_attention_for_label(model, x_1d.unsqueeze(0), label_idx)
+    return alpha_lbl[0]  # (seq_len,)
+
+def avg_jaccard_matrix_for_label(
+    dataset,
+    sample_indices: list[int],
+    label_idx: int,
+    top_k: int = 15,
+    trim_context_window: bool = True,
+):
+    model_names = list(models.keys())
+    mat_vals = { (a,b): [] for a in model_names for b in model_names }
+
+    window_size = config["window_size"] if trim_context_window else None
+
+    for ds_idx in sample_indices:
+        x, _ = dataset[ds_idx]
+        valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+
+        topk_by_model = {}
+        for mname, m in models.items():
+            att = attention_vec_for_label_single(m, x.to(device), label_idx)
+            topk_by_model[mname] = topk_positions(att, valid_pos, k=top_k)
+
+        for a in model_names:
+            for b in model_names:
+                mat_vals[(a,b)].append(jaccard(topk_by_model[a], topk_by_model[b]))
+
+    # build dataframe
+    M = np.zeros((len(model_names), len(model_names)), dtype=float)
+    for i, a in enumerate(model_names):
+        for j, b in enumerate(model_names):
+            vals = mat_vals[(a,b)]
+            M[i, j] = float(np.mean(vals)) if len(vals) else np.nan
+
+    return pd.DataFrame(M, index=model_names, columns=model_names)
+
+def mean_off_diagonal(df: pd.DataFrame) -> float:
+    arr = df.values
+    mask = ~np.eye(arr.shape[0], dtype=bool)
+    return float(np.nanmean(arr[mask]))
+
+TOP_K = 15
+TRIM_CONTEXT = True  # set False to keep edge tokens
+
+jaccard_results = {}
+summary_rows = []
+
+for lbl in label_indices:
+    idxs = sample_indices_by_label[lbl]
+    df_j = avg_jaccard_matrix_for_label(
+        dataset=test_dataset,
+        sample_indices=idxs,
+        label_idx=lbl,
+        top_k=TOP_K,
+        trim_context_window=TRIM_CONTEXT,
+    )
+    jaccard_results[lbl] = df_j
+
+    print(f"\nAvg Jaccard (top-{TOP_K}) | label={lbl} | n={len(idxs)} | trim_context={TRIM_CONTEXT}")
+    display(df_j)
+
+    summary_rows.append({
+        "label": lbl,
+        "n_samples": len(idxs),
+        "top_k": TOP_K,
+        "trim_context": TRIM_CONTEXT,
+        "mean_pairwise_jaccard": mean_off_diagonal(df_j),
+    })
+
+summary_df = pd.DataFrame(summary_rows).sort_values("mean_pairwise_jaccard", ascending=False)
+print("\nSummary (mean off-diagonal Jaccard per label):")
+display(summary_df)
 
 
 # %% [markdown]
 # ## Qualitative
-
-# %% [markdown]
-# ### Recover Tokens from Input Sequences
-
-# %%
-from gensim.models import Word2Vec
-
-# Load your W2V model to get the mapping index → token
-w2v = Word2Vec.load(model_param_path)
-idx_to_token = w2v.wv.index_to_key   # list where index maps to actual word
-
-PAD_INDEX = len(idx_to_token)  # from ConvAttnPool padding_idx
-
 
 # %% [markdown]
 # ### Decode a Sequence of Token IDs into Words
@@ -360,22 +505,40 @@ def decode_sequence(token_ids):
 # ### Visualize Attention By Token
 
 # %%
+def get_top_tokens(tokens, attention, k=15, skip_pad=True):
+    """
+    Return the top-k tokens by attention weight.
+    tokens   : list[str]
+    attention: 1D tensor of attention weights
+    k        : how many tokens to return
+    skip_pad : skip '<PAD>' tokens
+    """
+    att = attention.cpu().numpy()
+    idxs = np.argsort(att)[::-1]  # highest first
+
+    top = []
+    for idx in idxs:
+        tok = tokens[idx]
+        if skip_pad and tok == "<PAD>":
+            continue
+        top.append((idx, tok, float(att[idx])))
+        if len(top) >= k:
+            break
+    return top
+
+
+# %%
 from IPython.display import HTML
 
 def attention_to_html(tokens, attention, max_color=240):
-    """
-    tokens: list of decoded tokens
-    attention: 1D tensor of attention weights over sequence
-    max_color: higher value = more yellow intensity
-    """
-    att = attention / attention.max()  # normalize 0..1
+    att = attention / attention.max()
     html = ""
     for tok, w in zip(tokens, att):
         intensity = int(max_color * float(w))
         html += f"<span style='background-color: rgb(255,255,{255-intensity}); padding:2px; margin:1px;'>{tok}</span>"
     return HTML(html)
 
-def show_attention(model_name, label_idx, sample_dataset_idx=0):
+def show_attention(model_name, label_idx, sample_dataset_idx=0, top_k=15):
     # get the sample
     x, y = test_dataset[sample_dataset_idx]
     tokens = decode_sequence(x)
@@ -384,9 +547,14 @@ def show_attention(model_name, label_idx, sample_dataset_idx=0):
     logits, alpha = get_attention_for_label(models[model_name], x.unsqueeze(0), label_idx)
     attention_vec = alpha[0]  # shape (seq_len,)
 
-    # display
     print(f"\nModel: {model_name} | Label: {label_idx} | Sample index: {sample_dataset_idx}")
     display(attention_to_html(tokens, attention_vec))
+
+    # print top-k tokens by attention
+    top = get_top_tokens(tokens, attention_vec, k=top_k)
+    print(f"Top {top_k} tokens by attention:")
+    for pos, tok, w in top:
+        print(f"  pos={pos:4d}  att={w:.4f}  token='{tok}'")
 
 
 # %% [markdown]
