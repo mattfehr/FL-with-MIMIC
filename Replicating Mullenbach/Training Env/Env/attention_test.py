@@ -440,6 +440,368 @@ def show_attention(
         marker = "" if pos in set(valid_pos.tolist()) else "  (trimmed)"
         print(f"  pos={pos:4d} att={w:.4f} tok='{tok}'{marker}")
 
+# %%
+def plot_attention_heatmap(
+    sample_idx: int,
+    label_idx: int,
+    model_names: list,
+    trim_context: bool = True,
+    mode: str = "position",          # "position" (old-style) or "token_zoom"
+    max_tokens: int = None,          # for "position": None shows all valid positions; for "token_zoom" acts as width
+    start: int = 0,                  # for "token_zoom": start offset into valid positions
+    tick_every: int = 10,            # for "token_zoom": label every N tokens
+):
+    """
+    Plot attention heatmaps for multiple models on the same sample+label.
+
+    Modes:
+      - mode="position"  : old-style, x-axis is token position (valid positions only). Best for long sequences.
+      - mode="token_zoom": zoomed window with token strings on x-axis. Best for local inspection.
+
+    Rows = models
+    Cols = token positions (mode="position") or a zoomed token window (mode="token_zoom")
+    """
+    x, y = test_dataset[sample_idx]
+    tokens = decode_sequence(x)
+
+    window_size = config["window_size"] if trim_context else None
+    valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+
+    if len(valid_pos) == 0:
+        print("No valid positions to plot (sequence may be empty or fully padded).")
+        return
+
+    if mode not in {"position", "token_zoom"}:
+        raise ValueError("mode must be 'position' or 'token_zoom'")
+
+    # --- choose which positions to plot ---
+    if mode == "position":
+        pos = valid_pos
+        if max_tokens is not None and len(pos) > max_tokens:
+            pos = pos[:max_tokens]
+    else:  # token_zoom
+        width = 60 if max_tokens is None else int(max_tokens)
+        pos = valid_pos[start:start + width]
+        if len(pos) == 0:
+            print("Token zoom window is empty (check start/max_tokens).")
+            return
+
+    # --- build attention matrix (models x positions) ---
+    attn_matrix = []
+    for mname in model_names:
+        _, att = get_label_logits_and_attn(models[mname], x.unsqueeze(0), label_idx)
+        attn_matrix.append(att[0][pos].detach().cpu().numpy())
+    attn_matrix = np.vstack(attn_matrix)
+
+    # --- plot ---
+    if mode == "position":
+        # old-style: x is token position
+        plt.figure(figsize=(14, 2 + 1.2 * len(model_names)))
+        plt.imshow(
+            attn_matrix,
+            aspect="auto",
+            interpolation="nearest",
+            extent=[int(pos[0]), int(pos[-1]), len(model_names), 0],  # x-axis in true positions
+        )
+        plt.colorbar(label="Attention weight")
+        plt.yticks(np.arange(len(model_names)) + 0.5, model_names)
+        plt.xlabel("Token position (valid positions only)")
+        plt.title(f"Attention Heatmap (by position) | sample={sample_idx}, label={label_idx}")
+        plt.tight_layout()
+        plt.show()
+
+    else:
+        # zoomed: x ticks are token strings
+        plt.figure(figsize=(min(14, len(pos) * 0.25), 2 + 1.2 * len(model_names)))
+        plt.imshow(attn_matrix, aspect="auto", interpolation="nearest")
+        plt.colorbar(label="Attention weight")
+        plt.yticks(range(len(model_names)), model_names)
+
+        xticks = list(range(0, len(pos), max(1, int(tick_every))))
+        xticklabels = [tokens[int(pos[i])] for i in xticks]
+        plt.xticks(xticks, xticklabels, rotation=90)
+
+        plt.xlabel("Tokens (zoomed window)")
+        plt.title(f"Attention Heatmap (token zoom) | sample={sample_idx}, label={label_idx}")
+        plt.tight_layout()
+        plt.show()
+
+
+# %% [markdown]
+# ### Sanity tests for helper functions (labels 3 and 7)
+# 
+# These checks ensure:
+# - thresholds exist and look reasonable (0.05–0.90 grid)
+# - attention vectors are shaped correctly and sum to ~1 across tokens
+# - valid position logic trims PAD and conv edges as intended
+# - cosine/Jaccard behave as expected on a few known samples
+# - agree-positive masking is actually filtering (not always true/false)
+# - qualitative output prints consistent prediction metadata
+# 
+
+# %%
+# Test 1: Threshold vectors are valid per model
+
+TEST_LABELS = [3, 7]
+
+print("=== Threshold sanity check ===")
+for mname in models.keys():
+    thr = per_label_thr_by_model[mname]
+    print(f"\n{mname}: shape={tuple(thr.shape)}  min={thr.min():.2f}  max={thr.max():.2f}")
+    for lbl in TEST_LABELS:
+        print(f"  label {lbl}: thr={thr[lbl].item():.2f}")
+
+    # quick assertion-style checks
+    assert thr.ndim == 1, "threshold vector should be 1D"
+    assert (thr >= 0.0).all() and (thr <= 1.0).all(), "thresholds should be in [0,1]"
+
+
+# %%
+# Test 2: Attention shapes + sum-to-1 checks (softmax)
+
+print("=== Attention shape + sum-to-1 sanity check ===")
+
+# pick one arbitrary test sample
+ds_idx = 0
+x, y = test_dataset[ds_idx]
+Xb = x.unsqueeze(0)
+
+for lbl in TEST_LABELS:
+    print(f"\nSample={ds_idx} | label={lbl}")
+    for mname, model in models.items():
+        logits_lbl, attn_lbl = get_label_logits_and_attn(model, Xb, lbl)
+        att = attn_lbl[0]  # (L,)
+
+        s = float(att.sum().item())
+        mx = float(att.max().item())
+        print(f"  {mname:11s} attn_shape={tuple(att.shape)} sum={s:.6f} max={mx:.6f}")
+
+        # should be very close to 1.0 due to softmax
+        assert abs(s - 1.0) < 1e-3, f"{mname} attention does not sum to ~1 (got {s})"
+
+
+# %%
+# Test 3: valid_positions trimming behaves (PAD + conv edges)
+
+print("=== valid_positions sanity check ===")
+
+# pick a sample likely to have PADs (random-ish)
+ds_idx = 123
+x, y = test_dataset[ds_idx]
+nonpad_len = get_nonpad_len(x, PAD_INDEX)
+
+valid_no_trim = get_valid_positions(x, PAD_INDEX, window_size=None)
+valid_trim = get_valid_positions(x, PAD_INDEX, window_size=config["window_size"])
+
+print(f"Sample={ds_idx}")
+print("  seq_len:", x.numel())
+print("  nonpad_len:", nonpad_len)
+print("  valid_no_trim:", (valid_no_trim.min() if len(valid_no_trim) else None), "to", (valid_no_trim.max() if len(valid_no_trim) else None), "len=", len(valid_no_trim))
+print("  valid_trim   :", (valid_trim.min() if len(valid_trim) else None), "to", (valid_trim.max() if len(valid_trim) else None), "len=", len(valid_trim))
+
+# should be subset
+assert len(valid_trim) <= len(valid_no_trim)
+if len(valid_trim) > 0:
+    assert valid_trim[0] >= valid_no_trim[0]
+    assert valid_trim[-1] <= valid_no_trim[-1]
+
+
+# %%
+# Test 4: cosine/Jaccard self-similarity = 1, and symmetry
+
+print("=== Similarity metric sanity check ===")
+
+ds_idx = 0
+x, y = test_dataset[ds_idx]
+Xb = x.unsqueeze(0)
+valid_pos = get_valid_positions(x, PAD_INDEX, window_size=config["window_size"])
+TOP_K_TEST = 15
+
+for lbl in TEST_LABELS:
+    # pick one model as baseline
+    mname = "Centralized"
+    _, att = get_label_logits_and_attn(models[mname], Xb, lbl)
+    att = att[0]
+
+    cos_self = cosine_sim_on_valid(att, att, valid_pos)
+    jac_self = jaccard(topk_positions(att, valid_pos, TOP_K_TEST), topk_positions(att, valid_pos, TOP_K_TEST))
+
+    print(f"\nlabel={lbl} self-sim: cos={cos_self:.6f}  jac={jac_self:.6f}")
+    assert abs(cos_self - 1.0) < 1e-6
+    assert abs(jac_self - 1.0) < 1e-9
+
+    # symmetry check on a pair
+    a, b = "Centralized", "FedAvg"
+    _, att_a = get_label_logits_and_attn(models[a], Xb, lbl)
+    _, att_b = get_label_logits_and_attn(models[b], Xb, lbl)
+    att_a, att_b = att_a[0], att_b[0]
+
+    cos_ab = cosine_sim_on_valid(att_a, att_b, valid_pos)
+    cos_ba = cosine_sim_on_valid(att_b, att_a, valid_pos)
+
+    jac_ab = jaccard(topk_positions(att_a, valid_pos, TOP_K_TEST), topk_positions(att_b, valid_pos, TOP_K_TEST))
+    jac_ba = jaccard(topk_positions(att_b, valid_pos, TOP_K_TEST), topk_positions(att_a, valid_pos, TOP_K_TEST))
+
+    print(f"  symmetry: cos_ab={cos_ab:.6f} cos_ba={cos_ba:.6f} | jac_ab={jac_ab:.6f} jac_ba={jac_ba:.6f}")
+    assert abs(cos_ab - cos_ba) < 1e-9
+    assert abs(jac_ab - jac_ba) < 1e-12
+
+
+# %%
+# Test 5: agree-positive mask actually filters (find examples)
+
+print("=== agree_positive_mask sanity check (find actual kept samples) ===")
+
+pair = ("Centralized", "FedAvg")
+max_to_find = 5
+
+for lbl in TEST_LABELS:
+    found = []
+    for ds_idx in range(len(test_dataset)):
+        x, y = test_dataset[ds_idx]
+        Xb = x.unsqueeze(0)
+        if bool(agree_positive_mask(pair[0], pair[1], Xb, lbl).item()):
+            found.append(ds_idx)
+        if len(found) >= max_to_find:
+            break
+
+    print(f"\nlabel={lbl} | pair={pair[0]} vs {pair[1]} | found agree-positive samples:", found)
+
+    # It’s possible a label is super rare; don’t hard-assert >0,
+    # but if found, show prediction metadata for the first one.
+    if found:
+        ds0 = found[0]
+        for m in pair:
+            show_attention(m, lbl, ds0, top_k=15, trim_context=True)
+
+
+# %%
+# Test 6: “old notebook parity” check for labels 3 and 7
+
+print("=== Parity check: per-sample similarity matrices (labels 3 and 7) ===")
+
+MODEL_NAMES = list(models.keys())
+TOP_K = 15
+TRIM = True
+
+# pick one sample index per label where GT=1 (like your old notebook)
+def find_first_gt_positive(label_idx: int, max_scan: int = 5000) -> Optional[int]:
+    for i in range(min(max_scan, len(test_dataset))):
+        _, y = test_dataset[i]
+        if int(y[label_idx].item()) == 1:
+            return i
+    return None
+
+for lbl in TEST_LABELS:
+    ds_idx = find_first_gt_positive(lbl)
+    print(f"\nLabel={lbl} | first GT-positive sample={ds_idx}")
+    if ds_idx is None:
+        print("  (none found in scan range)")
+        continue
+
+    x, y = test_dataset[ds_idx]
+    Xb = x.unsqueeze(0)
+    window_size = config["window_size"] if TRIM else None
+    valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+
+    # collect attention vectors
+    att_by_model = {}
+    for mname in MODEL_NAMES:
+        _, att = get_label_logits_and_attn(models[mname], Xb, lbl)
+        att_by_model[mname] = att[0]
+
+    # cosine matrix
+    cosM = np.zeros((len(MODEL_NAMES), len(MODEL_NAMES)))
+    jacM = np.zeros((len(MODEL_NAMES), len(MODEL_NAMES)))
+
+    for i, a in enumerate(MODEL_NAMES):
+        for j, b in enumerate(MODEL_NAMES):
+            cosM[i, j] = cosine_sim_on_valid(att_by_model[a], att_by_model[b], valid_pos)
+            jacM[i, j] = jaccard(topk_positions(att_by_model[a], valid_pos, TOP_K),
+                                 topk_positions(att_by_model[b], valid_pos, TOP_K))
+
+    display(pd.DataFrame(cosM, index=MODEL_NAMES, columns=MODEL_NAMES))
+    display(pd.DataFrame(jacM, index=MODEL_NAMES, columns=MODEL_NAMES))
+
+    # show predictions for context
+    for mname in MODEL_NAMES:
+        logits, probs, pred = predict_label_for_samples(mname, Xb, lbl)
+        thr = per_label_thr_by_model[mname][lbl].item()
+        print(f"  {mname:11s} prob={probs[0].item():.4f} thr={thr:.2f} pred={bool(pred[0].item())} GT={int(y[lbl].item())}")
+
+
+# %%
+# Test 7: attention heatmap sanity check (agree-positive samples) — shows BOTH modes
+
+print("=== attention heatmap sanity check (position + token_zoom) ===")
+
+pair = ("Centralized", "FedAvg")
+max_to_find = 2
+
+# position-mode controls
+POS_MAX_TOKENS = None     # None shows full valid range; set e.g. 500 if too wide/heavy
+
+# token-zoom controls
+ZOOM_START = 0
+ZOOM_WIDTH = 60
+ZOOM_TICK_EVERY = 5
+
+for lbl in TEST_LABELS:
+    found = []
+
+    # find agree-positive samples
+    for ds_idx in range(len(test_dataset)):
+        x, y = test_dataset[ds_idx]
+        Xb = x.unsqueeze(0)
+
+        if bool(agree_positive_mask(pair[0], pair[1], Xb, lbl).item()):
+            found.append(ds_idx)
+
+        if len(found) >= max_to_find:
+            break
+
+    print(f"\nlabel={lbl} | pair={pair[0]} vs {pair[1]} | found agree-positive samples:", found)
+
+    if not found:
+        print("  (no agree-positive samples found; skipping heatmaps)")
+        continue
+
+    for ds_idx in found:
+        print("\n----------------------------------")
+        print(f"Heatmap test | label={lbl} | sample={ds_idx}")
+
+        # Print prediction metadata first (important context)
+        for m in pair:
+            x0, _ = test_dataset[ds_idx]
+            logits, probs, pred = predict_label_for_samples(m, x0.unsqueeze(0), lbl)
+            thr = per_label_thr_by_model[m][lbl].item()
+            print(f"  {m:11s} | prob={probs[0].item():.4f} | thr={thr:.2f} | pred={bool(pred[0].item())}")
+
+        # 1) Old-style: by token position (matches original notebook vibe)
+        print("  -> Plot: mode='position'")
+        plot_attention_heatmap(
+            sample_idx=ds_idx,
+            label_idx=lbl,
+            model_names=list(pair),
+            trim_context=True,
+            mode="position",
+            max_tokens=POS_MAX_TOKENS
+        )
+
+        # 2) Zoomed: token-labeled window (readable)
+        print("  -> Plot: mode='token_zoom'")
+        plot_attention_heatmap(
+            sample_idx=ds_idx,
+            label_idx=lbl,
+            model_names=list(pair),
+            trim_context=True,
+            mode="token_zoom",
+            start=ZOOM_START,
+            max_tokens=ZOOM_WIDTH,      # width of zoom window
+            tick_every=ZOOM_TICK_EVERY
+        )
+
+
 # %% [markdown]
 # ## Questions
 
@@ -447,11 +809,527 @@ def show_attention(
 # ### 1. Do different models focus on the same tokens given the same input and prediction?
 # 
 # This helps us assess whether federated models preserve reasoning patterns similar to centralized training.
+# 
+# We measure attention agreement **only on samples where two models both predict the label as positive**
+# (using each model's own per-label threshold computed on validation).
+# 
+# Metrics:
+# - Cosine similarity on attention vectors (valid positions only: no PAD + conv-edge trimmed)
+# - Top-k Jaccard overlap on most-attended token positions (valid positions only)
+# 
+# We also report **coverage**: how many samples survive the agree-positive filter.
+
+# %%
+# Q1 CONFIG
+
+Q1_LABELS = list(range(50))   # or [3, 7] to start small
+Q1_PAIR_MODE = "agree_positive"   # "agree_positive" (recommended) or "agree_prediction"
+Q1_TOP_K = 15
+Q1_TRIM_CONTEXT = True
+
+# candidate pool options:
+Q1_CANDIDATE_POOL = "all_test"     # "all_test" or "gt_positive"
+
+# speed/coverage knobs
+Q1_MAX_SAMPLES_PER_LABEL = None    # None = no cap, or set e.g. 300 to speed up
+Q1_PROGRESS = True
+
+MODEL_NAMES = list(models.keys())
+Q1_PAIRS = [(a, b) for i, a in enumerate(MODEL_NAMES) for b in MODEL_NAMES[i+1:]]
+
+print("Q1_LABELS:", (Q1_LABELS[:10], "...") if len(Q1_LABELS) > 10 else Q1_LABELS)
+print("Q1_PAIRS:", Q1_PAIRS)
+
+
+# %%
+def get_candidate_indices_for_label(label_idx: int) -> List[int]:
+    """
+    Choose candidate dataset indices to test for a label.
+    """
+    if Q1_CANDIDATE_POOL == "all_test":
+        idxs = list(range(len(test_dataset)))
+        return idxs[:Q1_MAX_SAMPLES_PER_LABEL] if Q1_MAX_SAMPLES_PER_LABEL else idxs
+
+    if Q1_CANDIDATE_POOL == "gt_positive":
+        idxs = []
+        for i in range(len(test_dataset)):
+            _, y = test_dataset[i]
+            if int(y[label_idx].item()) == 1:
+                idxs.append(i)
+                if Q1_MAX_SAMPLES_PER_LABEL and len(idxs) >= Q1_MAX_SAMPLES_PER_LABEL:
+                    break
+        return idxs
+
+    raise ValueError(f"Unknown Q1_CANDIDATE_POOL={Q1_CANDIDATE_POOL}")
+
+
+def q1_pair_mask(model_a: str, model_b: str, Xb: torch.Tensor, label_idx: int) -> torch.Tensor:
+    if Q1_PAIR_MODE == "agree_positive":
+        return agree_positive_mask(model_a, model_b, Xb, label_idx)
+    elif Q1_PAIR_MODE == "agree_prediction":
+        return agree_prediction_mask(model_a, model_b, Xb, label_idx)
+    else:
+        raise ValueError(f"Unknown Q1_PAIR_MODE={Q1_PAIR_MODE}")
+
+
+# %%
+# Q1 RUN
+
+q1_rows = []
+
+label_iter = tqdm(Q1_LABELS, desc="Q1 labels") if Q1_PROGRESS else Q1_LABELS
+for label_idx in label_iter:
+    cand_idxs = get_candidate_indices_for_label(label_idx)
+
+    for a, b in Q1_PAIRS:
+        cos_vals: List[float] = []
+        jac_vals: List[float] = []
+        kept = 0
+
+        # extra bookkeeping for context (optional but helpful)
+        kept_gt_pos = 0
+        kept_gt_neg = 0
+
+        for ds_idx in cand_idxs:
+            x, y = test_dataset[ds_idx]
+            Xb = x.unsqueeze(0)
+
+            mask = q1_pair_mask(a, b, Xb, label_idx)
+            if not bool(mask.item()):
+                continue
+
+            kept += 1
+            if int(y[label_idx].item()) == 1:
+                kept_gt_pos += 1
+            else:
+                kept_gt_neg += 1
+
+            window_size = config["window_size"] if Q1_TRIM_CONTEXT else None
+            valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+
+            # fetch attention vectors
+            _, att_a = get_label_logits_and_attn(models[a], Xb, label_idx)
+            _, att_b = get_label_logits_and_attn(models[b], Xb, label_idx)
+            att_a_1d = att_a[0]
+            att_b_1d = att_b[0]
+
+            # metrics
+            cos_vals.append(cosine_sim_on_valid(att_a_1d, att_b_1d, valid_pos))
+            top_a = topk_positions(att_a_1d, valid_pos, Q1_TOP_K)
+            top_b = topk_positions(att_b_1d, valid_pos, Q1_TOP_K)
+            jac_vals.append(jaccard(top_a, top_b))
+
+        q1_rows.append({
+            "label": label_idx,
+            "pair": f"{a} vs {b}",
+            "candidate_pool": Q1_CANDIDATE_POOL,
+            "pair_mode": Q1_PAIR_MODE,
+            "top_k": Q1_TOP_K,
+            "trim_context": Q1_TRIM_CONTEXT,
+            "n_candidates": len(cand_idxs),
+            "n_kept": kept,
+            "kept_gt_pos": kept_gt_pos,
+            "kept_gt_neg": kept_gt_neg,
+            "cos_mean": float(np.nanmean(cos_vals)) if cos_vals else np.nan,
+            "cos_median": float(np.nanmedian(cos_vals)) if cos_vals else np.nan,
+            "cos_std": float(np.nanstd(cos_vals)) if cos_vals else np.nan,
+            "jac_mean": float(np.nanmean(jac_vals)) if jac_vals else np.nan,
+            "jac_median": float(np.nanmedian(jac_vals)) if jac_vals else np.nan,
+            "jac_std": float(np.nanstd(jac_vals)) if jac_vals else np.nan,
+        })
+
+q1_df = pd.DataFrame(q1_rows)
+print("Done. Rows:", len(q1_df))
+display(q1_df.head())
+
+
+# %%
+# Q1: View coverage + agreement per label (sorted)
+
+# Sort by coverage first (so you can see which labels/pairs have enough agree-positive samples)
+q1_sorted = q1_df.sort_values(["n_kept", "jac_mean"], ascending=[False, False])
+display(q1_sorted.head(30))
+
+# If you want to only see central-vs-fed comparisons:
+central_vs = q1_df[q1_df["pair"].str.contains("Centralized")]
+display(central_vs.sort_values(["n_kept", "jac_mean"], ascending=[False, False]).head(30))
+
+
+# %%
+# Q1: Aggregate summary per pair across labels (weighted by coverage)
+
+def weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
+    mask = ~np.isnan(values)
+    values = values[mask]
+    weights = weights[mask]
+    if values.size == 0:
+        return float("nan")
+    if weights.sum() <= 0:
+        return float("nan")
+    return float((values * weights).sum() / weights.sum())
+
+pair_summaries = []
+for pair, sub in q1_df.groupby("pair"):
+    w = sub["n_kept"].to_numpy(dtype=float)
+
+    pair_summaries.append({
+        "pair": pair,
+        "labels_covered": int(sub["n_kept"].gt(0).sum()),
+        "total_kept": int(sub["n_kept"].sum()),
+        "cos_mean_weighted": weighted_mean(sub["cos_mean"].to_numpy(dtype=float), w),
+        "jac_mean_weighted": weighted_mean(sub["jac_mean"].to_numpy(dtype=float), w),
+        "cos_median_unweighted": float(np.nanmedian(sub["cos_median"].to_numpy(dtype=float))),
+        "jac_median_unweighted": float(np.nanmedian(sub["jac_median"].to_numpy(dtype=float))),
+    })
+
+q1_pair_summary = pd.DataFrame(pair_summaries).sort_values(["jac_mean_weighted", "cos_mean_weighted"], ascending=False)
+display(q1_pair_summary)
+
+
+# %%
+# Q1: Bar plots for Centralized vs Federated models
+
+central_pairs = q1_pair_summary[
+    q1_pair_summary["pair"].str.contains("Centralized")
+]
+
+if len(central_pairs) == 0:
+    print("No Centralized pairs found in summary (unexpected if Centralized model is loaded).")
+else:
+    # --- Weighted Cosine ---
+    plt.figure()
+    plt.bar(
+        central_pairs["pair"],
+        central_pairs["cos_mean_weighted"]
+    )
+    plt.title("Q1: Weighted Cosine Similarity (Centralized vs Federated)")
+    plt.ylabel("Weighted cosine similarity")
+    plt.xticks(rotation=30, ha="right")
+
+    for i, v in enumerate(central_pairs["cos_mean_weighted"]):
+        plt.text(i, v, f"{v:.3f}", ha="center", va="bottom")
+
+    plt.tight_layout()
+    plt.show()
+
+    # --- Weighted Jaccard ---
+    plt.figure()
+    plt.bar(
+        central_pairs["pair"],
+        central_pairs["jac_mean_weighted"]
+    )
+    plt.title("Q1: Weighted Jaccard@15 (Centralized vs Federated)")
+    plt.ylabel("Weighted Jaccard")
+    plt.xticks(rotation=30, ha="right")
+
+    for i, v in enumerate(central_pairs["jac_mean_weighted"]):
+        plt.text(i, v, f"{v:.3f}", ha="center", va="bottom")
+
+    plt.tight_layout()
+    plt.show()
+
+
+# %% [markdown]
+# ### Interpreting Q1 results (what to look for)
+# 
+# - High cosine + high Jaccard@K → models concentrate attention on similar token positions.
+# - High cosine but low Jaccard → attention mass is spread similarly but top tokens differ.
+# - Low cosine + low Jaccard → models rely on different parts of the sequence (different rationale patterns).
+# 
+# Always check `n_kept`:
+# - If `n_kept` is small for a label/pair, treat that label result as noisy.
+# 
 
 # %% [markdown]
 # ### 2. Are there cases where models make the same prediction but rely on different tokens?
 # 
 # These cases are particularly important, as they indicate potential differences in learned clinical rationale even when accuracy agrees.
+# 
+# We search for **disagreement-in-rationale** cases:
+# - Restrict to samples where both models predict the label positive (**agree-positive**)
+# - Score attention similarity on valid positions using:
+#   - cosine similarity (lower = more different)
+#   - Jaccard@K overlap (lower = different top tokens)
+# - Return the most divergent samples and inspect with `show_attention()`
+
+# %%
+# Q2 CONFIG
+
+Q2_LABELS = list(range(50))        # or start with [3, 7, 20]
+Q2_PAIR = ("Centralized", "FedAvg") # change to ("Centralized","FedProx"), ("Centralized","SCAFFOLD"), etc.
+
+Q2_TOP_K = 15
+Q2_TRIM_CONTEXT = True
+Q2_CANDIDATE_POOL = "all_test"      # "all_test" or "gt_positive"
+Q2_MAX_SCAN_PER_LABEL = None        # None or e.g. 500 for speed
+Q2_KEEP_TOP_N_PER_LABEL = 5         # keep top divergent samples per label
+Q2_MIN_KEPT_REQUIRED = 30           # skip labels with low coverage (avoid noisy results)
+
+print("Q2_LABELS:", (Q2_LABELS[:10], "...") if len(Q2_LABELS) > 10 else Q2_LABELS)
+print("Q2_PAIR:", Q2_PAIR)
+
+
+# %%
+# Helper: candidates for Q2 (reuse Q1 style but independent knobs)
+
+def q2_candidate_indices_for_label(label_idx: int) -> List[int]:
+    if Q2_CANDIDATE_POOL == "all_test":
+        idxs = list(range(len(test_dataset)))
+        return idxs[:Q2_MAX_SCAN_PER_LABEL] if Q2_MAX_SCAN_PER_LABEL else idxs
+
+    if Q2_CANDIDATE_POOL == "gt_positive":
+        idxs = []
+        for i in range(len(test_dataset)):
+            _, y = test_dataset[i]
+            if int(y[label_idx].item()) == 1:
+                idxs.append(i)
+                if Q2_MAX_SCAN_PER_LABEL and len(idxs) >= Q2_MAX_SCAN_PER_LABEL:
+                    break
+        return idxs
+
+    raise ValueError(f"Unknown Q2_CANDIDATE_POOL={Q2_CANDIDATE_POOL}")
+
+
+# %%
+# Q2: Compute per-sample divergence for a given label + pair (returns a dataframe)
+
+@torch.no_grad()
+def q2_find_divergent_samples_for_label(
+    label_idx: int,
+    model_a: str,
+    model_b: str,
+    top_k: int,
+    trim_context: bool,
+    candidate_indices: List[int],
+) -> pd.DataFrame:
+    rows = []
+    kept = 0
+
+    for ds_idx in candidate_indices:
+        x, y = test_dataset[ds_idx]
+        Xb = x.unsqueeze(0)
+
+        # agree-positive filter (same prediction == positive)
+        if not bool(agree_positive_mask(model_a, model_b, Xb, label_idx).item()):
+            continue
+
+        kept += 1
+        window_size = config["window_size"] if trim_context else None
+        valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+
+        # attention vectors
+        _, att_a = get_label_logits_and_attn(models[model_a], Xb, label_idx)
+        _, att_b = get_label_logits_and_attn(models[model_b], Xb, label_idx)
+        att_a_1d, att_b_1d = att_a[0], att_b[0]
+
+        cos = cosine_sim_on_valid(att_a_1d, att_b_1d, valid_pos)
+        jac = jaccard(
+            topk_positions(att_a_1d, valid_pos, top_k),
+            topk_positions(att_b_1d, valid_pos, top_k),
+        )
+
+        # also store prediction context
+        logit_a, prob_a, pred_a = predict_label_for_samples(model_a, Xb, label_idx)
+        logit_b, prob_b, pred_b = predict_label_for_samples(model_b, Xb, label_idx)
+        thr_a = float(per_label_thr_by_model[model_a][label_idx].item())
+        thr_b = float(per_label_thr_by_model[model_b][label_idx].item())
+
+        rows.append({
+            "label": label_idx,
+            "sample": ds_idx,
+            "pair": f"{model_a} vs {model_b}",
+            "gt": int(y[label_idx].item()),
+            "cos": float(cos),
+            "jac": float(jac),
+            "prob_a": float(prob_a[0].item()),
+            "thr_a": thr_a,
+            "prob_b": float(prob_b[0].item()),
+            "thr_b": thr_b,
+            "valid_len": int(len(valid_pos)),
+        })
+
+    df = pd.DataFrame(rows)
+    # Sort most divergent first: low cosine then low jaccard
+    if len(df) > 0:
+        df = df.sort_values(["cos", "jac"], ascending=[True, True]).reset_index(drop=True)
+
+    # attach coverage info (how many agree-positive were found)
+    df.attrs["n_kept"] = kept
+    df.attrs["n_scanned"] = len(candidate_indices)
+    return df
+
+
+# %%
+# Q2 RUN: collect top divergent examples per label
+
+model_a, model_b = Q2_PAIR
+
+q2_all = []
+q2_label_stats = []
+
+for label_idx in tqdm(Q2_LABELS, desc="Q2 labels"):
+    cand_idxs = q2_candidate_indices_for_label(label_idx)
+
+    df = q2_find_divergent_samples_for_label(
+        label_idx=label_idx,
+        model_a=model_a,
+        model_b=model_b,
+        top_k=Q2_TOP_K,
+        trim_context=Q2_TRIM_CONTEXT,
+        candidate_indices=cand_idxs,
+    )
+
+    n_kept = df.attrs.get("n_kept", 0)
+    q2_label_stats.append({
+        "label": label_idx,
+        "n_scanned": df.attrs.get("n_scanned", len(cand_idxs)),
+        "n_agree_pos": n_kept,
+        "n_returned": int(min(Q2_KEEP_TOP_N_PER_LABEL, len(df))),
+        "cos_min": float(df["cos"].min()) if len(df) else np.nan,
+        "jac_min": float(df["jac"].min()) if len(df) else np.nan,
+    })
+
+    # skip low-coverage labels (avoid misleading "divergent" samples from tiny n)
+    if n_kept < Q2_MIN_KEPT_REQUIRED:
+        continue
+
+    q2_all.append(df.head(Q2_KEEP_TOP_N_PER_LABEL))
+
+q2_label_stats_df = pd.DataFrame(q2_label_stats).sort_values("n_agree_pos", ascending=False)
+display(q2_label_stats_df.head(20))
+
+q2_cases_df = pd.concat(q2_all, ignore_index=True) if len(q2_all) else pd.DataFrame()
+print("Total Q2 cases collected:", len(q2_cases_df))
+display(q2_cases_df.head(20))
+
+
+# %%
+# Q2: Find the MOST divergent cases overall (across labels)
+
+if len(q2_cases_df) == 0:
+    print("No Q2 cases found (check Q2_MIN_KEPT_REQUIRED / pair / candidate pool).")
+else:
+    q2_most_divergent = q2_cases_df.sort_values(["cos", "jac"], ascending=[True, True]).head(30)
+    display(q2_most_divergent)
+
+
+# %%
+# Q2: Qualitative inspection helper (side-by-side attention + metadata)
+
+def q2_inspect_case(row: pd.Series, top_k: int = 15, trim_context: bool = True):
+    label_idx = int(row["label"])
+    ds_idx = int(row["sample"])
+    a, b = row["pair"].split(" vs ")
+
+    print("\n==============================")
+    print(f"Q2 case | label={label_idx} | sample={ds_idx} | pair={a} vs {b}")
+    print(f"  cos={row['cos']:.4f} | jac={row['jac']:.4f} | GT={row['gt']}")
+    print(f"  {a}: prob={row['prob_a']:.4f} thr={row['thr_a']:.2f}  |  {b}: prob={row['prob_b']:.4f} thr={row['thr_b']:.2f}")
+    print("==============================")
+
+    show_attention(a, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
+    show_attention(b, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
+
+
+# %%
+# Q2: Qualitative inspection helper (side-by-side attention + metadata)
+
+def q2_inspect_case(row: pd.Series, top_k: int = 15, trim_context: bool = True):
+    label_idx = int(row["label"])
+    ds_idx = int(row["sample"])
+    a, b = row["pair"].split(" vs ")
+
+    print("\n==============================")
+    print(f"Q2 case | label={label_idx} | sample={ds_idx} | pair={a} vs {b}")
+    print(f"  cos={row['cos']:.4f} | jac={row['jac']:.4f} | GT={row['gt']}")
+    print(f"  {a}: prob={row['prob_a']:.4f} thr={row['thr_a']:.2f}  |  {b}: prob={row['prob_b']:.4f} thr={row['thr_b']:.2f}")
+    print("==============================")
+
+    show_attention(a, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
+    show_attention(b, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
+
+
+# %%
+# Q2: Run for ALL pairs and produce top-divergent tables per pair
+
+MODEL_NAMES = list(models.keys())
+
+Q2_PAIRS = [
+    (a, b)
+    for i, a in enumerate(MODEL_NAMES)
+    for b in MODEL_NAMES[i+1:]
+]
+
+print("Q2_PAIRS:", Q2_PAIRS)
+
+Q2_LABELS = list(range(50))          # adjust if you want a subset
+Q2_TOP_K = 15
+Q2_TRIM_CONTEXT = True
+Q2_CANDIDATE_POOL = "all_test"       # "all_test" or "gt_positive"
+Q2_MAX_SCAN_PER_LABEL = None         # speed: set e.g. 500
+Q2_KEEP_TOP_N_PER_LABEL = 5          # per label, per pair
+Q2_MIN_KEPT_REQUIRED = 30            # skip labels with low agree-positive coverage
+
+def q2_run_for_pair(model_a: str, model_b: str):
+    q2_all = []
+    q2_label_stats = []
+
+    for label_idx in tqdm(Q2_LABELS, desc=f"Q2 labels ({model_a} vs {model_b})"):
+        cand_idxs = q2_candidate_indices_for_label(label_idx)
+
+        df = q2_find_divergent_samples_for_label(
+            label_idx=label_idx,
+            model_a=model_a,
+            model_b=model_b,
+            top_k=Q2_TOP_K,
+            trim_context=Q2_TRIM_CONTEXT,
+            candidate_indices=cand_idxs,
+        )
+
+        n_kept = df.attrs.get("n_kept", 0)
+        q2_label_stats.append({
+            "pair": f"{model_a} vs {model_b}",
+            "label": label_idx,
+            "n_scanned": df.attrs.get("n_scanned", len(cand_idxs)),
+            "n_agree_pos": n_kept,
+            "n_returned": int(min(Q2_KEEP_TOP_N_PER_LABEL, len(df))),
+            "cos_min": float(df["cos"].min()) if len(df) else np.nan,
+            "jac_min": float(df["jac"].min()) if len(df) else np.nan,
+        })
+
+        if n_kept < Q2_MIN_KEPT_REQUIRED:
+            continue
+
+        q2_all.append(df.head(Q2_KEEP_TOP_N_PER_LABEL))
+
+    stats_df = pd.DataFrame(q2_label_stats).sort_values(["n_agree_pos", "cos_min"], ascending=[False, True])
+    cases_df = pd.concat(q2_all, ignore_index=True) if len(q2_all) else pd.DataFrame()
+    return stats_df, cases_df
+
+
+q2_pair_results = {}   # pair -> {"stats": df, "cases": df, "top_overall": df}
+
+for a, b in Q2_PAIRS:
+    stats_df, cases_df = q2_run_for_pair(a, b)
+
+    if len(cases_df) > 0:
+        top_overall = cases_df.sort_values(["cos", "jac"], ascending=[True, True]).head(30).reset_index(drop=True)
+    else:
+        top_overall = pd.DataFrame()
+
+    q2_pair_results[(a, b)] = {
+        "stats": stats_df,
+        "cases": cases_df,
+        "top_overall": top_overall,
+    }
+
+    print("\n==============================")
+    print(f"PAIR: {a} vs {b}")
+    print("Label coverage (top 10 by agree-positive):")
+    display(stats_df.head(10))
+    print("Most divergent cases overall (top 30):")
+    display(top_overall)
+
 
 # %% [markdown]
 # ### 3. How does attention agreement change across label frequency?
