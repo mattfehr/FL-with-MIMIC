@@ -1335,6 +1335,172 @@ for a, b in Q2_PAIRS:
 # ### 3. How does attention agreement change across label frequency?
 # 
 # We are especially interested in whether agreement degrades for rare diagnoses compared to frequent ones.
+# 
+# We quantify label frequency (train prevalence by default), then test whether Q1 attention agreement
+# (cos_mean / jac_mean) varies with frequency across *all* model pairs.
+# 
+# We report:
+# - Spearman correlation (freq vs cosine/jaccard) per pair
+# - Scatter plots per pair
+# - Binned trends (rare → frequent) per pair
+
+# %%
+# Q3: label frequency (train + test)
+
+def label_counts_from_loader(loader: DataLoader, n_labels: int = 50) -> tuple[np.ndarray, int]:
+    counts = np.zeros(n_labels, dtype=int)
+    total = 0
+    for _, yb in loader:
+        y_np = yb.detach().cpu().numpy()
+        counts += y_np.sum(axis=0).astype(int)
+        total += y_np.shape[0]
+    return counts, total
+
+train_counts, n_train = label_counts_from_loader(train_loader, n_labels=50)
+test_counts,  n_test  = label_counts_from_loader(test_loader,  n_labels=50)
+
+freq_df = pd.DataFrame({
+    "label": np.arange(50),
+    "train_pos": train_counts,
+    "train_prev": train_counts / max(1, n_train),
+    "test_pos": test_counts,
+    "test_prev": test_counts / max(1, n_test),
+}).sort_values("train_pos", ascending=False)
+
+display(freq_df.head(10))
+display(freq_df.tail(10))
+
+
+# %%
+# Q3: merge frequency into Q1 label×pair results (ALL pairs)
+
+Q3_FREQ_COL = "train_pos"     # choose: "train_pos", "train_prev", "test_pos", "test_prev"
+Q3_MIN_KEPT = 30              # drop label×pair rows with too few agree-positive samples
+
+q3_df = (
+    q1_df.merge(freq_df[["label", Q3_FREQ_COL]], on="label", how="left")
+         .rename(columns={Q3_FREQ_COL: "label_freq"})
+)
+
+q3_df_filt = q3_df[q3_df["n_kept"] >= Q3_MIN_KEPT].copy()
+
+print("Q3 rows (all pairs):", len(q3_df), " | after n_kept filter:", len(q3_df_filt))
+display(q3_df_filt.head())
+
+
+# %%
+# Q3: focus view — Centralized vs Fed* only (recommended for reporting)
+
+q3_central = q3_df_filt[q3_df_filt["pair"].str.contains("Centralized")].copy()
+print("Centralized-vs-* rows:", len(q3_central))
+display(q3_central.head())
+
+
+# %%
+# Q3: Spearman correlation per pair (ALL pairs)
+
+def spearman_corr(x: np.ndarray, y: np.ndarray) -> float:
+    xr = pd.Series(x).rank(method="average").to_numpy()
+    yr = pd.Series(y).rank(method="average").to_numpy()
+    xr = xr - xr.mean()
+    yr = yr - yr.mean()
+    denom = (np.sqrt((xr**2).sum()) * np.sqrt((yr**2).sum())) + 1e-12
+    return float((xr * yr).sum() / denom)
+
+q3_corr_rows = []
+for pair, sub in q3_df_filt.groupby("pair"):
+    x = sub["label_freq"].to_numpy(dtype=float)
+    q3_corr_rows.append({
+        "pair": pair,
+        "n_labels_used": int(sub["label"].nunique()),
+        "total_kept": int(sub["n_kept"].sum()),
+        "spearman_freq_vs_cos": spearman_corr(x, sub["cos_mean"].to_numpy(dtype=float)),
+        "spearman_freq_vs_jac": spearman_corr(x, sub["jac_mean"].to_numpy(dtype=float)),
+    })
+
+q3_corr_df = pd.DataFrame(q3_corr_rows).sort_values(
+    ["spearman_freq_vs_jac", "spearman_freq_vs_cos"], ascending=False
+)
+
+display(q3_corr_df)
+
+
+# %%
+# Q3: Scatter plots per pair (ALL pairs)
+# Use log10(freq+1) because frequencies are heavy-tailed.
+
+q3_plot = q3_df_filt.copy()
+q3_plot["log_freq"] = np.log10(q3_plot["label_freq"] + 1)
+
+for pair, sub in q3_plot.groupby("pair"):
+    plt.figure()
+    plt.scatter(sub["log_freq"], sub["cos_mean"])
+    plt.title(f"Q3: Cosine vs Label Frequency | {pair}")
+    plt.xlabel("log10(label frequency + 1)")
+    plt.ylabel("Cosine mean (agree-positive)")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure()
+    plt.scatter(sub["log_freq"], sub["jac_mean"])
+    plt.title(f"Q3: Jaccard@{int(sub['top_k'].iloc[0])} vs Label Frequency | {pair}")
+    plt.xlabel("log10(label frequency + 1)")
+    plt.ylabel("Jaccard mean (agree-positive)")
+    plt.tight_layout()
+    plt.show()
+
+
+# %%
+# Q3: Binned trends (rare → frequent) per pair (ALL pairs)
+
+Q3_NUM_BINS = 5  # quintiles
+
+def binned_trend_all_pairs(df: pd.DataFrame, num_bins: int = 5) -> pd.DataFrame:
+    out = []
+    for pair, sub in df.groupby("pair"):
+        # one row per label for this pair (already label×pair, but keep safe)
+        tmp = sub[["label", "label_freq", "cos_mean", "jac_mean"]].drop_duplicates("label").copy()
+
+        # bin labels by frequency rank within this pair
+        tmp["bin"] = pd.qcut(tmp["label_freq"].rank(method="first"), q=num_bins, labels=False)
+
+        g = tmp.groupby("bin").agg(
+            labels_in_bin=("label", "count"),
+            freq_min=("label_freq", "min"),
+            freq_max=("label_freq", "max"),
+            cos_mean=("cos_mean", "mean"),
+            jac_mean=("jac_mean", "mean"),
+        ).reset_index()
+
+        g["pair"] = pair
+        out.append(g)
+
+    return pd.concat(out, ignore_index=True)
+
+q3_bins = binned_trend_all_pairs(q3_df_filt, num_bins=Q3_NUM_BINS)
+display(q3_bins.sort_values(["pair", "bin"]))
+
+# Plot binned curves: one figure per metric, lines per pair
+plt.figure()
+for pair, sub in q3_bins.groupby("pair"):
+    plt.plot(sub["bin"], sub["cos_mean"], marker="o", label=pair)
+plt.title("Q3: Mean Cosine by Frequency Bin (rare → frequent) — ALL pairs")
+plt.xlabel("Frequency bin (0=rarest)")
+plt.ylabel("Mean cosine")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+plt.figure()
+for pair, sub in q3_bins.groupby("pair"):
+    plt.plot(sub["bin"], sub["jac_mean"], marker="o", label=pair)
+plt.title("Q3: Mean Jaccard by Frequency Bin (rare → frequent) — ALL pairs")
+plt.xlabel("Frequency bin (0=rarest)")
+plt.ylabel("Mean Jaccard")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
 
 # %% [markdown]
 # ### 4. Which federated methods behave closest to centralized training in terms of attention structure?
