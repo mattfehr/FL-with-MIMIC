@@ -132,6 +132,9 @@ idx_to_token = w2v.wv.index_to_key
 PAD_INDEX = len(idx_to_token)
 
 def decode_sequence(token_ids_1d: torch.Tensor) -> List[str]:
+    """
+    Reverts tokenization (token ids) back into readable strings
+    """
     toks = []
     for idx in token_ids_1d.detach().cpu().tolist():
         if idx == PAD_INDEX:
@@ -238,6 +241,7 @@ print("Centralized thresholds (first 10):", per_label_thr_by_model["Centralized"
 @torch.no_grad()
 def get_logits_and_alpha(model: nn.Module, X_batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """
+    Gets all the logits and attention for every label
     Returns:
       logits: (B, C) on CPU
       alpha : (B, C, L) on CPU
@@ -253,6 +257,7 @@ def get_label_logits_and_attn(
     label_idx: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
+    Focuses to single labels logits and attention
     Returns:
       logits_label: (B,) CPU
       attn_label  : (B, L) CPU
@@ -265,6 +270,9 @@ def get_label_logits_and_attn(
 # Padding / Valid Positions (PAD + conv-edge trim)
 
 def get_nonpad_len(x_1d: torch.Tensor, pad_index: int) -> int:
+    """
+    Finds the length of the nonpadded sequence
+    """
     x = x_1d.detach().cpu()
     pad_pos = (x == pad_index).nonzero(as_tuple=False)
     return int(pad_pos[0].item()) if len(pad_pos) > 0 else int(x.numel())
@@ -275,6 +283,7 @@ def get_valid_positions(
     window_size: Optional[int],
 ) -> np.ndarray:
     """
+    Finds valid indices of token positions that are safe and meaningful
     Valid positions exclude:
       - PAD region (assumed at end)
       - conv-edge artifacts by trimming half window at each side (optional)
@@ -344,6 +353,8 @@ def predict_label_for_samples(
     probs = torch.sigmoid(logits)
     pred = (probs >= thr)
     return logits, probs, pred
+
+# The masks are needed to filter for certain meaninful samples
 
 @torch.no_grad()
 def agree_positive_mask(
@@ -811,13 +822,24 @@ for lbl in TEST_LABELS:
 # This helps us assess whether federated models preserve reasoning patterns similar to centralized training.
 # 
 # We measure attention agreement **only on samples where two models both predict the label as positive**
-# (using each model's own per-label threshold computed on validation).
+# (using each model's own per-label threshold computed on validation). We do specifically positive predictions because negative predictions 
+# for labels have attention that is diffuse and low magnitude. So there is no semantic rationale to compare compared to positive predictions
+# where attention is actually being used as rationale and justification.
 # 
 # Metrics:
 # - Cosine similarity on attention vectors (valid positions only: no PAD + conv-edge trimmed)
 # - Top-k Jaccard overlap on most-attended token positions (valid positions only)
 # 
 # We also report **coverage**: how many samples survive the agree-positive filter.
+# 
+# Interpretation
+# - High cosine + high Jaccard@K → models concentrate attention on similar token positions.
+# - High cosine but low Jaccard → attention mass is spread similarly but top tokens differ.
+# - Low cosine + low Jaccard → models rely on different parts of the sequence (different rationale patterns).
+# 
+# Always check `n_kept`:
+# - If `n_kept` is small for a label/pair, treat that label result as noisy.
+# 
 
 # %%
 # Q1 CONFIG
@@ -946,7 +968,7 @@ display(q1_df.head())
 # %%
 # Q1: View coverage + agreement per label (sorted)
 
-# Sort by coverage first (so you can see which labels/pairs have enough agree-positive samples)
+# Sort by coverage first (so you can see which labels/pairs have enough agree-positive samples - more evidence)
 q1_sorted = q1_df.sort_values(["n_kept", "jac_mean"], ascending=[False, False])
 display(q1_sorted.head(30))
 
@@ -1028,17 +1050,6 @@ else:
     plt.tight_layout()
     plt.show()
 
-
-# %% [markdown]
-# ### Interpreting Q1 results (what to look for)
-# 
-# - High cosine + high Jaccard@K → models concentrate attention on similar token positions.
-# - High cosine but low Jaccard → attention mass is spread similarly but top tokens differ.
-# - Low cosine + low Jaccard → models rely on different parts of the sequence (different rationale patterns).
-# 
-# Always check `n_kept`:
-# - If `n_kept` is small for a label/pair, treat that label result as noisy.
-# 
 
 # %% [markdown]
 # ### 2. Are there cases where models make the same prediction but rely on different tokens?
@@ -1198,6 +1209,7 @@ for label_idx in tqdm(Q2_LABELS, desc="Q2 labels"):
 q2_label_stats_df = pd.DataFrame(q2_label_stats).sort_values("n_agree_pos", ascending=False)
 display(q2_label_stats_df.head(20))
 
+# Each row is label x sample x model pair and the max is 250 because there are 50 labels and the config keep_top_n_per_label is 5
 q2_cases_df = pd.concat(q2_all, ignore_index=True) if len(q2_all) else pd.DataFrame()
 print("Total Q2 cases collected:", len(q2_cases_df))
 display(q2_cases_df.head(20))
@@ -1211,24 +1223,6 @@ if len(q2_cases_df) == 0:
 else:
     q2_most_divergent = q2_cases_df.sort_values(["cos", "jac"], ascending=[True, True]).head(30)
     display(q2_most_divergent)
-
-
-# %%
-# Q2: Qualitative inspection helper (side-by-side attention + metadata)
-
-def q2_inspect_case(row: pd.Series, top_k: int = 15, trim_context: bool = True):
-    label_idx = int(row["label"])
-    ds_idx = int(row["sample"])
-    a, b = row["pair"].split(" vs ")
-
-    print("\n==============================")
-    print(f"Q2 case | label={label_idx} | sample={ds_idx} | pair={a} vs {b}")
-    print(f"  cos={row['cos']:.4f} | jac={row['jac']:.4f} | GT={row['gt']}")
-    print(f"  {a}: prob={row['prob_a']:.4f} thr={row['thr_a']:.2f}  |  {b}: prob={row['prob_b']:.4f} thr={row['thr_b']:.2f}")
-    print("==============================")
-
-    show_attention(a, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
-    show_attention(b, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
 
 
 # %%
@@ -1337,7 +1331,7 @@ for a, b in Q2_PAIRS:
 # We are especially interested in whether agreement degrades for rare diagnoses compared to frequent ones.
 # 
 # We quantify label frequency (train prevalence by default), then test whether Q1 attention agreement
-# (cos_mean / jac_mean) varies with frequency across *all* model pairs.
+# (cos_mean / jac_mean) varies with frequency across *all* model pairs. Use train dataset because that frequency is what the model is based on which matters when looking at how frequency affects the models performace (causal). Use test as a sanity check as label distribution being wildly different at test time coulld require caution (evaluative). Exclude validation because that would just be noise as it was not used for training.
 # 
 # We report:
 # - Spearman correlation (freq vs cosine/jaccard) per pair
@@ -1362,7 +1356,7 @@ test_counts,  n_test  = label_counts_from_loader(test_loader,  n_labels=50)
 freq_df = pd.DataFrame({
     "label": np.arange(50),
     "train_pos": train_counts,
-    "train_prev": train_counts / max(1, n_train),
+    "train_prev": train_counts / max(1, n_train),   #fraction of training sample where label is positive
     "test_pos": test_counts,
     "test_prev": test_counts / max(1, n_test),
 }).sort_values("train_pos", ascending=False)
@@ -1506,5 +1500,226 @@ plt.show()
 # ### 4. Which federated methods behave closest to centralized training in terms of attention structure?
 # 
 # This allows us to compare federated methods beyond predictive performance and look at behavioral alignment.
+# 
+# We quantify "closeness" using Q1 agreement metrics between Centralized and each federated method:
+# - weighted mean cosine similarity (higher = closer)
+# - weighted mean Jaccard@K overlap (higher = closer)
+# Weights = coverage (`n_kept`) per label.
+# 
+# We also report robustness:
+# - per-label "win rate" (how often each method beats the others on a label)
+# - bootstrap confidence intervals over labels (weighted)
+# - optional breakdown by label frequency bins
+
+# %%
+# Q4: Extract Centralized-vs-Fed rows from Q1 and rank methods
+
+FED_METHODS = ["FedAvg", "FedProx", "SCAFFOLD"]
+CENTRAL = "Centralized"
+
+# 1) Method-level summary (from q1_pair_summary if available)
+if "q1_pair_summary" not in globals():
+    raise RuntimeError("q1_pair_summary not found. Run Q1 aggregation cell first.")
+
+q4_summary = q1_pair_summary[q1_pair_summary["pair"].str.contains(CENTRAL)].copy()
+display(q4_summary)
+
+# 2) Parse out the federated method name from "Centralized vs X"
+def extract_fed_method(pair_str: str) -> str:
+    # handles "Centralized vs FedAvg" etc.
+    parts = pair_str.split(" vs ")
+    return parts[1].strip() if len(parts) == 2 else pair_str
+
+q4_summary["fed_method"] = q4_summary["pair"].apply(extract_fed_method)
+
+# Keep only expected fed methods
+q4_summary = q4_summary[q4_summary["fed_method"].isin(FED_METHODS)].copy()
+
+# Rank by weighted metrics
+q4_rank = q4_summary.sort_values(["jac_mean_weighted", "cos_mean_weighted"], ascending=False)[
+    ["fed_method", "labels_covered", "total_kept", "cos_mean_weighted", "jac_mean_weighted",
+     "cos_median_unweighted", "jac_median_unweighted"]
+].reset_index(drop=True)
+
+display(q4_rank)
+
+
+# %%
+# Q4: Bar plots (ranked) for Centralized vs Fed methods
+
+if len(q4_rank) == 0:
+    print("No Centralized-vs-Fed rows found. Check pair naming in q1_pair_summary.")
+else:
+    # cosine
+    plt.figure()
+    plt.bar(q4_rank["fed_method"], q4_rank["cos_mean_weighted"])
+    plt.title("Q4: Closeness to Centralized (Weighted Cosine)")
+    plt.ylabel("Weighted cosine similarity")
+    plt.tight_layout()
+    plt.show()
+
+    # jaccard
+    plt.figure()
+    plt.bar(q4_rank["fed_method"], q4_rank["jac_mean_weighted"])
+    plt.title(f"Q4: Closeness to Centralized (Weighted Jaccard@{int(q1_df['top_k'].iloc[0])})")
+    plt.ylabel("Weighted Jaccard")
+    plt.tight_layout()
+    plt.show()
+
+
+# %%
+# Q4: Per-label "win rate" among Fed methods (which is closest to Centralized on each label?)
+
+# Build a label×method table of Centralized-vs-method agreement
+q4_label = q1_df[q1_df["pair"].str.contains(CENTRAL)].copy()
+q4_label["fed_method"] = q4_label["pair"].apply(extract_fed_method)
+q4_label = q4_label[q4_label["fed_method"].isin(FED_METHODS)].copy()
+
+# Optional: only consider labels where all three methods have enough coverage
+Q4_MIN_KEPT_PER_LABEL = 30
+pivot_cos = q4_label.pivot_table(index="label", columns="fed_method", values="cos_mean")
+pivot_jac = q4_label.pivot_table(index="label", columns="fed_method", values="jac_mean")
+pivot_kept = q4_label.pivot_table(index="label", columns="fed_method", values="n_kept")
+
+valid_labels = pivot_kept.dropna().index[
+    (pivot_kept.dropna() >= Q4_MIN_KEPT_PER_LABEL).all(axis=1)
+]
+
+pivot_cos_f = pivot_cos.loc[valid_labels]
+pivot_jac_f = pivot_jac.loc[valid_labels]
+
+print("Labels where ALL 3 methods have n_kept >= threshold:", len(valid_labels), "/ 50")
+
+# Winner per label
+cos_winner = pivot_cos_f.idxmax(axis=1)
+jac_winner = pivot_jac_f.idxmax(axis=1)
+
+win_df = pd.DataFrame({
+    "cos_winner": cos_winner.value_counts(),
+    "jac_winner": jac_winner.value_counts(),
+}).fillna(0).astype(int)
+
+display(win_df)
+
+# Also show some "disagreement labels" where cosine and jaccard winners differ
+diff_winner_labels = cos_winner.index[cos_winner != jac_winner]
+print("Labels where cosine-winner != jaccard-winner:", len(diff_winner_labels))
+display(pd.DataFrame({
+    "label": diff_winner_labels,
+    "cos_winner": cos_winner.loc[diff_winner_labels].values,
+    "jac_winner": jac_winner.loc[diff_winner_labels].values,
+}).head(15))
+
+
+# %%
+# Q4: Bootstrap confidence intervals over labels (weighted by n_kept)
+
+rng = np.random.default_rng(42)
+
+def bootstrap_weighted_mean(sub_df: pd.DataFrame, value_col: str, weight_col: str, n_boot: int = 2000) -> tuple[float,float,float]:
+    """
+    Bootstrap over labels: resample labels with replacement, and compute weighted mean within each sample.
+    """
+    # one row per label
+    d = sub_df[["label", value_col, weight_col]].dropna().copy()
+    labels = d["label"].to_numpy()
+    vals = d[value_col].to_numpy(dtype=float)
+    wts  = d[weight_col].to_numpy(dtype=float)
+
+    # map label -> (val, wt)
+    by_label = {}
+    for lbl, v, w in zip(labels, vals, wts):
+        by_label[int(lbl)] = (float(v), float(w))
+    uniq = np.array(list(by_label.keys()), dtype=int)
+
+    def wmean_for_labels(sample_labels: np.ndarray) -> float:
+        vv = np.array([by_label[int(l)][0] for l in sample_labels], dtype=float)
+        ww = np.array([by_label[int(l)][1] for l in sample_labels], dtype=float)
+        ww = np.clip(ww, 0.0, None)
+        if ww.sum() <= 0:
+            return float("nan")
+        return float((vv * ww).sum() / ww.sum())
+
+    boot = []
+    for _ in range(n_boot):
+        samp = rng.choice(uniq, size=len(uniq), replace=True)
+        boot.append(wmean_for_labels(samp))
+
+    boot = np.array(boot, dtype=float)
+    center = float(np.nanmean(boot))
+    lo = float(np.nanpercentile(boot, 2.5))
+    hi = float(np.nanpercentile(boot, 97.5))
+    return center, lo, hi
+
+q4_ci_rows = []
+for m in FED_METHODS:
+    sub = q4_label[q4_label["fed_method"] == m].copy()
+    # use n_kept as weights
+    cos_c, cos_lo, cos_hi = bootstrap_weighted_mean(sub, "cos_mean", "n_kept", n_boot=2000)
+    jac_c, jac_lo, jac_hi = bootstrap_weighted_mean(sub, "jac_mean", "n_kept", n_boot=2000)
+    q4_ci_rows.append({
+        "fed_method": m,
+        "cos_mean_weighted_boot": cos_c,
+        "cos_95ci": (cos_lo, cos_hi),
+        "jac_mean_weighted_boot": jac_c,
+        "jac_95ci": (jac_lo, jac_hi),
+    })
+
+q4_ci = pd.DataFrame(q4_ci_rows).sort_values(["jac_mean_weighted_boot","cos_mean_weighted_boot"], ascending=False)
+display(q4_ci)
+
+
+# %%
+# Q4 (optional): Breakdown by label frequency bins (uses freq_df from Q3)
+
+if "freq_df" not in globals():
+    print("freq_df not found (run Q3 frequency cell first) — skipping frequency-bin breakdown.")
+else:
+    Q4_FREQ_COL = "train_pos"
+    bins = 5
+
+    tmp = q4_label.merge(freq_df[["label", Q4_FREQ_COL]], on="label", how="left").rename(columns={Q4_FREQ_COL: "label_freq"})
+    # bin labels globally by frequency
+    tmp_labels = tmp[["label","label_freq"]].drop_duplicates().copy()
+    tmp_labels["bin"] = pd.qcut(tmp_labels["label_freq"].rank(method="first"), q=bins, labels=False)
+    tmp = tmp.merge(tmp_labels[["label","bin"]], on="label", how="left")
+
+    # weighted means within each (method, bin)
+    out = []
+    for (m, b), sub in tmp.groupby(["fed_method","bin"]):
+        w = sub["n_kept"].to_numpy(dtype=float)
+        out.append({
+            "fed_method": m,
+            "bin": int(b),
+            "labels_in_bin": int(sub["label"].nunique()),
+            "total_kept": int(sub["n_kept"].sum()),
+            "cos_wmean": weighted_mean(sub["cos_mean"].to_numpy(dtype=float), w),
+            "jac_wmean": weighted_mean(sub["jac_mean"].to_numpy(dtype=float), w),
+        })
+
+    q4_bins = pd.DataFrame(out).sort_values(["bin","fed_method"])
+    display(q4_bins)
+
+    # plot trends
+    plt.figure()
+    for m, sub in q4_bins.groupby("fed_method"):
+        plt.plot(sub["bin"], sub["cos_wmean"], marker="o", label=m)
+    plt.title("Q4: Centralized-vs-Fed closeness by label-frequency bin (Cosine)")
+    plt.xlabel("Frequency bin (0=rarest)")
+    plt.ylabel("Weighted cosine")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure()
+    for m, sub in q4_bins.groupby("fed_method"):
+        plt.plot(sub["bin"], sub["jac_wmean"], marker="o", label=m)
+    plt.title("Q4: Centralized-vs-Fed closeness by label-frequency bin (Jaccard)")
+    plt.xlabel("Frequency bin (0=rarest)")
+    plt.ylabel("Weighted Jaccard")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
 
 
