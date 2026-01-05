@@ -415,6 +415,33 @@ def get_top_tokens(tokens: List[str], attn_1d: torch.Tensor, k: int = 15, skip_p
             break
     return out
 
+def get_top_tokens_valid(
+    tokens: List[str],
+    attn_1d: torch.Tensor,
+    valid_pos: np.ndarray,
+    k: int = 15,
+):
+    """
+    Return top-k tokens by attention, restricted to valid positions only.
+    This matches how cosine/Jaccard are computed.
+    """
+    if valid_pos.size == 0:
+        return []
+
+    att = attn_1d.detach().cpu().numpy()
+    att_valid = att[valid_pos]
+
+    k_eff = min(k, att_valid.size)
+    idx_part = np.argpartition(att_valid, -k_eff)[-k_eff:]
+    idx_sorted = idx_part[np.argsort(att_valid[idx_part])[::-1]]
+
+    out = []
+    for i in idx_sorted:
+        pos = int(valid_pos[i])
+        out.append((pos, tokens[pos], float(att[pos])))
+
+    return out
+
 @torch.no_grad()
 def show_attention(
     model_name: str,
@@ -445,11 +472,11 @@ def show_attention(
 
     display(attention_to_html(tokens, attn_vec))
 
-    top = get_top_tokens(tokens, attn_vec, k=top_k)
-    print(f"Top-{top_k} tokens by attention:")
+    top = get_top_tokens_valid(tokens, attn_vec, valid_pos, k=top_k)
+    print(f"Top-{top_k} tokens by attention (VALID positions only):")
     for pos, tok, w in top:
-        marker = "" if pos in set(valid_pos.tolist()) else "  (trimmed)"
-        print(f"  pos={pos:4d} att={w:.4f} tok='{tok}'{marker}")
+        print(f"  pos={pos:4d} att={w:.4f} tok='{tok}'")
+
 
 # %%
 def plot_attention_heatmap(
@@ -1228,23 +1255,67 @@ else:
 # %%
 # Q2: Qualitative inspection helper (side-by-side attention + metadata)
 
-def q2_inspect_case(row: pd.Series, top_k: int = 15, trim_context: bool = True):
+def q2_inspect_case(
+    row: pd.Series,
+    top_k: int = 15,
+    trim_context: bool = True,
+    token_zoom_width: int = 60,
+    token_zoom_start: int = 0,
+    tick_every: int = 5,
+    do_position_heatmap: bool = True,
+    do_token_heatmap: bool = True,
+):
+    """
+    For one Q2 case row, show:
+      - metadata
+      - show_attention for each model (includes VALID-only top-k tokens)
+      - heatmap by position
+      - heatmap token zoom
+    """
     label_idx = int(row["label"])
     ds_idx = int(row["sample"])
     a, b = row["pair"].split(" vs ")
 
     print("\n==============================")
     print(f"Q2 case | label={label_idx} | sample={ds_idx} | pair={a} vs {b}")
-    print(f"  cos={row['cos']:.4f} | jac={row['jac']:.4f} | GT={row['gt']}")
-    print(f"  {a}: prob={row['prob_a']:.4f} thr={row['thr_a']:.2f}  |  {b}: prob={row['prob_b']:.4f} thr={row['thr_b']:.2f}")
+    print(f"  cos={float(row['cos']):.4f} | jac={float(row['jac']):.4f} | GT={int(row['gt'])}")
+    print(f"  {a}: prob={float(row['prob_a']):.4f} thr={float(row['thr_a']):.2f}")
+    print(f"  {b}: prob={float(row['prob_b']):.4f} thr={float(row['thr_b']):.2f}")
+    print(f"  valid_len={int(row.get('valid_len', -1))}")
     print("==============================")
 
+    # Token-level + top-k (printed inside show_attention)
     show_attention(a, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
     show_attention(b, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
 
+    # Heatmap by position (global view)
+    if do_position_heatmap:
+        plot_attention_heatmap(
+            sample_idx=ds_idx,
+            label_idx=label_idx,
+            model_names=[a, b],
+            trim_context=trim_context,
+            mode="position",
+            max_tokens=None,
+        )
+
+    # Token zoom heatmap (local readable view)
+    if do_token_heatmap:
+        plot_attention_heatmap(
+            sample_idx=ds_idx,
+            label_idx=label_idx,
+            model_names=[a, b],
+            trim_context=trim_context,
+            mode="token_zoom",
+            max_tokens=token_zoom_width,
+            start=token_zoom_start,
+            tick_every=tick_every,
+        )
+
+
 
 # %%
-# Q2: Run for ALL pairs and produce top-divergent tables per pair
+# Q2: Run for ALL pairs and produce top-divergent tables per pair (plus qualitative inspection)
 
 MODEL_NAMES = list(models.keys())
 
@@ -1256,13 +1327,18 @@ Q2_PAIRS = [
 
 print("Q2_PAIRS:", Q2_PAIRS)
 
-Q2_LABELS = list(range(50))          # adjust if you want a subset
+Q2_LABELS = list(range(50))
 Q2_TOP_K = 15
 Q2_TRIM_CONTEXT = True
 Q2_CANDIDATE_POOL = "all_test"       # "all_test" or "gt_positive"
-Q2_MAX_SCAN_PER_LABEL = None         # speed: set e.g. 500
-Q2_KEEP_TOP_N_PER_LABEL = 5          # per label, per pair
-Q2_MIN_KEPT_REQUIRED = 30            # skip labels with low agree-positive coverage
+Q2_MAX_SCAN_PER_LABEL = None
+Q2_KEEP_TOP_N_PER_LABEL = 5
+Q2_MIN_KEPT_REQUIRED = 30
+
+# qualitative selection
+Q2_SHOW_QUAL = True
+Q2_EXAMPLE_IDXS = [0, 10]            # extreme + representative rank
+Q2_TOP_OVERALL_N = 30                # pool to pick from
 
 def q2_run_for_pair(model_a: str, model_b: str):
     q2_all = []
@@ -1296,18 +1372,60 @@ def q2_run_for_pair(model_a: str, model_b: str):
 
         q2_all.append(df.head(Q2_KEEP_TOP_N_PER_LABEL))
 
-    stats_df = pd.DataFrame(q2_label_stats).sort_values(["n_agree_pos", "cos_min"], ascending=[False, True])
+    stats_df = (
+        pd.DataFrame(q2_label_stats)
+          .sort_values(["n_agree_pos", "cos_min"], ascending=[False, True])
+          .reset_index(drop=True)
+    )
     cases_df = pd.concat(q2_all, ignore_index=True) if len(q2_all) else pd.DataFrame()
     return stats_df, cases_df
 
 
-q2_pair_results = {}   # pair -> {"stats": df, "cases": df, "top_overall": df}
+def pick_3_examples(top_overall: pd.DataFrame) -> list[pd.Series]:
+    """
+    Pick 3 examples:
+      1) extreme: rank 0
+      2) representative: rank ~10 (or last)
+      3) different-label: first row in top_overall with a new label
+    """
+    if top_overall is None or len(top_overall) == 0:
+        return []
+
+    picks = []
+
+    # 1) extreme
+    r0 = top_overall.iloc[0]
+    picks.append(r0)
+
+    # 2) representative
+    rep_idx = min(Q2_EXAMPLE_IDXS[1], len(top_overall) - 1)
+    r1 = top_overall.iloc[rep_idx]
+    picks.append(r1)
+
+    # 3) different label
+    used = {int(r0["label"]), int(r1["label"])}
+    r2 = None
+    for _, row in top_overall.iterrows():
+        if int(row["label"]) not in used:
+            r2 = row
+            break
+    if r2 is not None:
+        picks.append(r2)
+
+    return picks[:3]
+
+
+q2_pair_results = {}  # pair -> {"stats": df, "cases": df, "top_overall": df}
 
 for a, b in Q2_PAIRS:
     stats_df, cases_df = q2_run_for_pair(a, b)
 
     if len(cases_df) > 0:
-        top_overall = cases_df.sort_values(["cos", "jac"], ascending=[True, True]).head(30).reset_index(drop=True)
+        top_overall = (
+            cases_df.sort_values(["cos", "jac"], ascending=[True, True])
+                    .head(Q2_TOP_OVERALL_N)
+                    .reset_index(drop=True)
+        )
     else:
         top_overall = pd.DataFrame()
 
@@ -1321,8 +1439,23 @@ for a, b in Q2_PAIRS:
     print(f"PAIR: {a} vs {b}")
     print("Label coverage (top 10 by agree-positive):")
     display(stats_df.head(10))
-    print("Most divergent cases overall (top 30):")
+    print(f"Most divergent cases overall (top {Q2_TOP_OVERALL_N}):")
     display(top_overall)
+
+    # --- qualitative: 3 examples per pair ---
+    if Q2_SHOW_QUAL and len(top_overall) > 0:
+        examples = pick_3_examples(top_overall)
+        for ex_row in examples:
+            q2_inspect_case(
+                ex_row,
+                top_k=Q2_TOP_K,
+                trim_context=Q2_TRIM_CONTEXT,
+                do_position_heatmap=True,
+                do_token_heatmap=True,
+                token_zoom_width=60,
+                token_zoom_start=0,
+                tick_every=5
+            )
 
 
 # %% [markdown]
