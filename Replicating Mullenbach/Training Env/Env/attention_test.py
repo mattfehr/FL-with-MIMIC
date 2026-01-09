@@ -1259,18 +1259,13 @@ def q2_inspect_case(
     row: pd.Series,
     top_k: int = 15,
     trim_context: bool = True,
-    token_zoom_width: int = 60,
-    token_zoom_start: int = 0,
-    tick_every: int = 5,
     do_position_heatmap: bool = True,
-    do_token_heatmap: bool = True,
 ):
     """
     For one Q2 case row, show:
       - metadata
       - show_attention for each model (includes VALID-only top-k tokens)
-      - heatmap by position
-      - heatmap token zoom
+      - heatmap by position (global view)
     """
     label_idx = int(row["label"])
     ds_idx = int(row["sample"])
@@ -1284,11 +1279,11 @@ def q2_inspect_case(
     print(f"  valid_len={int(row.get('valid_len', -1))}")
     print("==============================")
 
-    # Token-level + top-k (printed inside show_attention)
+    # Token-level attention + top-k tokens
     show_attention(a, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
     show_attention(b, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
 
-    # Heatmap by position (global view)
+    # Global position heatmap
     if do_position_heatmap:
         plot_attention_heatmap(
             sample_idx=ds_idx,
@@ -1297,19 +1292,6 @@ def q2_inspect_case(
             trim_context=trim_context,
             mode="position",
             max_tokens=None,
-        )
-
-    # Token zoom heatmap (local readable view)
-    if do_token_heatmap:
-        plot_attention_heatmap(
-            sample_idx=ds_idx,
-            label_idx=label_idx,
-            model_names=[a, b],
-            trim_context=trim_context,
-            mode="token_zoom",
-            max_tokens=token_zoom_width,
-            start=token_zoom_start,
-            tick_every=tick_every,
         )
 
 
@@ -1450,11 +1432,7 @@ for a, b in Q2_PAIRS:
                 ex_row,
                 top_k=Q2_TOP_K,
                 trim_context=Q2_TRIM_CONTEXT,
-                do_position_heatmap=True,
-                do_token_heatmap=True,
-                token_zoom_width=60,
-                token_zoom_start=0,
-                tick_every=5
+                do_position_heatmap=True
             )
 
 
@@ -1853,6 +1831,399 @@ else:
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+
+# %% [markdown]
+# ### Finding if high agreement has more similar heatmaps and relating agreement to mislabeling
+# 
+# Q2H: Highest-agreement samples (agree-positive) + Agreement ↔ Mislabeling (GT) analysis
+# This section mirrors Q2, but:
+# 1) Collects **ALL agree-positive rows** (no top-N-per-label) for unbiased agreement↔mislabeling analysis.
+# 2) Also provides a **highest-agreement sample picker** for qualitative heatmap inspection per pair.
+# 
+
+# %%
+# Q2H CONFIG
+
+MODEL_NAMES = list(models.keys())
+
+Q2H_PAIRS = [
+    (a, b)
+    for i, a in enumerate(MODEL_NAMES)
+    for b in MODEL_NAMES[i+1:]
+]
+
+Q2H_LABELS = list(range(50))
+Q2H_TOP_K = 15
+Q2H_TRIM_CONTEXT = True
+Q2H_CANDIDATE_POOL = "all_test"   # "all_test" or "gt_positive"
+Q2H_MAX_SCAN_PER_LABEL = None     # speed knob
+
+# qualitative inspection knobs
+Q2H_TOP_OVERALL_N = 30            # show/keep top-N highest agreement cases overall per pair
+Q2H_SHOW_QUAL = True
+Q2H_N_QUAL_PER_PAIR = 3
+
+# analysis knobs
+Q2H_BINS = 10                     # number of quantile bins for agreement vs mislabeling
+
+print("Q2H_LABELS:", (Q2H_LABELS[:10], "...") if len(Q2H_LABELS) > 10 else Q2H_LABELS)
+print("Q2H_PAIRS:", Q2H_PAIRS)
+print("Q2H_CANDIDATE_POOL:", Q2H_CANDIDATE_POOL)
+
+
+# %%
+# Helper: candidates (same logic as Q2 but using Q2H knobs)
+
+def q2h_candidate_indices_for_label(label_idx: int) -> List[int]:
+    if Q2H_CANDIDATE_POOL == "all_test":
+        idxs = list(range(len(test_dataset)))
+        return idxs[:Q2H_MAX_SCAN_PER_LABEL] if Q2H_MAX_SCAN_PER_LABEL else idxs
+
+    if Q2H_CANDIDATE_POOL == "gt_positive":
+        idxs = []
+        for i in range(len(test_dataset)):
+            _, y = test_dataset[i]
+            if int(y[label_idx].item()) == 1:
+                idxs.append(i)
+                if Q2H_MAX_SCAN_PER_LABEL and len(idxs) >= Q2H_MAX_SCAN_PER_LABEL:
+                    break
+        return idxs
+
+    raise ValueError(f"Unknown Q2H_CANDIDATE_POOL={Q2H_CANDIDATE_POOL}")
+
+
+# %%
+# Q2H: Collect ALL agree-positive rows for a given label + pair (NO per-label top-N)
+
+@torch.no_grad()
+def q2h_collect_agree_pos_rows_for_label(
+    label_idx: int,
+    model_a: str,
+    model_b: str,
+    top_k: int,
+    trim_context: bool,
+    candidate_indices: List[int],
+) -> pd.DataFrame:
+    rows = []
+    kept = 0
+
+    for ds_idx in candidate_indices:
+        x, y = test_dataset[ds_idx]
+        Xb = x.unsqueeze(0)
+
+        # agree-positive filter (same prediction == positive)
+        if not bool(agree_positive_mask(model_a, model_b, Xb, label_idx).item()):
+            continue
+
+        kept += 1
+
+        window_size = config["window_size"] if trim_context else None
+        valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+
+        # attention vectors
+        _, att_a = get_label_logits_and_attn(models[model_a], Xb, label_idx)
+        _, att_b = get_label_logits_and_attn(models[model_b], Xb, label_idx)
+        att_a_1d, att_b_1d = att_a[0], att_b[0]
+
+        cos = cosine_sim_on_valid(att_a_1d, att_b_1d, valid_pos)
+        jac = jaccard(
+            topk_positions(att_a_1d, valid_pos, top_k),
+            topk_positions(att_b_1d, valid_pos, top_k),
+        )
+
+        # prediction context
+        logit_a, prob_a, pred_a = predict_label_for_samples(model_a, Xb, label_idx)
+        logit_b, prob_b, pred_b = predict_label_for_samples(model_b, Xb, label_idx)
+        thr_a = float(per_label_thr_by_model[model_a][label_idx].item())
+        thr_b = float(per_label_thr_by_model[model_b][label_idx].item())
+
+        rows.append({
+            "label": label_idx,
+            "sample": ds_idx,
+            "pair": f"{model_a} vs {model_b}",
+            "gt": int(y[label_idx].item()),
+
+            "cos": float(cos),
+            "jac": float(jac),
+
+            "prob_a": float(prob_a[0].item()),
+            "thr_a": thr_a,
+            "margin_a": float(prob_a[0].item()) - thr_a,
+
+            "prob_b": float(prob_b[0].item()),
+            "thr_b": thr_b,
+            "margin_b": float(prob_b[0].item()) - thr_b,
+
+            "valid_len": int(len(valid_pos)),
+        })
+
+    df = pd.DataFrame(rows)
+    df.attrs["n_kept"] = kept
+    df.attrs["n_scanned"] = len(candidate_indices)
+    return df
+
+
+# %%
+# Q2H: Run for a single pair -> returns:
+#   1) label_stats_df (coverage)
+#   2) agree_pos_df   (ALL agree-positive rows across labels, unbiased)
+
+def q2h_run_for_pair_collect_all(model_a: str, model_b: str):
+    all_rows = []
+    label_stats = []
+
+    for label_idx in tqdm(Q2H_LABELS, desc=f"Q2H collect ({model_a} vs {model_b})"):
+        cand_idxs = q2h_candidate_indices_for_label(label_idx)
+
+        df = q2h_collect_agree_pos_rows_for_label(
+            label_idx=label_idx,
+            model_a=model_a,
+            model_b=model_b,
+            top_k=Q2H_TOP_K,
+            trim_context=Q2H_TRIM_CONTEXT,
+            candidate_indices=cand_idxs,
+        )
+
+        n_kept = df.attrs.get("n_kept", 0)
+        label_stats.append({
+            "pair": f"{model_a} vs {model_b}",
+            "label": label_idx,
+            "n_scanned": df.attrs.get("n_scanned", len(cand_idxs)),
+            "n_agree_pos": n_kept,
+            "cos_max": float(df["cos"].max()) if len(df) else np.nan,
+            "jac_max": float(df["jac"].max()) if len(df) else np.nan,
+        })
+
+        if len(df) > 0:
+            all_rows.append(df)
+
+    label_stats_df = (
+        pd.DataFrame(label_stats)
+          .sort_values(["n_agree_pos", "cos_max"], ascending=[False, False])
+          .reset_index(drop=True)
+    )
+
+    agree_pos_df = pd.concat(all_rows, ignore_index=True) if len(all_rows) else pd.DataFrame()
+
+    # derived columns for analysis
+    if len(agree_pos_df) > 0:
+        agree_pos_df["is_fp"] = (agree_pos_df["gt"] == 0).astype(int)  # since agree-positive => GT=0 means shared FP
+        agree_pos_df["agreement_avg"] = (agree_pos_df["cos"] + agree_pos_df["jac"]) / 2.0
+        agree_pos_df["agreement_min"] = agree_pos_df[["cos", "jac"]].min(axis=1)
+
+    return label_stats_df, agree_pos_df
+
+
+# %%
+# Q2H: Pick examples from highest-agreement table for qualitative inspection
+
+def q2h_pick_examples_high_agree(df_top: pd.DataFrame, n: int = 3) -> list[pd.Series]:
+    """
+    Picks:
+      1) highest agreement (rank 0)
+      2) another high agreement (rank ~10 or last)
+      3) different label if possible
+    """
+    if df_top is None or len(df_top) == 0:
+        return []
+
+    picks = []
+    picks.append(df_top.iloc[0])
+
+    mid_idx = min(10, len(df_top) - 1)
+    if mid_idx != 0 and len(picks) < n:
+        picks.append(df_top.iloc[mid_idx])
+
+    used_labels = {int(r["label"]) for r in picks}
+    if len(picks) < n:
+        for _, row in df_top.iterrows():
+            if int(row["label"]) not in used_labels:
+                picks.append(row)
+                break
+
+    return picks[:n]
+
+
+# %%
+# Q2H: Agreement ↔ mislabeling analysis (per pair)
+# - Works on ALL agree-positive rows (unbiased).
+# - Produces:
+#   * overall FP rate
+#   * FP rate by agreement quantile bins for cos, jac, and combined scores
+
+def q2h_agreement_vs_mislabeling(agree_pos_df: pd.DataFrame, n_bins: int = 10) -> dict:
+    if agree_pos_df is None or len(agree_pos_df) == 0:
+        return {"summary": None, "by_bin": {}}
+
+    out = {}
+
+    # overall summary
+    summary = {
+        "n_rows": int(len(agree_pos_df)),
+        "fp_rate": float(agree_pos_df["is_fp"].mean()),
+        "tp_rate": float((agree_pos_df["gt"] == 1).mean()),
+        "cos_mean": float(agree_pos_df["cos"].mean()),
+        "jac_mean": float(agree_pos_df["jac"].mean()),
+        "agreement_avg_mean": float(agree_pos_df["agreement_avg"].mean()),
+        "agreement_min_mean": float(agree_pos_df["agreement_min"].mean()),
+    }
+    out["summary"] = pd.DataFrame([summary])
+
+    by_bin = {}
+
+    def _bin_stats(col: str) -> pd.DataFrame:
+        df = agree_pos_df.copy()
+
+        # qcut can fail if too many duplicate values; handle with rank-based fallback
+        try:
+            df["bin"] = pd.qcut(df[col], q=n_bins, duplicates="drop")
+        except ValueError:
+            df["bin"] = pd.qcut(df[col].rank(method="average"), q=n_bins, duplicates="drop")
+
+        g = df.groupby("bin", observed=True).agg(
+            n=("is_fp", "size"),
+            fp_rate=("is_fp", "mean"),
+            cos_mean=("cos", "mean"),
+            jac_mean=("jac", "mean"),
+            agreement_avg_mean=("agreement_avg", "mean"),
+            agreement_min_mean=("agreement_min", "mean"),
+            gt_pos_rate=("gt", "mean"),
+        ).reset_index()
+
+        # add bin endpoints for readability
+        # (bin is an interval in most cases)
+        return g.sort_values("bin")
+
+    for col in ["cos", "jac", "agreement_avg", "agreement_min"]:
+        by_bin[col] = _bin_stats(col)
+
+    out["by_bin"] = by_bin
+    return out
+
+
+# %%
+# Q2H: Run ALL pairs
+# For each pair:
+#   1) collect ALL agree-positive rows (agree_pos_df)
+#   2) show high-agreement examples (top overall) for inspection
+#   3) run agreement↔mislabeling analysis tables
+
+q2h_pair_results = {}  # (a,b) -> dict
+
+for a, b in Q2H_PAIRS:
+    label_stats_df, agree_pos_df = q2h_run_for_pair_collect_all(a, b)
+
+    print("\n==============================")
+    print(f"PAIR: {a} vs {b}")
+    print("Label coverage (top 10 by agree-positive):")
+    display(label_stats_df.head(10))
+
+    if agree_pos_df is None or len(agree_pos_df) == 0:
+        print("No agree-positive rows found for this pair.")
+        q2h_pair_results[(a, b)] = {
+            "label_stats": label_stats_df,
+            "agree_pos": agree_pos_df,
+            "top_high_agree": pd.DataFrame(),
+            "analysis": {"summary": None, "by_bin": {}},
+        }
+        continue
+
+    # Highest-agreement rows overall (global, across labels)
+    top_high_agree = (
+        agree_pos_df.sort_values(["cos", "jac"], ascending=[False, False])
+                    .head(Q2H_TOP_OVERALL_N)
+                    .reset_index(drop=True)
+    )
+
+    print(f"Highest-agreement cases overall (top {Q2H_TOP_OVERALL_N}):")
+    display(top_high_agree)
+
+    # Agreement vs mislabeling analysis (unbiased)
+    analysis = q2h_agreement_vs_mislabeling(agree_pos_df, n_bins=Q2H_BINS)
+
+    print("Agreement↔mislabeling summary:")
+    display(analysis["summary"])
+
+    print("FP rate by COS agreement quantiles:")
+    display(analysis["by_bin"]["cos"])
+
+    print("FP rate by JACCARD agreement quantiles:")
+    display(analysis["by_bin"]["jac"])
+
+    print("FP rate by AVG agreement quantiles ( (cos+jac)/2 ):")
+    display(analysis["by_bin"]["agreement_avg"])
+
+    print("FP rate by MIN agreement quantiles ( min(cos,jac) ):")
+    display(analysis["by_bin"]["agreement_min"])
+
+    # Qualitative inspection: inspect a few high-agreement examples
+    if Q2H_SHOW_QUAL and len(top_high_agree) > 0:
+        examples = q2h_pick_examples_high_agree(top_high_agree, n=Q2H_N_QUAL_PER_PAIR)
+        for ex_row in examples:
+            q2_inspect_case(
+                ex_row,
+                top_k=Q2H_TOP_K,
+                trim_context=Q2H_TRIM_CONTEXT,
+                do_position_heatmap=True
+            )
+
+    q2h_pair_results[(a, b)] = {
+        "label_stats": label_stats_df,
+        "agree_pos": agree_pos_df,
+        "top_high_agree": top_high_agree,
+        "analysis": analysis,
+    }
+
+
+# %%
+# Combine all pairs' agree-positive rows into one big df (tagged by pair)
+
+all_pairs_agree_pos = []
+for (a, b), d in q2h_pair_results.items():
+    df = d.get("agree_pos", None)
+    if df is not None and len(df) > 0:
+        all_pairs_agree_pos.append(df)
+
+all_pairs_agree_pos_df = pd.concat(all_pairs_agree_pos, ignore_index=True) if len(all_pairs_agree_pos) else pd.DataFrame()
+print("Total agree-positive rows across all pairs:", len(all_pairs_agree_pos_df))
+display(all_pairs_agree_pos_df.head(10))
+
+if len(all_pairs_agree_pos_df) > 0:
+    agg_analysis = q2h_agreement_vs_mislabeling(all_pairs_agree_pos_df, n_bins=Q2H_BINS)
+    print("AGGREGATE summary (all pairs):")
+    display(agg_analysis["summary"])
+
+    print("AGGREGATE FP rate by COS agreement quantiles:")
+    display(agg_analysis["by_bin"]["cos"])
+
+    print("AGGREGATE FP rate by JACCARD agreement quantiles:")
+    display(agg_analysis["by_bin"]["jac"])
+
+
+# %%
+def plot_fp_rate_by_bin(bin_df: pd.DataFrame, title: str):
+    if bin_df is None or len(bin_df) == 0:
+        print("No data to plot.")
+        return
+    # Use bin order on x; matplotlib can handle categorical via range
+    x = list(range(len(bin_df)))
+    y = bin_df["fp_rate"].values
+
+    plt.figure()
+    plt.plot(x, y, marker="o")
+    plt.xticks(x, [str(b) for b in bin_df["bin"]], rotation=45, ha="right")
+    plt.ylabel("False Positive Rate (GT=0 among agree-positive)")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+# Example: plot aggregate if present
+if "agg_analysis" in globals() and agg_analysis["by_bin"]:
+    plot_fp_rate_by_bin(agg_analysis["by_bin"]["cos"], "Aggregate: FP rate vs COS agreement quantiles")
+    plot_fp_rate_by_bin(agg_analysis["by_bin"]["jac"], "Aggregate: FP rate vs JACCARD agreement quantiles")
+    plot_fp_rate_by_bin(agg_analysis["by_bin"]["agreement_avg"], "Aggregate: FP rate vs AVG agreement quantiles")
+    plot_fp_rate_by_bin(agg_analysis["by_bin"]["agreement_min"], "Aggregate: FP rate vs MIN agreement quantiles")
 
 
 
