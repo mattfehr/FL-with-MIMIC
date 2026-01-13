@@ -2226,4 +2226,205 @@ if "agg_analysis" in globals() and agg_analysis["by_bin"]:
     plot_fp_rate_by_bin(agg_analysis["by_bin"]["agreement_min"], "Aggregate: FP rate vs MIN agreement quantiles")
 
 
+# %% [markdown]
+# ### Phrase Level Attention Inspection
+
+# %%
+# Phrase / window extraction helpers
+
+def _merge_overlapping_spans(spans):
+    """spans: list[(start,end,score)] sorted by start. merges overlaps keeping max score sum-ish."""
+    if not spans:
+        return []
+    spans = sorted(spans, key=lambda x: (x[0], x[1]))
+    merged = [list(spans[0])]
+    for s,e,sc in spans[1:]:
+        ms, me, msc = merged[-1]
+        if s <= me:  # overlap
+            merged[-1][1] = max(me, e)
+            merged[-1][2] = max(msc, sc)
+        else:
+            merged.append([s,e,sc])
+    return [tuple(x) for x in merged]
+
+def top_attention_phrases(
+    tokens,
+    attn_1d,
+    valid_pos=None,
+    top_k=5,
+    window_size=10,
+    centered=True,
+    skip_pad=True,
+):
+    """
+    Returns list of phrases/windows around high-attention positions.
+
+    - centered=True: window is centered on top attention token positions (recommended)
+    - valid_pos: np array of allowed positions (use your get_valid_positions output)
+    """
+    L = len(tokens)
+    att = attn_1d.detach().cpu().numpy()
+
+    # build candidate positions
+    if valid_pos is None:
+        cand_pos = np.arange(L)
+    else:
+        cand_pos = np.array(valid_pos, dtype=int)
+
+    # optionally drop PAD positions from candidates
+    if skip_pad:
+        cand_pos = np.array([p for p in cand_pos if tokens[p] != "<PAD>"], dtype=int)
+        if cand_pos.size == 0:
+            return []
+
+    # rank candidate positions by attention
+    att_c = att[cand_pos]
+    # grab more than top_k to survive dedup/overlap
+    grab = min(len(cand_pos), top_k * 5)
+    top_idx = np.argsort(att_c)[::-1][:grab]
+    top_positions = cand_pos[top_idx]
+
+    spans = []
+    half = window_size // 2
+
+    for pos in top_positions:
+        if centered:
+            start = max(int(pos) - half, 0)
+            end   = min(start + window_size, L)
+            start = max(end - window_size, 0)
+        else:
+            start = int(pos)
+            end   = min(start + window_size, L)
+
+        # compute span score (sum of attention in span)
+        score = float(att[start:end].sum())
+
+        span_tokens = tokens[start:end]
+        if skip_pad:
+            span_tokens = [t for t in span_tokens if t != "<PAD>"]
+        span_text = " ".join(span_tokens).strip()
+
+        if span_text:
+            spans.append((start, end, score, span_text))
+
+    # remove duplicates by span_text, keep best score
+    best = {}
+    for s,e,sc,txt in spans:
+        if (txt not in best) or (sc > best[txt][2]):
+            best[txt] = (s,e,sc,txt)
+    spans = list(best.values())
+
+    # merge overlaps (optional but helpful)
+    spans_simple = [(s,e,sc) for (s,e,sc,txt) in spans]
+    merged = _merge_overlapping_spans(spans_simple)
+
+    # rebuild merged spans with text + score
+    out = []
+    for s,e,sc in merged:
+        txt = " ".join([t for t in tokens[s:e] if (not skip_pad or t != "<PAD>")]).strip()
+        if txt:
+            out.append((s,e,sc,txt))
+
+    # sort by score desc and cut to top_k
+    out.sort(key=lambda x: -x[2])
+    return out[:top_k]
+
+
+# %%
+# Compare across models display function
+
+@torch.no_grad()
+def show_phrase_attention_comparison(
+    sample_idx: int,
+    label_idx: int,
+    model_names=("Centralized", "FedAvg", "FedProx", "SCAFFOLD"),
+    top_k_phrases: int = 5,
+    phrase_window: int = 10,
+    trim_context: bool = True,
+):
+    x, y = test_dataset[sample_idx]
+    tokens = decode_sequence(x)
+
+    window_size = config["window_size"] if trim_context else None
+    valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+
+    print(f"\n=== Phrase attention comparison | sample={sample_idx} label={label_idx} ===")
+    print(f"GT={int(y[label_idx].item())} | valid_len={len(valid_pos)} / seq_len={len(tokens)}")
+    print(f"(phrase_window={phrase_window}, top_k_phrases={top_k_phrases}, trim_context={trim_context})")
+
+    # collect phrases per model
+    phrases_by_model = {}
+
+    for mname in model_names:
+        # prediction metadata (your notebook uses per-model thresholds)
+        logits_lbl, attn_lbl = get_label_logits_and_attn(models[mname], x.unsqueeze(0), label_idx)
+        prob = float(torch.sigmoid(logits_lbl[0]).item())
+        thr  = float(per_label_thr_by_model[mname][label_idx].item())
+        pred = bool(prob >= thr)
+
+        attn_vec = attn_lbl[0]  # (L,)
+
+        phrases = top_attention_phrases(
+            tokens=tokens,
+            attn_1d=attn_vec,
+            valid_pos=valid_pos,
+            top_k=top_k_phrases,
+            window_size=phrase_window,
+            centered=True,
+            skip_pad=True,
+        )
+        phrases_by_model[mname] = phrases
+
+        print(f"\n--- {mname} --- prob={prob:.4f} thr={thr:.2f} pred={pred}")
+        for i, (s,e,score,txt) in enumerate(phrases, 1):
+            print(f"#{i}  span[{s}:{e}]  score={score:.4f}  {txt}")
+
+    # simple overlap view: which phrase texts are shared?
+    sets = {m: set([p[3] for p in ph]) for m, ph in phrases_by_model.items()}
+    if len(sets) >= 2:
+        base = model_names[0]
+        print(f"\n=== Phrase overlap vs {base} (exact-text match) ===")
+        base_set = sets.get(base, set())
+        for m in model_names[1:]:
+            inter = base_set & sets.get(m, set())
+            print(f"{m}: {len(inter)} shared / {len(base_set)} centralized phrases")
+            for t in list(inter)[:5]:
+                print("  -", t)
+
+
+# %%
+# sample use
+def find_agree_positive_example(label_idx, model_a="Centralized", model_b="FedAvg", max_scan=5000):
+    for ds_idx in range(min(max_scan, len(test_dataset))):
+        x, y = test_dataset[ds_idx]
+        if bool(agree_positive_mask(model_a, model_b, x.unsqueeze(0), label_idx).item()):
+            return ds_idx
+    return None
+
+lbl = 7
+ds = find_agree_positive_example(lbl, "Centralized", "FedAvg")
+print("found sample:", ds)
+
+show_phrase_attention_comparison(
+    sample_idx=ds,
+    label_idx=lbl,
+    model_names=("Centralized","FedAvg","FedProx","SCAFFOLD"),
+    top_k_phrases=5,
+    phrase_window=12,
+    trim_context=True
+)
+
+#specific test
+x, y = test_dataset[1212]
+print("GT:", int(y[1].item()))
+
+logits, _ = get_label_logits_and_attn(models["Centralized"], x.unsqueeze(0), 1)
+prob = torch.sigmoid(logits[0]).item()
+thr  = per_label_thr_by_model["Centralized"][1].item()
+print("Centralized prob/thr:", prob, thr)
+sample_idx = 1212
+label_idx  = 1
+show_phrase_attention_comparison(sample_idx, label_idx)
+
+
 
