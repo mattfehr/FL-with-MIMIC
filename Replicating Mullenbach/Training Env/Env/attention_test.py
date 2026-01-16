@@ -2255,31 +2255,26 @@ def top_attention_phrases(
     window_size=10,
     centered=True,
     skip_pad=True,
+    return_attn=True,   # NEW
 ):
     """
-    Returns list of phrases/windows around high-attention positions.
-
-    - centered=True: window is centered on top attention token positions (recommended)
-    - valid_pos: np array of allowed positions (use your get_valid_positions output)
+    Returns list of (start, end, score, text, attn_vals, span_tokens).
+    score = sum(attn over span), like the Colab output.
     """
     L = len(tokens)
     att = attn_1d.detach().cpu().numpy()
 
-    # build candidate positions
     if valid_pos is None:
         cand_pos = np.arange(L)
     else:
         cand_pos = np.array(valid_pos, dtype=int)
 
-    # optionally drop PAD positions from candidates
     if skip_pad:
         cand_pos = np.array([p for p in cand_pos if tokens[p] != "<PAD>"], dtype=int)
         if cand_pos.size == 0:
             return []
 
-    # rank candidate positions by attention
     att_c = att[cand_pos]
-    # grab more than top_k to survive dedup/overlap
     grab = min(len(cand_pos), top_k * 5)
     top_idx = np.argsort(att_c)[::-1][:grab]
     top_positions = cand_pos[top_idx]
@@ -2296,36 +2291,66 @@ def top_attention_phrases(
             start = int(pos)
             end   = min(start + window_size, L)
 
-        # compute span score (sum of attention in span)
-        score = float(att[start:end].sum())
+        # raw tokens + raw attention in the span (BEFORE any PAD filtering)
+        span_tokens_raw = tokens[start:end]
+        span_att_raw = att[start:end]
 
-        span_tokens = tokens[start:end]
+        # score matches Colab: sum of attention in the window/span
+        score = float(span_att_raw.sum())
+
+        # optionally remove PAD tokens for display (keep aligned tokens+attn)
         if skip_pad:
-            span_tokens = [t for t in span_tokens if t != "<PAD>"]
-        span_text = " ".join(span_tokens).strip()
+            kept = [(t, a) for t, a in zip(span_tokens_raw, span_att_raw) if t != "<PAD>"]
+            if not kept:
+                continue
+            span_tokens_disp = [t for t, _ in kept]
+            span_att_disp = [float(a) for _, a in kept]
+        else:
+            span_tokens_disp = span_tokens_raw
+            span_att_disp = [float(a) for a in span_att_raw]
 
+        span_text = " ".join(span_tokens_disp).strip()
         if span_text:
-            spans.append((start, end, score, span_text))
+            if return_attn:
+                spans.append((start, end, score, span_text, span_att_disp, span_tokens_disp))
+            else:
+                spans.append((start, end, score, span_text))
 
-    # remove duplicates by span_text, keep best score
+    # dedup by text, keep best score
     best = {}
-    for s,e,sc,txt in spans:
+    for item in spans:
+        txt = item[3]
+        sc = item[2]
         if (txt not in best) or (sc > best[txt][2]):
-            best[txt] = (s,e,sc,txt)
+            best[txt] = item
     spans = list(best.values())
 
-    # merge overlaps (optional but helpful)
-    spans_simple = [(s,e,sc) for (s,e,sc,txt) in spans]
+    # merge overlaps (keeping max score span)
+    spans_simple = [(s, e, sc) for (s, e, sc, *_rest) in spans]
     merged = _merge_overlapping_spans(spans_simple)
 
-    # rebuild merged spans with text + score
+    # rebuild merged spans with text + (optional) attn vector
     out = []
-    for s,e,sc in merged:
-        txt = " ".join([t for t in tokens[s:e] if (not skip_pad or t != "<PAD>")]).strip()
-        if txt:
-            out.append((s,e,sc,txt))
+    for s, e, sc in merged:
+        span_tokens_raw = tokens[s:e]
+        span_att_raw = att[s:e]
+        if skip_pad:
+            kept = [(t, a) for t, a in zip(span_tokens_raw, span_att_raw) if t != "<PAD>"]
+            if not kept:
+                continue
+            span_tokens_disp = [t for t, _ in kept]
+            span_att_disp = [float(a) for _, a in kept]
+        else:
+            span_tokens_disp = span_tokens_raw
+            span_att_disp = [float(a) for a in span_att_raw]
 
-    # sort by score desc and cut to top_k
+        txt = " ".join(span_tokens_disp).strip()
+        if txt:
+            if return_attn:
+                out.append((s, e, float(np.sum(span_att_raw)), txt, span_att_disp, span_tokens_disp))
+            else:
+                out.append((s, e, float(np.sum(span_att_raw)), txt))
+
     out.sort(key=lambda x: -x[2])
     return out[:top_k]
 
@@ -2376,8 +2401,10 @@ def show_phrase_attention_comparison(
         phrases_by_model[mname] = phrases
 
         print(f"\n--- {mname} --- prob={prob:.4f} thr={thr:.2f} pred={pred}")
-        for i, (s,e,score,txt) in enumerate(phrases, 1):
+        for i, (s, e, score, txt, att_vals, span_toks) in enumerate(phrases, 1):
             print(f"#{i}  span[{s}:{e}]  score={score:.4f}  {txt}")
+            print(f"     Tokens: {' '.join(span_toks)}")
+            print(f"     Attention: {[round(a, 4) for a in att_vals]}")
 
     # simple overlap view: which phrase texts are shared?
     sets = {m: set([p[3] for p in ph]) for m, ph in phrases_by_model.items()}
