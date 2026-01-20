@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from typing import Optional, Dict, List, Tuple
+from itertools import combinations
 
 import os
 import math
@@ -44,6 +45,42 @@ from IPython.display import HTML, display
 torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
+
+
+# %%
+# Load label metadata
+
+DESC_PATH = os.path.join("..", "Data", "ICD9_descriptions")
+CODE_50_PATH = os.path.join("..", "Data", "TOP_50_CODES.csv")
+
+def load_icd_metadata(desc_path: str, code_50_path: str):
+    """
+    Loads:
+      - label_idx -> ICD code
+      - ICD code -> long description
+    Returns two dicts.
+    """
+    # ICD code -> description
+    desc_df = pd.read_csv(desc_path, sep="\t", header=None, names=["CODE", "LONG_TITLE"])
+    code_to_desc = dict(zip(desc_df["CODE"].astype(str), desc_df["LONG_TITLE"]))
+
+    # label index -> ICD code (row order matters!)
+    top50_df = pd.read_csv(code_50_path, header=None, names=["CODE"])
+    idx_to_code = dict(enumerate(top50_df["CODE"].astype(str)))
+
+    return idx_to_code, code_to_desc
+
+
+IDX_TO_CODE, CODE_TO_DESC = load_icd_metadata(DESC_PATH, CODE_50_PATH)
+
+def label_info(label_idx: int) -> str:
+    """
+    Returns a readable string for a label index:
+      '401.9 – Unspecified essential hypertension'
+    """
+    code = IDX_TO_CODE.get(label_idx, "UNK")
+    desc = CODE_TO_DESC.get(code, "Unknown ICD code")
+    return f"{code} – {desc}"
 
 
 # %%
@@ -184,6 +221,9 @@ print("Test samples:", len(test_dataset))
 
 # %% [markdown]
 # ## Helper Functions
+
+# %% [markdown]
+# ### Function Definitions
 
 # %%
 # Recomputer Per-Label Thresholds Per Model
@@ -466,7 +506,7 @@ def show_attention(
     window_size = config["window_size"] if trim_context else None
     valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
 
-    print(f"\nModel={model_name} | label={label_idx} | sample={sample_dataset_idx}")
+    print(f"\nModel={model_name} | label={label_idx} ({label_info(label_idx)}) | sample={sample_dataset_idx}")
     print(f"  logit={logits:.4f} | prob={prob:.4f} | thr={thr:.2f} | pred={pred} | GT={int(y[label_idx].item())}")
     print(f"  valid_len={len(valid_pos)} / seq_len={len(tokens)} (trim_context={trim_context})")
 
@@ -544,7 +584,7 @@ def plot_attention_heatmap(
         plt.colorbar(label="Attention weight")
         plt.yticks(np.arange(len(model_names)) + 0.5, model_names)
         plt.xlabel("Token position (valid positions only)")
-        plt.title(f"Attention Heatmap (by position) | sample={sample_idx}, label={label_idx}")
+        plt.title(f"Attention Heatmap (by position) | sample={sample_idx}, label={label_idx} ({label_info(label_idx)})")
         plt.tight_layout()
         plt.show()
 
@@ -1198,58 +1238,58 @@ def q2_find_divergent_samples_for_label(
 
 
 # %%
-# Q2 RUN: collect top divergent examples per label
+# # Q2 RUN: collect top divergent examples per label
 
-model_a, model_b = Q2_PAIR
+# model_a, model_b = Q2_PAIR
 
-q2_all = []
-q2_label_stats = []
+# q2_all = []
+# q2_label_stats = []
 
-for label_idx in tqdm(Q2_LABELS, desc="Q2 labels"):
-    cand_idxs = q2_candidate_indices_for_label(label_idx)
+# for label_idx in tqdm(Q2_LABELS, desc="Q2 labels"):
+#     cand_idxs = q2_candidate_indices_for_label(label_idx)
 
-    df = q2_find_divergent_samples_for_label(
-        label_idx=label_idx,
-        model_a=model_a,
-        model_b=model_b,
-        top_k=Q2_TOP_K,
-        trim_context=Q2_TRIM_CONTEXT,
-        candidate_indices=cand_idxs,
-    )
+#     df = q2_find_divergent_samples_for_label(
+#         label_idx=label_idx,
+#         model_a=model_a,
+#         model_b=model_b,
+#         top_k=Q2_TOP_K,
+#         trim_context=Q2_TRIM_CONTEXT,
+#         candidate_indices=cand_idxs,
+#     )
 
-    n_kept = df.attrs.get("n_kept", 0)
-    q2_label_stats.append({
-        "label": label_idx,
-        "n_scanned": df.attrs.get("n_scanned", len(cand_idxs)),
-        "n_agree_pos": n_kept,
-        "n_returned": int(min(Q2_KEEP_TOP_N_PER_LABEL, len(df))),
-        "cos_min": float(df["cos"].min()) if len(df) else np.nan,
-        "jac_min": float(df["jac"].min()) if len(df) else np.nan,
-    })
+#     n_kept = df.attrs.get("n_kept", 0)
+#     q2_label_stats.append({
+#         "label": label_idx,
+#         "n_scanned": df.attrs.get("n_scanned", len(cand_idxs)),
+#         "n_agree_pos": n_kept,
+#         "n_returned": int(min(Q2_KEEP_TOP_N_PER_LABEL, len(df))),
+#         "cos_min": float(df["cos"].min()) if len(df) else np.nan,
+#         "jac_min": float(df["jac"].min()) if len(df) else np.nan,
+#     })
 
-    # skip low-coverage labels (avoid misleading "divergent" samples from tiny n)
-    if n_kept < Q2_MIN_KEPT_REQUIRED:
-        continue
+#     # skip low-coverage labels (avoid misleading "divergent" samples from tiny n)
+#     if n_kept < Q2_MIN_KEPT_REQUIRED:
+#         continue
 
-    q2_all.append(df.head(Q2_KEEP_TOP_N_PER_LABEL))
+#     q2_all.append(df.head(Q2_KEEP_TOP_N_PER_LABEL))
 
-q2_label_stats_df = pd.DataFrame(q2_label_stats).sort_values("n_agree_pos", ascending=False)
-display(q2_label_stats_df.head(20))
+# q2_label_stats_df = pd.DataFrame(q2_label_stats).sort_values("n_agree_pos", ascending=False)
+# display(q2_label_stats_df.head(20))
 
-# Each row is label x sample x model pair and the max is 250 because there are 50 labels and the config keep_top_n_per_label is 5
-q2_cases_df = pd.concat(q2_all, ignore_index=True) if len(q2_all) else pd.DataFrame()
-print("Total Q2 cases collected:", len(q2_cases_df))
-display(q2_cases_df.head(20))
+# # Each row is label x sample x model pair and the max is 250 because there are 50 labels and the config keep_top_n_per_label is 5
+# q2_cases_df = pd.concat(q2_all, ignore_index=True) if len(q2_all) else pd.DataFrame()
+# print("Total Q2 cases collected:", len(q2_cases_df))
+# display(q2_cases_df.head(20))
 
 
 # %%
-# Q2: Find the MOST divergent cases overall (across labels)
+# # Q2: Find the MOST divergent cases overall (across labels)
 
-if len(q2_cases_df) == 0:
-    print("No Q2 cases found (check Q2_MIN_KEPT_REQUIRED / pair / candidate pool).")
-else:
-    q2_most_divergent = q2_cases_df.sort_values(["cos", "jac"], ascending=[True, True]).head(30)
-    display(q2_most_divergent)
+# if len(q2_cases_df) == 0:
+#     print("No Q2 cases found (check Q2_MIN_KEPT_REQUIRED / pair / candidate pool).")
+# else:
+#     q2_most_divergent = q2_cases_df.sort_values(["cos", "jac"], ascending=[True, True]).head(30)
+#     display(q2_most_divergent)
 
 
 # %%
@@ -1272,7 +1312,7 @@ def q2_inspect_case(
     a, b = row["pair"].split(" vs ")
 
     print("\n==============================")
-    print(f"Q2 case | label={label_idx} | sample={ds_idx} | pair={a} vs {b}")
+    print(f"Q2 case | label={label_idx} ({label_info(label_idx)}) | sample={ds_idx} | pair={a} vs {b}")
     print(f"  cos={float(row['cos']):.4f} | jac={float(row['jac']):.4f} | GT={int(row['gt'])}")
     print(f"  {a}: prob={float(row['prob_a']):.4f} thr={float(row['thr_a']):.2f}")
     print(f"  {b}: prob={float(row['prob_b']):.4f} thr={float(row['thr_b']):.2f}")
@@ -2230,24 +2270,25 @@ if "agg_analysis" in globals() and agg_analysis["by_bin"]:
 # ### Phrase Level Attention Inspection
 
 # %%
-# Phrase / window extraction helpers
+# Phrase / window extraction helpers with merging
 
 def _merge_overlapping_spans(spans):
-    """spans: list[(start,end,score)] sorted by start. merges overlaps keeping max score sum-ish."""
+    """spans: list[(start,end,score)] merges overlaps keeping max score (as before)."""
     if not spans:
         return []
     spans = sorted(spans, key=lambda x: (x[0], x[1]))
     merged = [list(spans[0])]
-    for s,e,sc in spans[1:]:
+    for s, e, sc in spans[1:]:
         ms, me, msc = merged[-1]
         if s <= me:  # overlap
             merged[-1][1] = max(me, e)
             merged[-1][2] = max(msc, sc)
         else:
-            merged.append([s,e,sc])
+            merged.append([s, e, sc])
     return [tuple(x) for x in merged]
 
-def top_attention_phrases(
+
+def top_attention_phrases_merging(
     tokens,
     attn_1d,
     valid_pos=None,
@@ -2255,11 +2296,17 @@ def top_attention_phrases(
     window_size=10,
     centered=True,
     skip_pad=True,
-    return_attn=True,   # NEW
+    return_attn=True,
+    merge_overlaps=True,   # NEW: toggle merging
 ):
     """
     Returns list of (start, end, score, text, attn_vals, span_tokens).
     score = sum(attn over span), like the Colab output.
+
+    Notes:
+      - Windows are built around top-attended token positions.
+      - If merge_overlaps=True, overlapping windows are merged into larger spans.
+      - If merge_overlaps=False, returned spans are the best scored unique windows after dedup.
     """
     L = len(tokens)
     att = attn_1d.detach().cpu().numpy()
@@ -2325,6 +2372,14 @@ def top_attention_phrases(
             best[txt] = item
     spans = list(best.values())
 
+    if not spans:
+        return []
+
+    # NEW: allow skipping merge. If skipping, just sort by score and return top_k.
+    if not merge_overlaps:
+        spans.sort(key=lambda x: -x[2])
+        return spans[:top_k]
+
     # merge overlaps (keeping max score span)
     spans_simple = [(s, e, sc) for (s, e, sc, *_rest) in spans]
     merged = _merge_overlapping_spans(spans_simple)
@@ -2346,17 +2401,324 @@ def top_attention_phrases(
 
         txt = " ".join(span_tokens_disp).strip()
         if txt:
+            sc2 = float(np.sum(span_att_raw))
             if return_attn:
-                out.append((s, e, float(np.sum(span_att_raw)), txt, span_att_disp, span_tokens_disp))
+                out.append((s, e, sc2, txt, span_att_disp, span_tokens_disp))
             else:
-                out.append((s, e, float(np.sum(span_att_raw)), txt))
+                out.append((s, e, sc2, txt))
 
     out.sort(key=lambda x: -x[2])
     return out[:top_k]
 
+# %%
+# Phrase / window extraction helpers (with span-level NMS)
+
+def span_iou(a, b):
+    """IoU for half-open token spans a=(s1,e1), b=(s2,e2)."""
+    s1, e1 = a
+    s2, e2 = b
+    inter = max(0, min(e1, e2) - max(s1, s2))
+    if inter <= 0:
+        return 0.0
+    union = (e1 - s1) + (e2 - s2) - inter
+    return float(inter) / float(union) if union > 0 else 0.0
+
+
+def nms_spans(spans, top_k=5, iou_thresh=0.5):
+    """
+    Non-maximum suppression over spans.
+
+    spans: list of tuples that start with (start, end, score, ...)
+           e.g. (start, end, score, text, attn_vals, span_tokens)
+
+    Keeps highest-score spans, suppresses any candidate whose IoU with any kept span >= iou_thresh.
+    """
+    if not spans:
+        return []
+
+    spans_sorted = sorted(spans, key=lambda x: -x[2])  # sort by score desc
+    kept = []
+
+    for item in spans_sorted:
+        s, e = item[0], item[1]
+        too_close = any(span_iou((s, e), (ks, ke)) >= iou_thresh for (ks, ke, *_rest) in kept)
+        if too_close:
+            continue
+        kept.append(item)
+        if len(kept) >= top_k:
+            break
+
+    return kept
+
+
+def top_attention_phrases_NMS(
+    tokens,
+    attn_1d,
+    valid_pos=None,
+    top_k=5,
+    window_size=10,
+    centered=True,
+    skip_pad=True,
+    return_attn=True,
+    # NEW: NMS controls
+    use_nms=True,
+    nms_iou_thresh=0.3,
+    nms_grab_multiplier=5,   # grab more candidates before NMS
+):
+    """
+    Returns list of (start, end, score, text, attn_vals, span_tokens).
+    score = sum(attn over span) on the RAW window [start:end].
+
+    This version uses fixed-length windows and (optionally) NMS to ensure non-overlapping phrases.
+    - Windows are built around top-attended token positions.
+    - use_nms=True keeps spans fixed-length and enforces distinctness via IoU suppression.
+    """
+    L = len(tokens)
+    att = attn_1d.detach().cpu().numpy()
+
+    if valid_pos is None:
+        cand_pos = np.arange(L)
+    else:
+        cand_pos = np.array(valid_pos, dtype=int)
+
+    if skip_pad:
+        cand_pos = np.array([p for p in cand_pos if tokens[p] != "<PAD>"], dtype=int)
+        if cand_pos.size == 0:
+            return []
+
+    # pick top-attended token positions (grab more than top_k so NMS has options)
+    att_c = att[cand_pos]
+    grab = min(len(cand_pos), max(top_k * nms_grab_multiplier, top_k))
+    top_idx = np.argsort(att_c)[::-1][:grab]
+    top_positions = cand_pos[top_idx]
+
+    spans = []
+    half = window_size // 2
+
+    for pos in top_positions:
+        if centered:
+            start = max(int(pos) - half, 0)
+            end   = min(start + window_size, L)
+            start = max(end - window_size, 0)
+        else:
+            start = int(pos)
+            end   = min(start + window_size, L)
+
+        # raw tokens + raw attention in the fixed window (BEFORE any PAD filtering)
+        span_tokens_raw = tokens[start:end]
+        span_att_raw = att[start:end]
+
+        # score matches Colab: sum of attention in the window/span
+        score = float(span_att_raw.sum())
+
+        # optionally remove PAD tokens for display (keep aligned tokens+attn)
+        if skip_pad:
+            kept_tok_att = [(t, a) for t, a in zip(span_tokens_raw, span_att_raw) if t != "<PAD>"]
+            if not kept_tok_att:
+                continue
+            span_tokens_disp = [t for t, _ in kept_tok_att]
+            span_att_disp = [float(a) for _, a in kept_tok_att]
+        else:
+            span_tokens_disp = span_tokens_raw
+            span_att_disp = [float(a) for a in span_att_raw]
+
+        span_text = " ".join(span_tokens_disp).strip()
+        if not span_text:
+            continue
+
+        if return_attn:
+            spans.append((start, end, score, span_text, span_att_disp, span_tokens_disp))
+        else:
+            spans.append((start, end, score, span_text))
+
+    if not spans:
+        return []
+
+    # dedup by text, keep best score (still useful even with NMS)
+    best = {}
+    for item in spans:
+        txt = item[3]
+        sc = item[2]
+        if (txt not in best) or (sc > best[txt][2]):
+            best[txt] = item
+    spans = list(best.values())
+
+    if not spans:
+        return []
+
+    # apply NMS to enforce distinct spans while keeping fixed window sizes
+    if use_nms:
+        spans = nms_spans(spans, top_k=top_k, iou_thresh=nms_iou_thresh)
+        spans.sort(key=lambda x: -x[2])
+        return spans[:top_k]
+
+    # fallback: no NMS, just top by score (can be highly redundant)
+    spans.sort(key=lambda x: -x[2])
+    return spans[:top_k]
+
 
 # %%
-# Compare across models display function
+# NMS threshold sweep: find a good iou / overlap threshold for phrase extraction
+
+# -- helper: overlap ratio defined as intersection / min(len(A), len(B))
+def span_overlap_ratio_minlen(a, b):
+    s1, e1 = a
+    s2, e2 = b
+    inter = max(0, min(e1, e2) - max(s1, s2))
+    if inter <= 0:
+        return 0.0
+    minlen = min(e1 - s1, e2 - s2)
+    return float(inter) / float(minlen) if minlen > 0 else 0.0
+
+# -- helper: pairwise IoU summary for a list of spans
+def pairwise_overlap_stats(spans, metric="iou"):
+    # spans: list of tuples (s,e,score,...)
+    if len(spans) < 2:
+        return {"mean_pairwise": 0.0, "max_pairwise": 0.0}
+    vals = []
+    for i, j in combinations(range(len(spans)), 2):
+        a = (spans[i][0], spans[i][1])
+        b = (spans[j][0], spans[j][1])
+        if metric == "iou":
+            vals.append(span_iou(a, b))
+        elif metric == "minlen":
+            vals.append(span_overlap_ratio_minlen(a, b))
+        else:
+            raise ValueError("metric must be 'iou' or 'minlen'")
+    return {"mean_pairwise": float(np.mean(vals)), "max_pairwise": float(np.max(vals))}
+
+# -- sweep function
+@torch.no_grad()
+def sweep_nms_thresholds(
+    sample_size=300,
+    label_sample=None,              # list of label indices to evaluate (None -> random labels per sample)
+    model_names=("Centralized","FedAvg","FedProx","SCAFFOLD"),
+    thresholds=(0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5),
+    top_k=5,
+    phrase_window=12,
+    trim_context=True,
+    nms_grab_multiplier=5,
+    overlap_metric="iou",           # "iou" or "minlen"
+    random_seed=42,
+):
+    """
+    Sweep NMS thresholds and return a DataFrame of aggregated statistics.
+
+    Returns:
+      df: pandas.DataFrame with rows (threshold, model) and columns:
+         mean_num_spans, std_num_spans, mean_mean_pairwise, mean_max_pairwise
+    """
+    rng = np.random.RandomState(random_seed)
+
+    # select sample indices (avoid too-large runs)
+    all_indices = list(range(len(test_dataset)))
+    if sample_size >= len(all_indices):
+        sample_indices = all_indices
+    else:
+        sample_indices = rng.choice(all_indices, size=sample_size, replace=False).tolist()
+
+    # if label_sample is None, we will randomly pick one *positive* label per sample if possible,
+    # otherwise we will evaluate all labels (or a fixed set). To keep runtime reasonable, we'll
+    # sample one label per sample unless label_sample is provided as a list.
+    # Here we choose a random label index in range(num_labels) as a default fallback.
+    num_labels = test_dataset[0][1].shape[0]  # assumes (x,y) and y is vector
+    if label_sample is None:
+        pick_label_per_sample = True
+    else:
+        pick_label_per_sample = False
+        label_sample = list(label_sample)
+
+    rows = []
+
+    for t in tqdm(thresholds, desc="thresholds"):
+        stats_by_model = {m: {"nspans": [], "mean_pairwise": [], "max_pairwise": []} for m in model_names}
+
+        for ds_idx in sample_indices:
+            x, y = test_dataset[ds_idx]
+            tokens = decode_sequence(x)
+            window_size = config["window_size"] if trim_context else None
+            valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+
+            # choose which labels to test: either provided list or one random label per sample
+            if pick_label_per_sample:
+                lbl = rng.randint(0, num_labels)
+                labels_to_check = [lbl]
+            else:
+                labels_to_check = label_sample
+
+            for lbl in labels_to_check:
+                for m in model_names:
+                    # get attention vector
+                    logits_lbl, attn_lbl = get_label_logits_and_attn(models[m], x.unsqueeze(0), lbl)
+                    attn_vec = attn_lbl[0]
+
+                    spans = top_attention_phrases_NMS(
+                        tokens=tokens,
+                        attn_1d=attn_vec,
+                        valid_pos=valid_pos,
+                        top_k=top_k,
+                        window_size=phrase_window,
+                        centered=True,
+                        skip_pad=True,
+                        return_attn=True,
+                        use_nms=True,
+                        nms_iou_thresh=float(t),
+                        nms_grab_multiplier=nms_grab_multiplier,
+                    )
+
+                    # record counts
+                    stats_by_model[m]["nspans"].append(len(spans))
+
+                    # pairwise overlap stats
+                    pair_stats = pairwise_overlap_stats(spans, metric=("iou" if overlap_metric=="iou" else "minlen"))
+                    stats_by_model[m]["mean_pairwise"].append(pair_stats["mean_pairwise"])
+                    stats_by_model[m]["max_pairwise"].append(pair_stats["max_pairwise"])
+
+        # aggregate per model
+        for m in model_names:
+            arr_n = np.array(stats_by_model[m]["nspans"])
+            arr_mp = np.array(stats_by_model[m]["mean_pairwise"])
+            arr_xp = np.array(stats_by_model[m]["max_pairwise"])
+            rows.append({
+                "threshold": float(t),
+                "model": m,
+                "mean_num_spans": float(np.mean(arr_n)) if arr_n.size else 0.0,
+                "std_num_spans": float(np.std(arr_n)) if arr_n.size else 0.0,
+                "mean_mean_pairwise": float(np.mean(arr_mp)) if arr_mp.size else 0.0,
+                "mean_max_pairwise": float(np.mean(arr_xp)) if arr_xp.size else 0.0,
+                "sample_size": len(sample_indices),
+                "top_k": top_k,
+                "phrase_window": phrase_window,
+                "overlap_metric": overlap_metric,
+            })
+
+    df = pd.DataFrame(rows)
+    return df
+
+# %%
+# Example usage (quick, medium, or longer runs)
+# - For a quick exploratory run, sample_size=200 and phrase_window=12 is reasonable.
+# - Increase sample_size for more stable estimates.
+df_results = sweep_nms_thresholds(
+    sample_size=250,
+    thresholds=(0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
+    top_k=5,
+    phrase_window=12,
+    nms_grab_multiplier=6,
+    overlap_metric="minlen",   # or "minlen"
+)
+
+# Show results pivoted
+display(df_results.pivot_table(index="threshold", columns="model",
+                               values=["mean_num_spans","mean_max_pairwise"]).round(4))
+
+# Save CSV for later inspection
+# df_results.to_csv("nms_threshold_sweep_results.csv", index=False)
+# print("Saved results to nms_threshold_sweep_results.csv")
+
+
+# %%
+# Compare across models display function (updated for NMS-based phrase extraction)
 
 @torch.no_grad()
 def show_phrase_attention_comparison(
@@ -2366,6 +2728,10 @@ def show_phrase_attention_comparison(
     top_k_phrases: int = 5,
     phrase_window: int = 10,
     trim_context: bool = True,
+    # NEW: NMS controls
+    use_nms: bool = True,
+    nms_iou_thresh: float = 0.3,
+    nms_grab_multiplier: int = 5,
 ):
     x, y = test_dataset[sample_idx]
     tokens = decode_sequence(x)
@@ -2373,15 +2739,16 @@ def show_phrase_attention_comparison(
     window_size = config["window_size"] if trim_context else None
     valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
 
-    print(f"\n=== Phrase attention comparison | sample={sample_idx} label={label_idx} ===")
+    print(f"\n=== Phrase attention comparison | sample={sample_idx} label={label_idx} ({label_info(label_idx)}) ===")
     print(f"GT={int(y[label_idx].item())} | valid_len={len(valid_pos)} / seq_len={len(tokens)}")
-    print(f"(phrase_window={phrase_window}, top_k_phrases={top_k_phrases}, trim_context={trim_context})")
+    print(
+        f"(phrase_window={phrase_window}, top_k_phrases={top_k_phrases}, trim_context={trim_context}, "
+        f"use_nms={use_nms}, nms_iou_thresh={nms_iou_thresh})"
+    )
 
-    # collect phrases per model
     phrases_by_model = {}
 
     for mname in model_names:
-        # prediction metadata (your notebook uses per-model thresholds)
         logits_lbl, attn_lbl = get_label_logits_and_attn(models[mname], x.unsqueeze(0), label_idx)
         prob = float(torch.sigmoid(logits_lbl[0]).item())
         thr  = float(per_label_thr_by_model[mname][label_idx].item())
@@ -2389,7 +2756,7 @@ def show_phrase_attention_comparison(
 
         attn_vec = attn_lbl[0]  # (L,)
 
-        phrases = top_attention_phrases(
+        phrases = top_attention_phrases_NMS(
             tokens=tokens,
             attn_1d=attn_vec,
             valid_pos=valid_pos,
@@ -2397,6 +2764,9 @@ def show_phrase_attention_comparison(
             window_size=phrase_window,
             centered=True,
             skip_pad=True,
+            use_nms=use_nms,
+            nms_iou_thresh=nms_iou_thresh,
+            nms_grab_multiplier=nms_grab_multiplier,
         )
         phrases_by_model[mname] = phrases
 
@@ -2406,7 +2776,7 @@ def show_phrase_attention_comparison(
             print(f"     Tokens: {' '.join(span_toks)}")
             print(f"     Attention: {[round(a, 4) for a in att_vals]}")
 
-    # simple overlap view: which phrase texts are shared?
+    # simple overlap view: which phrase texts are shared? (exact-text match; optional sanity check)
     sets = {m: set([p[3] for p in ph]) for m, ph in phrases_by_model.items()}
     if len(sets) >= 2:
         base = model_names[0]
@@ -2438,7 +2808,7 @@ show_phrase_attention_comparison(
     model_names=("Centralized","FedAvg","FedProx","SCAFFOLD"),
     top_k_phrases=5,
     phrase_window=12,
-    trim_context=True
+    trim_context=True,
 )
 
 #specific test
@@ -2452,6 +2822,325 @@ print("Centralized prob/thr:", prob, thr)
 sample_idx = 1212
 label_idx  = 1
 show_phrase_attention_comparison(sample_idx, label_idx)
+
+
+# %%
+# Phrase-level similarity across models (Top-1 IoU, Top-5 max IoU, Top-5 weighted best-match IoU)
+
+# --- span overlap metric for comparing models ---
+# Use IoU for comparison, independent of the NMS overlap criterion (minlen).
+# (You can swap in span_overlap_ratio_minlen if you prefer.)
+def span_iou_pair(a, b):
+    return span_iou((a[0], a[1]), (b[0], b[1]))
+
+def extract_phrases_for_model(x, label_idx, model_name, top_k=5, phrase_window=12,
+                              trim_context=True, use_nms=True, nms_thresh=0.30, nms_grab_multiplier=6):
+    tokens = decode_sequence(x)
+    window_size = config["window_size"] if trim_context else None
+    valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+
+    logits_lbl, attn_lbl = get_label_logits_and_attn(models[model_name], x.unsqueeze(0), label_idx)
+    attn_vec = attn_lbl[0]
+
+    phrases = top_attention_phrases_NMS(
+        tokens=tokens,
+        attn_1d=attn_vec,
+        valid_pos=valid_pos,
+        top_k=top_k,
+        window_size=phrase_window,
+        centered=True,
+        skip_pad=True,
+        return_attn=True,
+        use_nms=use_nms,
+        nms_iou_thresh=float(nms_thresh),
+        nms_grab_multiplier=int(nms_grab_multiplier),
+    )
+    # Each phrase: (start, end, score, text, attn_vals, span_tokens)
+    return phrases
+
+def top1_iou(A, B):
+    if not A or not B:
+        return np.nan
+    return span_iou_pair(A[0], B[0])
+
+def topk_max_iou(A, B):
+    if not A or not B:
+        return np.nan
+    best = 0.0
+    for a in A:
+        for b in B:
+            best = max(best, span_iou_pair(a, b))
+    return best
+
+def weighted_best_match_iou(A, B, eps=1e-12):
+    """
+    Primary metric:
+      - For each phrase in A, find best IoU against any phrase in B.
+      - Weighted average of these best IoUs using A's phrase scores.
+      - Symmetrize by averaging A->B and B->A.
+    """
+    def one_way(src, tgt):
+        if not src or not tgt:
+            return np.nan
+        scores = np.array([max(span_iou_pair(s, t) for t in tgt) for s in src], dtype=float)
+        w = np.array([max(s[2], 0.0) for s in src], dtype=float)
+        if w.sum() <= eps:
+            return float(np.mean(scores))  # fallback if all weights zero-ish
+        return float((scores * w).sum() / (w.sum() + eps))
+
+    ab = one_way(A, B)
+    ba = one_way(B, A)
+    if np.isnan(ab) and np.isnan(ba):
+        return np.nan
+    if np.isnan(ab):
+        return ba
+    if np.isnan(ba):
+        return ab
+    return 0.5 * (ab + ba)
+
+@torch.no_grad()
+def run_phrase_similarity_eval(
+    sample_indices,
+    label_indices,
+    model_names=("Centralized","FedAvg","FedProx","SCAFFOLD"),
+    top_k=5,
+    phrase_window=12,
+    trim_context=True,
+    nms_thresh=0.30,            # <-- use the tuned threshold here
+    nms_grab_multiplier=6,
+):
+    rows = []
+
+    # cache phrases so we don't recompute per pair
+    for ds_idx in tqdm(sample_indices, desc="samples", disable=True):
+        x, y = test_dataset[ds_idx]
+
+        for lbl in label_indices:
+            # optional: you can filter to positives if you want
+            gt = int(y[lbl].item())
+
+            phrases_by_model = {}
+            for m in model_names:
+                phrases_by_model[m] = extract_phrases_for_model(
+                    x, lbl, m,
+                    top_k=top_k,
+                    phrase_window=phrase_window,
+                    trim_context=trim_context,
+                    use_nms=True,
+                    nms_thresh=nms_thresh,
+                    nms_grab_multiplier=nms_grab_multiplier,
+                )
+
+            # compute pairwise metrics
+            for a, b in combinations(model_names, 2):
+                A = phrases_by_model[a]
+                B = phrases_by_model[b]
+                rows.append({
+                    "sample_idx": ds_idx,
+                    "label_idx": lbl,
+                    "gt": gt,
+                    "model_a": a,
+                    "model_b": b,
+                    "top1_iou": top1_iou(A, B),
+                    "top5_max_iou": topk_max_iou(A, B),
+                    "top5_weighted_bestmatch_iou": weighted_best_match_iou(A, B),
+                    "numA": len(A),
+                    "numB": len(B),
+                })
+
+    df = pd.DataFrame(rows)
+    return df
+
+# %%
+# Phrase similarity eval restricted to AGREE-POSITIVE (ALL test samples, Q2-style)
+# For each (pair, label): scan ALL test samples, keep only agree-positive samples,
+# then compute phrase similarity metrics (top-1, top-5 max, top-5 weighted best-match).
+
+# ----------------
+# CONFIG (Q2-style)
+# ----------------
+MODEL_NAMES = ("Centralized", "FedAvg", "FedProx", "SCAFFOLD")
+PAIRS = [(a, b) for i, a in enumerate(MODEL_NAMES) for b in MODEL_NAMES[i+1:]]
+
+LABEL_INDICES = list(range(test_dataset[0][1].shape[0]))   # e.g. list(range(50))
+
+TOP_K = 5
+PHRASE_WINDOW = 12
+NMS_THRESH = 0.30
+NMS_GRAB_MULT = 6
+
+MIN_KEPT_REQUIRED = 30     # skip (pair,label) if fewer than this many agree-positive samples
+
+print("Pairs:", PAIRS)
+print("Num labels:", len(LABEL_INDICES))
+print("Scanning ALL test samples:", len(test_dataset))
+
+
+# Helper: agree-positive indices for one (pair, label), all_test
+@torch.no_grad()
+def agree_pos_indices_all_test(model_a: str, model_b: str, label_idx: int) -> list[int]:
+    idxs = []
+    for ds_idx in range(len(test_dataset)):
+        x, _ = test_dataset[ds_idx]
+        if bool(agree_positive_mask(model_a, model_b, x.unsqueeze(0), label_idx).item()):
+            idxs.append(ds_idx)
+    return idxs
+
+
+# RUN: per pair x per label loop
+all_rows = []
+coverage_rows = []
+
+for (a, b) in PAIRS:
+    print(f"\n==============================")
+    print(f"PAIR: {a} vs {b}")
+    print("==============================")
+
+    for lbl in tqdm(LABEL_INDICES, desc=f"labels ({a} vs {b})"):
+        ap_idxs = agree_pos_indices_all_test(a, b, lbl)
+
+        coverage_rows.append({
+            "model_a": a,
+            "model_b": b,
+            "label_idx": lbl,
+            "n_scanned": len(test_dataset),
+            "n_agree_pos": len(ap_idxs),
+        })
+
+        # Skip low-coverage labels to avoid noisy estimates (same idea as Q2)
+        if len(ap_idxs) < MIN_KEPT_REQUIRED:
+            continue
+
+        df = run_phrase_similarity_eval(
+            sample_indices=ap_idxs,
+            label_indices=[lbl],         # IMPORTANT: only this label, so every row is agree-positive by construction
+            model_names=(a, b),          # IMPORTANT: only this pair
+            top_k=TOP_K,
+            phrase_window=PHRASE_WINDOW,
+            nms_thresh=NMS_THRESH,
+            nms_grab_multiplier=NMS_GRAB_MULT,
+        )
+        all_rows.append(df)
+
+coverage_df = pd.DataFrame(coverage_rows)
+print("\nTop label coverage (by agree-positive):")
+display(coverage_df.sort_values(["model_a","model_b","n_agree_pos"], ascending=[True, True, False]).head(20))
+
+df_phrase_sim = pd.concat(all_rows, ignore_index=True) if len(all_rows) else pd.DataFrame()
+print("Final agree-positive rows:", len(df_phrase_sim))
+display(df_phrase_sim.head())
+
+
+# Overall summary
+if len(df_phrase_sim) > 0:
+    summary_overall = (
+        df_phrase_sim.groupby(["model_a","model_b"])[
+            ["top1_iou","top5_max_iou","top5_weighted_bestmatch_iou"]
+        ]
+        .agg(["mean","std","count"])
+        .round(4)
+    )
+    display(summary_overall)
+
+    # Per-label summary + n
+    summary_by_label = (
+        df_phrase_sim.groupby(["label_idx","model_a","model_b"])[
+            ["top1_iou","top5_max_iou","top5_weighted_bestmatch_iou"]
+        ]
+        .agg(["mean","count"])
+        .reset_index()
+    )
+
+    summary_by_label.columns = ["label_idx","model_a","model_b",
+                                "top1_mean","top1_n",
+                                "top5max_mean","top5max_n",
+                                "wbest_mean","wbest_n"]
+    
+    # Add ICD metadata
+    summary_by_label["icd_code"] = summary_by_label["label_idx"].map(lambda i: IDX_TO_CODE.get(int(i), "UNK"))
+    summary_by_label["icd_description"] = summary_by_label["icd_code"].map(lambda c: CODE_TO_DESC.get(str(c), "Unknown ICD code"))
+
+    print(f"\nLowest similarity labels (primary metric), filtered to n>={MIN_KEPT_REQUIRED}:")
+    interesting = summary_by_label[summary_by_label["wbest_n"] >= MIN_KEPT_REQUIRED].sort_values("wbest_mean")
+    display(interesting.head(15))
+else:
+    print("No (pair,label) met MIN_KEPT_REQUIRED. Lower MIN_KEPT_REQUIRED or verify agree_positive_mask.")
+
+
+# %%
+# Inspect dissimilar cases and similar cases
+
+if len(df_phrase_sim) > 0:
+
+    assert "sample_idx" in df_phrase_sim.columns, "df_phrase_sim is missing 'sample_idx' column."
+    assert "top5_weighted_bestmatch_iou" in df_phrase_sim.columns, "df_phrase_sim missing wbest metric column."
+
+    # Filter once
+    filt = summary_by_label[summary_by_label["wbest_n"] >= MIN_KEPT_REQUIRED].copy()
+
+    # lowest similarity (label + pair combos)
+    lowest_labels = filt.sort_values("wbest_mean").head(3)
+
+    # highest similarity (label + pair combos)
+    highest_labels = filt.sort_values("wbest_mean", ascending=False).head(3)
+
+    def pick_extreme_sample(df, label_idx, model_a, model_b, kind="low"):
+        sub = df[
+            (df["label_idx"] == label_idx) &
+            (df["model_a"] == model_a) &
+            (df["model_b"] == model_b)
+        ].copy()
+
+        if len(sub) == 0:
+            return None
+
+        metric = "top5_weighted_bestmatch_iou"
+        if kind == "low":
+            return sub.sort_values(metric).iloc[0]
+        else:
+            return sub.sort_values(metric, ascending=False).iloc[0]
+
+    def inspect_combos(combo_df, kind="low", show_all_models=True):
+        for _, r in combo_df.iterrows():
+            label_idx = int(r["label_idx"])
+            model_a   = r["model_a"]
+            model_b   = r["model_b"]
+
+            row = pick_extreme_sample(df_phrase_sim, label_idx, model_a, model_b, kind=kind)
+            if row is None:
+                print(f"Skipping (no rows): label={label_idx}, {model_a} vs {model_b}")
+                continue
+
+            sample_idx = int(row["sample_idx"])
+            sample_wbest = float(row["top5_weighted_bestmatch_iou"])
+
+            print("\n==============================")
+            print(f"{kind.upper()} | label_idx={label_idx} | {model_a} vs {model_b}")
+            if "icd_code" in r and "icd_description" in r:
+                print(f"{r['icd_code']} – {r['icd_description']}")
+            print(f"pair mean wbest={float(r['wbest_mean']):.4f} (n={int(r['wbest_n'])})")
+            print(f"chosen sample_idx={sample_idx} | sample wbest={sample_wbest:.4f}")
+
+            models_to_show = (
+                ("Centralized","FedAvg","FedProx","SCAFFOLD")
+                if show_all_models
+                else (model_a, model_b)
+            )
+
+            show_phrase_attention_comparison(
+                sample_idx=sample_idx,
+                label_idx=label_idx,
+                model_names=models_to_show,
+                top_k_phrases=5,
+                phrase_window=12,
+                trim_context=True,
+            )
+
+    inspect_combos(lowest_labels, kind="low",  show_all_models=True)
+    inspect_combos(highest_labels, kind="high", show_all_models=True)
+
+else:
+    print("Skipping inspection because df_phrase_sim is empty.")
 
 
 
