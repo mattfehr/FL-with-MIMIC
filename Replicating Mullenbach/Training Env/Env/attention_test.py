@@ -2558,163 +2558,163 @@ def top_attention_phrases_NMS(
 
 
 # %%
-# NMS threshold sweep: find a good iou / overlap threshold for phrase extraction
+# # NMS threshold sweep: find a good iou / overlap threshold for phrase extraction
 
-# -- helper: overlap ratio defined as intersection / min(len(A), len(B))
-def span_overlap_ratio_minlen(a, b):
-    s1, e1 = a
-    s2, e2 = b
-    inter = max(0, min(e1, e2) - max(s1, s2))
-    if inter <= 0:
-        return 0.0
-    minlen = min(e1 - s1, e2 - s2)
-    return float(inter) / float(minlen) if minlen > 0 else 0.0
+# # -- helper: overlap ratio defined as intersection / min(len(A), len(B))
+# def span_overlap_ratio_minlen(a, b):
+#     s1, e1 = a
+#     s2, e2 = b
+#     inter = max(0, min(e1, e2) - max(s1, s2))
+#     if inter <= 0:
+#         return 0.0
+#     minlen = min(e1 - s1, e2 - s2)
+#     return float(inter) / float(minlen) if minlen > 0 else 0.0
 
-# -- helper: pairwise IoU summary for a list of spans
-def pairwise_overlap_stats(spans, metric="iou"):
-    # spans: list of tuples (s,e,score,...)
-    if len(spans) < 2:
-        return {"mean_pairwise": 0.0, "max_pairwise": 0.0}
-    vals = []
-    for i, j in combinations(range(len(spans)), 2):
-        a = (spans[i][0], spans[i][1])
-        b = (spans[j][0], spans[j][1])
-        if metric == "iou":
-            vals.append(span_iou(a, b))
-        elif metric == "minlen":
-            vals.append(span_overlap_ratio_minlen(a, b))
-        else:
-            raise ValueError("metric must be 'iou' or 'minlen'")
-    return {"mean_pairwise": float(np.mean(vals)), "max_pairwise": float(np.max(vals))}
+# # -- helper: pairwise IoU summary for a list of spans
+# def pairwise_overlap_stats(spans, metric="iou"):
+#     # spans: list of tuples (s,e,score,...)
+#     if len(spans) < 2:
+#         return {"mean_pairwise": 0.0, "max_pairwise": 0.0}
+#     vals = []
+#     for i, j in combinations(range(len(spans)), 2):
+#         a = (spans[i][0], spans[i][1])
+#         b = (spans[j][0], spans[j][1])
+#         if metric == "iou":
+#             vals.append(span_iou(a, b))
+#         elif metric == "minlen":
+#             vals.append(span_overlap_ratio_minlen(a, b))
+#         else:
+#             raise ValueError("metric must be 'iou' or 'minlen'")
+#     return {"mean_pairwise": float(np.mean(vals)), "max_pairwise": float(np.max(vals))}
 
-# -- sweep function
-@torch.no_grad()
-def sweep_nms_thresholds(
-    sample_size=300,
-    label_sample=None,              # list of label indices to evaluate (None -> random labels per sample)
-    model_names=("Centralized","FedAvg","FedProx","SCAFFOLD"),
-    thresholds=(0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5),
-    top_k=5,
-    phrase_window=12,
-    trim_context=True,
-    nms_grab_multiplier=5,
-    overlap_metric="iou",           # "iou" or "minlen"
-    random_seed=42,
-):
-    """
-    Sweep NMS thresholds and return a DataFrame of aggregated statistics.
+# # -- sweep function
+# @torch.no_grad()
+# def sweep_nms_thresholds(
+#     sample_size=300,
+#     label_sample=None,              # list of label indices to evaluate (None -> random labels per sample)
+#     model_names=("Centralized","FedAvg","FedProx","SCAFFOLD"),
+#     thresholds=(0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5),
+#     top_k=5,
+#     phrase_window=12,
+#     trim_context=True,
+#     nms_grab_multiplier=5,
+#     overlap_metric="iou",           # "iou" or "minlen"
+#     random_seed=42,
+# ):
+#     """
+#     Sweep NMS thresholds and return a DataFrame of aggregated statistics.
 
-    Returns:
-      df: pandas.DataFrame with rows (threshold, model) and columns:
-         mean_num_spans, std_num_spans, mean_mean_pairwise, mean_max_pairwise
-    """
-    rng = np.random.RandomState(random_seed)
+#     Returns:
+#       df: pandas.DataFrame with rows (threshold, model) and columns:
+#          mean_num_spans, std_num_spans, mean_mean_pairwise, mean_max_pairwise
+#     """
+#     rng = np.random.RandomState(random_seed)
 
-    # select sample indices (avoid too-large runs)
-    all_indices = list(range(len(test_dataset)))
-    if sample_size >= len(all_indices):
-        sample_indices = all_indices
-    else:
-        sample_indices = rng.choice(all_indices, size=sample_size, replace=False).tolist()
+#     # select sample indices (avoid too-large runs)
+#     all_indices = list(range(len(test_dataset)))
+#     if sample_size >= len(all_indices):
+#         sample_indices = all_indices
+#     else:
+#         sample_indices = rng.choice(all_indices, size=sample_size, replace=False).tolist()
 
-    # if label_sample is None, we will randomly pick one *positive* label per sample if possible,
-    # otherwise we will evaluate all labels (or a fixed set). To keep runtime reasonable, we'll
-    # sample one label per sample unless label_sample is provided as a list.
-    # Here we choose a random label index in range(num_labels) as a default fallback.
-    num_labels = test_dataset[0][1].shape[0]  # assumes (x,y) and y is vector
-    if label_sample is None:
-        pick_label_per_sample = True
-    else:
-        pick_label_per_sample = False
-        label_sample = list(label_sample)
+#     # if label_sample is None, we will randomly pick one *positive* label per sample if possible,
+#     # otherwise we will evaluate all labels (or a fixed set). To keep runtime reasonable, we'll
+#     # sample one label per sample unless label_sample is provided as a list.
+#     # Here we choose a random label index in range(num_labels) as a default fallback.
+#     num_labels = test_dataset[0][1].shape[0]  # assumes (x,y) and y is vector
+#     if label_sample is None:
+#         pick_label_per_sample = True
+#     else:
+#         pick_label_per_sample = False
+#         label_sample = list(label_sample)
 
-    rows = []
+#     rows = []
 
-    for t in tqdm(thresholds, desc="thresholds"):
-        stats_by_model = {m: {"nspans": [], "mean_pairwise": [], "max_pairwise": []} for m in model_names}
+#     for t in tqdm(thresholds, desc="thresholds"):
+#         stats_by_model = {m: {"nspans": [], "mean_pairwise": [], "max_pairwise": []} for m in model_names}
 
-        for ds_idx in sample_indices:
-            x, y = test_dataset[ds_idx]
-            tokens = decode_sequence(x)
-            window_size = config["window_size"] if trim_context else None
-            valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+#         for ds_idx in sample_indices:
+#             x, y = test_dataset[ds_idx]
+#             tokens = decode_sequence(x)
+#             window_size = config["window_size"] if trim_context else None
+#             valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
 
-            # choose which labels to test: either provided list or one random label per sample
-            if pick_label_per_sample:
-                lbl = rng.randint(0, num_labels)
-                labels_to_check = [lbl]
-            else:
-                labels_to_check = label_sample
+#             # choose which labels to test: either provided list or one random label per sample
+#             if pick_label_per_sample:
+#                 lbl = rng.randint(0, num_labels)
+#                 labels_to_check = [lbl]
+#             else:
+#                 labels_to_check = label_sample
 
-            for lbl in labels_to_check:
-                for m in model_names:
-                    # get attention vector
-                    logits_lbl, attn_lbl = get_label_logits_and_attn(models[m], x.unsqueeze(0), lbl)
-                    attn_vec = attn_lbl[0]
+#             for lbl in labels_to_check:
+#                 for m in model_names:
+#                     # get attention vector
+#                     logits_lbl, attn_lbl = get_label_logits_and_attn(models[m], x.unsqueeze(0), lbl)
+#                     attn_vec = attn_lbl[0]
 
-                    spans = top_attention_phrases_NMS(
-                        tokens=tokens,
-                        attn_1d=attn_vec,
-                        valid_pos=valid_pos,
-                        top_k=top_k,
-                        window_size=phrase_window,
-                        centered=True,
-                        skip_pad=True,
-                        return_attn=True,
-                        use_nms=True,
-                        nms_iou_thresh=float(t),
-                        nms_grab_multiplier=nms_grab_multiplier,
-                    )
+#                     spans = top_attention_phrases_NMS(
+#                         tokens=tokens,
+#                         attn_1d=attn_vec,
+#                         valid_pos=valid_pos,
+#                         top_k=top_k,
+#                         window_size=phrase_window,
+#                         centered=True,
+#                         skip_pad=True,
+#                         return_attn=True,
+#                         use_nms=True,
+#                         nms_iou_thresh=float(t),
+#                         nms_grab_multiplier=nms_grab_multiplier,
+#                     )
 
-                    # record counts
-                    stats_by_model[m]["nspans"].append(len(spans))
+#                     # record counts
+#                     stats_by_model[m]["nspans"].append(len(spans))
 
-                    # pairwise overlap stats
-                    pair_stats = pairwise_overlap_stats(spans, metric=("iou" if overlap_metric=="iou" else "minlen"))
-                    stats_by_model[m]["mean_pairwise"].append(pair_stats["mean_pairwise"])
-                    stats_by_model[m]["max_pairwise"].append(pair_stats["max_pairwise"])
+#                     # pairwise overlap stats
+#                     pair_stats = pairwise_overlap_stats(spans, metric=("iou" if overlap_metric=="iou" else "minlen"))
+#                     stats_by_model[m]["mean_pairwise"].append(pair_stats["mean_pairwise"])
+#                     stats_by_model[m]["max_pairwise"].append(pair_stats["max_pairwise"])
 
-        # aggregate per model
-        for m in model_names:
-            arr_n = np.array(stats_by_model[m]["nspans"])
-            arr_mp = np.array(stats_by_model[m]["mean_pairwise"])
-            arr_xp = np.array(stats_by_model[m]["max_pairwise"])
-            rows.append({
-                "threshold": float(t),
-                "model": m,
-                "mean_num_spans": float(np.mean(arr_n)) if arr_n.size else 0.0,
-                "std_num_spans": float(np.std(arr_n)) if arr_n.size else 0.0,
-                "mean_mean_pairwise": float(np.mean(arr_mp)) if arr_mp.size else 0.0,
-                "mean_max_pairwise": float(np.mean(arr_xp)) if arr_xp.size else 0.0,
-                "sample_size": len(sample_indices),
-                "top_k": top_k,
-                "phrase_window": phrase_window,
-                "overlap_metric": overlap_metric,
-            })
+#         # aggregate per model
+#         for m in model_names:
+#             arr_n = np.array(stats_by_model[m]["nspans"])
+#             arr_mp = np.array(stats_by_model[m]["mean_pairwise"])
+#             arr_xp = np.array(stats_by_model[m]["max_pairwise"])
+#             rows.append({
+#                 "threshold": float(t),
+#                 "model": m,
+#                 "mean_num_spans": float(np.mean(arr_n)) if arr_n.size else 0.0,
+#                 "std_num_spans": float(np.std(arr_n)) if arr_n.size else 0.0,
+#                 "mean_mean_pairwise": float(np.mean(arr_mp)) if arr_mp.size else 0.0,
+#                 "mean_max_pairwise": float(np.mean(arr_xp)) if arr_xp.size else 0.0,
+#                 "sample_size": len(sample_indices),
+#                 "top_k": top_k,
+#                 "phrase_window": phrase_window,
+#                 "overlap_metric": overlap_metric,
+#             })
 
-    df = pd.DataFrame(rows)
-    return df
+#     df = pd.DataFrame(rows)
+#     return df
 
-# %%
-# Example usage (quick, medium, or longer runs)
-# - For a quick exploratory run, sample_size=200 and phrase_window=12 is reasonable.
-# - Increase sample_size for more stable estimates.
-df_results = sweep_nms_thresholds(
-    sample_size=250,
-    thresholds=(0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
-    top_k=5,
-    phrase_window=12,
-    nms_grab_multiplier=6,
-    overlap_metric="minlen",   # or "minlen"
-)
+# # %%
+# # Example usage (quick, medium, or longer runs)
+# # - For a quick exploratory run, sample_size=200 and phrase_window=12 is reasonable.
+# # - Increase sample_size for more stable estimates.
+# df_results = sweep_nms_thresholds(
+#     sample_size=250,
+#     thresholds=(0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
+#     top_k=5,
+#     phrase_window=12,
+#     nms_grab_multiplier=6,
+#     overlap_metric="minlen",   # or "minlen"
+# )
 
-# Show results pivoted
-display(df_results.pivot_table(index="threshold", columns="model",
-                               values=["mean_num_spans","mean_max_pairwise"]).round(4))
+# # Show results pivoted
+# display(df_results.pivot_table(index="threshold", columns="model",
+#                                values=["mean_num_spans","mean_max_pairwise"]).round(4))
 
-# Save CSV for later inspection
-# df_results.to_csv("nms_threshold_sweep_results.csv", index=False)
-# print("Saved results to nms_threshold_sweep_results.csv")
+# # Save CSV for later inspection
+# # df_results.to_csv("nms_threshold_sweep_results.csv", index=False)
+# # print("Saved results to nms_threshold_sweep_results.csv")
 
 
 # %%
@@ -2825,7 +2825,8 @@ show_phrase_attention_comparison(sample_idx, label_idx)
 
 
 # %%
-# Phrase-level similarity across models (Top-1 IoU, Top-5 max IoU, Top-5 weighted best-match IoU)
+# Phrase-level similarity across models
+# Metrics: Top-1 IoU, Top-5 Max IoU, Weighted / Unweighted / Rank-aware Best-Match IoU (all symmetric)
 
 # --- span overlap metric for comparing models ---
 # Use IoU for comparison, independent of the NMS overlap criterion (minlen).
@@ -2876,7 +2877,7 @@ def weighted_best_match_iou(A, B, eps=1e-12):
     """
     Primary metric:
       - For each phrase in A, find best IoU against any phrase in B.
-      - Weighted average of these best IoUs using A's phrase scores.
+      - Weighted average of these best IoUs using A's phrase scores and B's scores.
       - Symmetrize by averaging A->B and B->A.
     """
     def one_way(src, tgt):
@@ -2887,6 +2888,80 @@ def weighted_best_match_iou(A, B, eps=1e-12):
         if w.sum() <= eps:
             return float(np.mean(scores))  # fallback if all weights zero-ish
         return float((scores * w).sum() / (w.sum() + eps))
+
+    ab = one_way(A, B)
+    ba = one_way(B, A)
+    if np.isnan(ab) and np.isnan(ba):
+        return np.nan
+    if np.isnan(ab):
+        return ba
+    if np.isnan(ba):
+        return ab
+    return 0.5 * (ab + ba)
+
+def unweighted_best_match_iou(A, B):
+    """
+    Metric 4:
+      - For each phrase in A, find best IoU against any phrase in B.
+      - Average these best IoUs (no weights).
+      - Symmetrize by averaging A->B and B->A.
+    """
+    def one_way(src, tgt):
+        if not src or not tgt:
+            return np.nan
+        scores = np.array([max(span_iou_pair(s, t) for t in tgt) for s in src], dtype=float)
+        return float(np.mean(scores)) if scores.size else np.nan
+
+    ab = one_way(A, B)
+    ba = one_way(B, A)
+    if np.isnan(ab) and np.isnan(ba):
+        return np.nan
+    if np.isnan(ab):
+        return ba
+    if np.isnan(ba):
+        return ab
+    return 0.5 * (ab + ba)
+
+
+def rank_weight(i, j, mode="inv", alpha=0.7):
+    """
+    Weight based on rank mismatch between phrase i in src and phrase j in tgt.
+    Ranks are 0-indexed here, so use |i-j|.
+
+    mode="inv": 1 / (1 + |i-j|)   (simple, bounded, interpretable)
+    mode="exp": exp(-alpha * |i-j|) (stronger penalty if alpha>0)
+    """
+    d = abs(int(i) - int(j))
+    if mode == "exp":
+        return float(np.exp(-alpha * d))
+    return float(1.0 / (1.0 + d))
+
+
+def rankaware_best_match_iou(A, B, rank_mode="inv", alpha=0.7):
+    """
+    Metric 5:
+      - For each phrase i in A, find the best match phrase j in B
+        maximizing: IoU(i,j) * rank_weight(i,j)
+      - Average over i (unweighted)
+      - Symmetrize by averaging A->B and B->A
+
+    This directly penalizes "1 matches 5" vs "1 matches 1".
+    """
+    def one_way(src, tgt):
+        if not src or not tgt:
+            return np.nan
+
+        vals = []
+        for i, s in enumerate(src):
+            best = 0.0
+            for j, t in enumerate(tgt):
+                iou = span_iou_pair(s, t)
+                w = rank_weight(i, j, mode=rank_mode, alpha=alpha)
+                best = max(best, iou * w)
+            vals.append(best)
+
+        vals = np.array(vals, dtype=float)
+        return float(np.mean(vals)) if vals.size else np.nan
 
     ab = one_way(A, B)
     ba = one_way(B, A)
@@ -2944,6 +3019,8 @@ def run_phrase_similarity_eval(
                     "top1_iou": top1_iou(A, B),
                     "top5_max_iou": topk_max_iou(A, B),
                     "top5_weighted_bestmatch_iou": weighted_best_match_iou(A, B),
+                    "top5_unweighted_bestmatch_iou": unweighted_best_match_iou(A, B),
+                    "top5_rankaware_bestmatch_iou": rankaware_best_match_iou(A, B, rank_mode="inv", alpha=0.7),
                     "numA": len(A),
                     "numB": len(B),
                 })
@@ -3032,37 +3109,74 @@ display(df_phrase_sim.head())
 
 
 # Overall summary
+METRIC_COLS = [
+    "top1_iou",
+    "top5_max_iou",
+    "top5_weighted_bestmatch_iou",
+    "top5_unweighted_bestmatch_iou",
+    "top5_rankaware_bestmatch_iou",
+]
+
 if len(df_phrase_sim) > 0:
     summary_overall = (
-        df_phrase_sim.groupby(["model_a","model_b"])[
-            ["top1_iou","top5_max_iou","top5_weighted_bestmatch_iou"]
-        ]
+        df_phrase_sim.groupby(["model_a","model_b"])[METRIC_COLS]
         .agg(["mean","std","count"])
         .round(4)
     )
     display(summary_overall)
 
-    # Per-label summary + n
+    # Per-label summary + n  (this creates MultiIndex columns: flatten them next)
     summary_by_label = (
-        df_phrase_sim.groupby(["label_idx","model_a","model_b"])[
-            ["top1_iou","top5_max_iou","top5_weighted_bestmatch_iou"]
-        ]
+        df_phrase_sim.groupby(["label_idx","model_a","model_b"])[METRIC_COLS]
         .agg(["mean","count"])
-        .reset_index()
+    ).reset_index()
+
+    # --- FLATTEN multiindex columns produced by agg(...) into single strings ---
+    # example: ('top1_iou', 'mean') -> 'top1_iou_mean'
+    flat_cols = []
+    for col in summary_by_label.columns:
+        if isinstance(col, tuple):
+            # join non-empty parts with underscore
+            flat_name = "_".join([str(c) for c in col if c != ""]).strip("_")
+            flat_cols.append(flat_name)
+        else:
+            flat_cols.append(str(col))
+    summary_by_label.columns = flat_cols
+
+    # --- RENAME flattened metric columns to friendly short names used later ---
+    rename_map = {
+        "top1_iou_mean": "top1_mean",
+        "top1_iou_count": "top1_n",
+        "top5_max_iou_mean": "top5max_mean",
+        "top5_max_iou_count": "top5max_n",
+        "top5_weighted_bestmatch_iou_mean": "wbest_mean",
+        "top5_weighted_bestmatch_iou_count": "wbest_n",
+        "top5_unweighted_bestmatch_iou_mean": "ubest_mean",
+        "top5_unweighted_bestmatch_iou_count": "ubest_n",
+        "top5_rankaware_bestmatch_iou_mean": "rankbest_mean",
+        "top5_rankaware_bestmatch_iou_count": "rankbest_n",
+    }
+    summary_by_label = summary_by_label.rename(columns=rename_map)
+
+    # attach true agree-positive coverage (coverage_df already has single-level cols)
+    # safe merge now because both sides have single-level columns
+    summary_by_label = summary_by_label.merge(
+        coverage_df[["model_a","model_b","label_idx","n_agree_pos"]],
+        on=["model_a","model_b","label_idx"],
+        how="left",
     )
 
-    summary_by_label.columns = ["label_idx","model_a","model_b",
-                                "top1_mean","top1_n",
-                                "top5max_mean","top5max_n",
-                                "wbest_mean","wbest_n"]
-    
     # Add ICD metadata
     summary_by_label["icd_code"] = summary_by_label["label_idx"].map(lambda i: IDX_TO_CODE.get(int(i), "UNK"))
     summary_by_label["icd_description"] = summary_by_label["icd_code"].map(lambda c: CODE_TO_DESC.get(str(c), "Unknown ICD code"))
 
     print(f"\nLowest similarity labels (primary metric), filtered to n>={MIN_KEPT_REQUIRED}:")
-    interesting = summary_by_label[summary_by_label["wbest_n"] >= MIN_KEPT_REQUIRED].sort_values("wbest_mean")
+    interesting = summary_by_label[summary_by_label["n_agree_pos"] >= MIN_KEPT_REQUIRED].sort_values("wbest_mean")
     display(interesting.head(15))
+
+    print(f"\nHighest similarity labels (primary metric), filtered to n>={MIN_KEPT_REQUIRED}:")
+    interesting_high = summary_by_label[summary_by_label["n_agree_pos"] >= MIN_KEPT_REQUIRED].sort_values("wbest_mean", ascending=False)
+    display(interesting_high.head(15))
 else:
     print("No (pair,label) met MIN_KEPT_REQUIRED. Lower MIN_KEPT_REQUIRED or verify agree_positive_mask.")
 
@@ -3076,7 +3190,7 @@ if len(df_phrase_sim) > 0:
     assert "top5_weighted_bestmatch_iou" in df_phrase_sim.columns, "df_phrase_sim missing wbest metric column."
 
     # Filter once
-    filt = summary_by_label[summary_by_label["wbest_n"] >= MIN_KEPT_REQUIRED].copy()
+    filt = summary_by_label[summary_by_label["n_agree_pos"] >= MIN_KEPT_REQUIRED].copy()
 
     # lowest similarity (label + pair combos)
     lowest_labels = filt.sort_values("wbest_mean").head(3)
@@ -3084,7 +3198,7 @@ if len(df_phrase_sim) > 0:
     # highest similarity (label + pair combos)
     highest_labels = filt.sort_values("wbest_mean", ascending=False).head(3)
 
-    def pick_extreme_sample(df, label_idx, model_a, model_b, kind="low"):
+    def pick_extreme_sample(df, label_idx, model_a, model_b, kind="low", metric="top5_weighted_bestmatch_iou"):
         sub = df[
             (df["label_idx"] == label_idx) &
             (df["model_a"] == model_a) &
@@ -3094,32 +3208,57 @@ if len(df_phrase_sim) > 0:
         if len(sub) == 0:
             return None
 
-        metric = "top5_weighted_bestmatch_iou"
         if kind == "low":
             return sub.sort_values(metric).iloc[0]
         else:
             return sub.sort_values(metric, ascending=False).iloc[0]
+
 
     def inspect_combos(combo_df, kind="low", show_all_models=True):
         for _, r in combo_df.iterrows():
             label_idx = int(r["label_idx"])
             model_a   = r["model_a"]
             model_b   = r["model_b"]
-
-            row = pick_extreme_sample(df_phrase_sim, label_idx, model_a, model_b, kind=kind)
+            # could also pick via the other metrics
+            row = pick_extreme_sample(
+                df_phrase_sim, label_idx, model_a, model_b, kind=kind,
+                metric="top5_weighted_bestmatch_iou"
+            )
             if row is None:
                 print(f"Skipping (no rows): label={label_idx}, {model_a} vs {model_b}")
                 continue
 
             sample_idx = int(row["sample_idx"])
-            sample_wbest = float(row["top5_weighted_bestmatch_iou"])
+
+            # sample-level metrics
+            s_top1     = float(row["top1_iou"])
+            s_top5max  = float(row["top5_max_iou"])
+            s_wbest    = float(row["top5_weighted_bestmatch_iou"])
+            s_ubest    = float(row["top5_unweighted_bestmatch_iou"])
+            s_rankbest = float(row["top5_rankaware_bestmatch_iou"])
 
             print("\n==============================")
             print(f"{kind.upper()} | label_idx={label_idx} | {model_a} vs {model_b}")
             if "icd_code" in r and "icd_description" in r:
                 print(f"{r['icd_code']} – {r['icd_description']}")
-            print(f"pair mean wbest={float(r['wbest_mean']):.4f} (n={int(r['wbest_n'])})")
-            print(f"chosen sample_idx={sample_idx} | sample wbest={sample_wbest:.4f}")
+
+            # pair-level summary metrics (means) + n
+            print(
+                "pair means (n): "
+                f"top1={float(r['top1_mean']):.4f} (n={int(r['top1_n'])}) | "
+                f"top5max={float(r['top5max_mean']):.4f} (n={int(r['top5max_n'])}) | "
+                f"wbest={float(r['wbest_mean']):.4f} (n={int(r['wbest_n'])}) | "
+                f"ubest={float(r['ubest_mean']):.4f} (n={int(r['ubest_n'])}) | "
+                f"rankbest={float(r['rankbest_mean']):.4f} (n={int(r['rankbest_n'])})"
+            )
+
+            # sample-level metrics
+            print(
+                f"chosen sample_idx={sample_idx} | "
+                f"sample: top1={s_top1:.4f} | top5max={s_top5max:.4f} | "
+                f"wbest={s_wbest:.4f} | ubest={s_ubest:.4f} | rankbest={s_rankbest:.4f}"
+            )
+
 
             models_to_show = (
                 ("Centralized","FedAvg","FedProx","SCAFFOLD")

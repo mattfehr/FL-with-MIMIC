@@ -655,102 +655,6 @@ def eval_model(
 # ## Full test plan loop
 
 # %%
-def run_federated_experiment(algo, num_clients, local_epochs, config, train_dataset, val_loader, test_loader, device):
-    """
-    Runs one federated configuration (FedAvg, FedProx, or SCAFFOLD)
-    and returns evaluation metrics on the test set.
-    """
-    start_time = time.time()
-
-    # --- Split dataset into clients dynamically ---
-    splits = [1 / num_clients] * num_clients
-    lengths = [int(len(train_dataset) * s) for s in splits[:-1]]
-    lengths.append(len(train_dataset) - sum(lengths))
-    client_datasets = random_split(train_dataset, lengths=lengths)
-    c_loaders = [DataLoader(c, batch_size=config["batch_size"], shuffle=True) for c in client_datasets]
-
-    # --- Initialize global and client models ---
-    global_model = GenerateModel(
-        model_param_path,
-        num_of_filters=config["n_filters"],
-        kernel_size=config["window_size"]
-    ).to(device)
-
-    client_model = copy.deepcopy(global_model)
-
-    # --- Initialize control variates if SCAFFOLD ---
-    if algo == "SCAFFOLD":
-        c_global = {k: torch.zeros_like(v) for k, v in global_model.state_dict().items()}
-        c_clients = [{k: torch.zeros_like(v) for k, v in global_model.state_dict().items()} for _ in range(num_clients)]
-    else:
-        c_global = c_clients = None
-
-    # --- Federated training rounds ---
-    for rnd in tqdm(range(config["rounds"]), colour="blue", desc=f"{algo} | Clients={num_clients} | Epochs={local_epochs}"):
-        client_params = []
-        new_c_clients = []
-
-        # ---- Each client trains locally ----
-        for idx, loader in enumerate(c_loaders):
-            client_model.load_state_dict(global_model.state_dict())
-
-            local_loss, client_state, c_local = client_update(
-                model=client_model,
-                train_loader=loader,
-                epochs=local_epochs,
-                lr=config["lr"],
-                device=device,
-                use_focal=config["use_focal"],
-                gamma=config["gamma"],
-                mu=config["mu"],
-                global_params=global_model.state_dict(),
-                c_global=c_global if algo == "SCAFFOLD" else None,
-                c_local=c_clients[idx] if algo == "SCAFFOLD" else None,
-                algorithm=algo
-            )
-
-            client_params.append(client_state)
-            new_c_clients.append(c_local)
-
-        # ---- Aggregate updates ----
-        if algo == "FedAvg":
-            new_params = FedAvg(global_model.state_dict(), client_params)
-            global_model.load_state_dict(new_params)
-
-        elif algo == "FedProx":
-            new_params = FedProx(global_model.state_dict(), client_params, mu=config["mu"])
-            global_model.load_state_dict(new_params)
-
-        elif algo == "SCAFFOLD":
-            new_params, c_global, c_clients = Scaffold(
-                global_model.state_dict(),
-                client_params,
-                c_global,
-                c_clients,
-                lr=config["lr"],
-                num_clients=num_clients
-            )
-            global_model.load_state_dict(new_params)
-
-    # --- Evaluate on test set using per-label thresholds from validation ---
-    _, per_label_thr = find_best_thresholds_per_label(global_model, val_loader, device)
-    _, metrics = eval_model(global_model, device, test_loader, per_label_thr=per_label_thr)
-
-    elapsed = time.time() - start_time
-    return metrics, elapsed
-
-
-# %%
-# === Federated Experiment Grid: FedAvg, FedProx, SCAFFOLD ===
-
-results = pd.DataFrame(columns=[
-    "Function", "Clients", "Local Epochs",
-    "AUC Macro", "AUC Micro",
-    "F1 Macro", "F1 Micro",
-    "PR-AUC Macro", "PR-AUC Micro",
-    "Time"
-])
-
 # Load datasets
 train_dataset = TensorDataset(
     torch.load(os.path.join("..", "Data", "X_train.pt")),
@@ -759,173 +663,270 @@ train_dataset = TensorDataset(
 val_loader = load_data("val")
 test_loader = load_data("test")
 
-algorithms = ["FedAvg", "FedProx", "SCAFFOLD"]
-client_counts = [2, 3, 4]
-local_epochs = [1, 2, 3]
+# %%
+# def run_federated_experiment(algo, num_clients, local_epochs, config, train_dataset, val_loader, test_loader, device):
+#     """
+#     Runs one federated configuration (FedAvg, FedProx, or SCAFFOLD)
+#     and returns evaluation metrics on the test set.
+#     """
+#     start_time = time.time()
 
-for algo in algorithms:
-    for n_clients in client_counts:
-        for epochs in local_epochs:
-            print(f"\n=== Running {algo} | Clients={n_clients} | Local Epochs={epochs} ===")
-            config["algorithm"] = algo
-            config["epochs"] = epochs
+#     # --- Split dataset into clients dynamically ---
+#     splits = [1 / num_clients] * num_clients
+#     lengths = [int(len(train_dataset) * s) for s in splits[:-1]]
+#     lengths.append(len(train_dataset) - sum(lengths))
+#     client_datasets = random_split(train_dataset, lengths=lengths)
+#     c_loaders = [DataLoader(c, batch_size=config["batch_size"], shuffle=True) for c in client_datasets]
 
-            metrics, elapsed = run_federated_experiment(
-                algo=algo,
-                num_clients=n_clients,
-                local_epochs=epochs,
-                config=config.copy(),
-                train_dataset=train_dataset,
-                val_loader=val_loader,
-                test_loader=test_loader,
-                device=device
-            )
+#     # --- Initialize global and client models ---
+#     global_model = GenerateModel(
+#         model_param_path,
+#         num_of_filters=config["n_filters"],
+#         kernel_size=config["window_size"]
+#     ).to(device)
 
-            results.loc[len(results)] = [
-                algo, n_clients, epochs,
-                metrics.get("auc_macro", None),
-                metrics.get("auc_micro", None),
-                metrics.get("f1_macro", None),
-                metrics.get("f1_micro", None),
-                metrics.get("pr_auc_macro", None),
-                metrics.get("pr_auc_micro", None),
-                elapsed
-            ]
+#     client_model = copy.deepcopy(global_model)
 
-            # Save after each run to preserve progress
-            results.to_csv("../History/summary_results.csv", index=False)
-            print(f"Completed: {algo} | Clients={n_clients} | Epochs={epochs}\n")
+#     # --- Initialize control variates if SCAFFOLD ---
+#     if algo == "SCAFFOLD":
+#         c_global = {k: torch.zeros_like(v) for k, v in global_model.state_dict().items()}
+#         c_clients = [{k: torch.zeros_like(v) for k, v in global_model.state_dict().items()} for _ in range(num_clients)]
+#     else:
+#         c_global = c_clients = None
 
-print("\nAll 27 configurations complete!")
-print(results)
+#     # --- Federated training rounds ---
+#     for rnd in tqdm(range(config["rounds"]), colour="blue", desc=f"{algo} | Clients={num_clients} | Epochs={local_epochs}"):
+#         client_params = []
+#         new_c_clients = []
+
+#         # ---- Each client trains locally ----
+#         for idx, loader in enumerate(c_loaders):
+#             client_model.load_state_dict(global_model.state_dict())
+
+#             local_loss, client_state, c_local = client_update(
+#                 model=client_model,
+#                 train_loader=loader,
+#                 epochs=local_epochs,
+#                 lr=config["lr"],
+#                 device=device,
+#                 use_focal=config["use_focal"],
+#                 gamma=config["gamma"],
+#                 mu=config["mu"],
+#                 global_params=global_model.state_dict(),
+#                 c_global=c_global if algo == "SCAFFOLD" else None,
+#                 c_local=c_clients[idx] if algo == "SCAFFOLD" else None,
+#                 algorithm=algo
+#             )
+
+#             client_params.append(client_state)
+#             new_c_clients.append(c_local)
+
+#         # ---- Aggregate updates ----
+#         if algo == "FedAvg":
+#             new_params = FedAvg(global_model.state_dict(), client_params)
+#             global_model.load_state_dict(new_params)
+
+#         elif algo == "FedProx":
+#             new_params = FedProx(global_model.state_dict(), client_params, mu=config["mu"])
+#             global_model.load_state_dict(new_params)
+
+#         elif algo == "SCAFFOLD":
+#             new_params, c_global, c_clients = Scaffold(
+#                 global_model.state_dict(),
+#                 client_params,
+#                 c_global,
+#                 c_clients,
+#                 lr=config["lr"],
+#                 num_clients=num_clients
+#             )
+#             global_model.load_state_dict(new_params)
+
+#     # --- Evaluate on test set using per-label thresholds from validation ---
+#     _, per_label_thr = find_best_thresholds_per_label(global_model, val_loader, device)
+#     _, metrics = eval_model(global_model, device, test_loader, per_label_thr=per_label_thr)
+
+#     elapsed = time.time() - start_time
+#     return metrics, elapsed
+
+
+# %%
+# # === Federated Experiment Grid: FedAvg, FedProx, SCAFFOLD ===
+
+# results = pd.DataFrame(columns=[
+#     "Function", "Clients", "Local Epochs",
+#     "AUC Macro", "AUC Micro",
+#     "F1 Macro", "F1 Micro",
+#     "PR-AUC Macro", "PR-AUC Micro",
+#     "Time"
+# ])
+
+# algorithms = ["FedAvg", "FedProx", "SCAFFOLD"]
+# client_counts = [2, 3, 4]
+# local_epochs = [1, 2, 3]
+
+# for algo in algorithms:
+#     for n_clients in client_counts:
+#         for epochs in local_epochs:
+#             print(f"\n=== Running {algo} | Clients={n_clients} | Local Epochs={epochs} ===")
+#             config["algorithm"] = algo
+#             config["epochs"] = epochs
+
+#             metrics, elapsed = run_federated_experiment(
+#                 algo=algo,
+#                 num_clients=n_clients,
+#                 local_epochs=epochs,
+#                 config=config.copy(),
+#                 train_dataset=train_dataset,
+#                 val_loader=val_loader,
+#                 test_loader=test_loader,
+#                 device=device
+#             )
+
+#             results.loc[len(results)] = [
+#                 algo, n_clients, epochs,
+#                 metrics.get("auc_macro", None),
+#                 metrics.get("auc_micro", None),
+#                 metrics.get("f1_macro", None),
+#                 metrics.get("f1_micro", None),
+#                 metrics.get("pr_auc_macro", None),
+#                 metrics.get("pr_auc_micro", None),
+#                 elapsed
+#             ]
+
+#             # Save after each run to preserve progress
+#             results.to_csv("../History/summary_results.csv", index=False)
+#             print(f"Completed: {algo} | Clients={n_clients} | Epochs={epochs}\n")
+
+# print("\nAll 27 configurations complete!")
+# print(results)
 
 
 # %% [markdown]
 # ## Central Model
 
 # %%
-# Config — same parameters as the federated setup
-central_config = {
-    "batch_size": 32,
-    "lr": 0.002,
-    "n_filters": 21,
-    "window_size": 6,
-    "epochs": 10,          # total training epochs for centralized run
-    "use_focal": False,    # using BCEWithLogitsLoss for fair comparison
-    "gamma": 2.5,          # unused since not focal
-}
+# # Config — same parameters as the federated setup
+# central_config = {
+#     "batch_size": 32,
+#     "lr": 0.002,
+#     "n_filters": 21,
+#     "window_size": 6,
+#     "epochs": 10,          # total training epochs for centralized run
+#     "use_focal": False,    # using BCEWithLogitsLoss for fair comparison
+#     "gamma": 2.5,          # unused since not focal
+# }
 
-print(central_config)
-
-
-# %%
-# Centralized model initialization
-
-central_model = GenerateModel(
-    table_path=os.path.join("..", "Model", "processed_full.w2v"),
-    num_of_filters=central_config["n_filters"],
-    kernel_size=central_config["window_size"]
-).to(device)
-
-# Load data
-train_loader = load_data(split="train")
-val_loader = load_data(split="val")
-test_loader = load_data(split="test")
-
-# ---- Optional but recommended: bias init for fairness ----
-n_labels = val_loader.dataset[0][1].shape[0]
-pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
-
-with torch.no_grad():
-    p = pos_weight / (pos_weight + 1.0)
-    prior_logit = torch.log(p / (1 - p))
-    central_model.final.bias.copy_(prior_logit.clamp(-10, 10))
-
-print("Centralized model and data ready.")
+# print(central_config)
 
 
 # %%
-def run_centralized_experiment(config, train_loader, val_loader, test_loader, device):
-    """
-    Train and evaluate a centralized model using BCEWithLogitsLoss.
-    Returns final test metrics and total runtime.
-    """
-    start_time = time.time()
+# # Centralized model initialization
 
-    # --- Initialize model ---
-    model = GenerateModel(
-        table_path=os.path.join("..", "Model", "processed_full.w2v"),
-        num_of_filters=config["n_filters"],
-        kernel_size=config["window_size"]
-    ).to(device)
+# central_model = GenerateModel(
+#     table_path=os.path.join("..", "Model", "processed_full.w2v"),
+#     num_of_filters=central_config["n_filters"],
+#     kernel_size=central_config["window_size"]
+# ).to(device)
 
-    # --- Optimizer and loss ---
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], betas=(0.9, 0.99))
-    n_labels = train_loader.dataset[0][1].shape[0]
-    pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+# # Load data
+# train_loader = load_data(split="train")
+# val_loader = load_data(split="val")
+# test_loader = load_data(split="test")
 
-    # ---- Training phase ----
-    for epoch in tqdm(range(config["epochs"]), colour="green", desc="Centralized Training"):
-        model.train()
-        total_loss = 0.0
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            optimizer.zero_grad()
-            preds, _ = model(X_batch)
-            loss = loss_fn(preds, y_batch)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+# # ---- Optional but recommended: bias init for fairness ----
+# n_labels = val_loader.dataset[0][1].shape[0]
+# pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
 
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{config['epochs']} | Train Loss: {avg_loss:.4f}")
+# with torch.no_grad():
+#     p = pos_weight / (pos_weight + 1.0)
+#     prior_logit = torch.log(p / (1 - p))
+#     central_model.final.bias.copy_(prior_logit.clamp(-10, 10))
 
-    # ---- Validation: find per-label thresholds ----
-    _, per_label_thr = find_best_thresholds_per_label(model, val_loader, device)
-
-    # ---- Test Evaluation ----
-    test_loss, metrics = eval_model(model, device, test_loader, per_label_thr=per_label_thr)
-
-    elapsed = time.time() - start_time
-    return metrics, elapsed
+# print("Centralized model and data ready.")
 
 
 # %%
-# === Centralized Experiment ===
+# def run_centralized_experiment(config, train_loader, val_loader, test_loader, device):
+#     """
+#     Train and evaluate a centralized model using BCEWithLogitsLoss.
+#     Returns final test metrics and total runtime.
+#     """
+#     start_time = time.time()
 
-central_results = pd.DataFrame(columns=[
-    "Function", "Epochs",
-    "AUC Macro", "AUC Micro",
-    "F1 Macro", "F1 Micro",
-    "PR-AUC Macro", "PR-AUC Micro",
-    "Time"
-])
+#     # --- Initialize model ---
+#     model = GenerateModel(
+#         table_path=os.path.join("..", "Model", "processed_full.w2v"),
+#         num_of_filters=config["n_filters"],
+#         kernel_size=config["window_size"]
+#     ).to(device)
 
-print("\n=== Running Centralized Training ===")
+#     # --- Optimizer and loss ---
+#     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], betas=(0.9, 0.99))
+#     n_labels = train_loader.dataset[0][1].shape[0]
+#     pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
+#     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-metrics, elapsed = run_centralized_experiment(
-    config=central_config,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    test_loader=test_loader,
-    device=device
-)
+#     # ---- Training phase ----
+#     for epoch in tqdm(range(config["epochs"]), colour="green", desc="Centralized Training"):
+#         model.train()
+#         total_loss = 0.0
+#         for X_batch, y_batch in train_loader:
+#             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+#             optimizer.zero_grad()
+#             preds, _ = model(X_batch)
+#             loss = loss_fn(preds, y_batch)
+#             loss.backward()
+#             optimizer.step()
+#             total_loss += loss.item()
 
-central_results.loc[len(central_results)] = [
-    "Centralized", central_config["epochs"],
-    metrics.get("auc_macro", None),
-    metrics.get("auc_micro", None),
-    metrics.get("f1_macro", None),
-    metrics.get("f1_micro", None),
-    metrics.get("pr_auc_macro", None),
-    metrics.get("pr_auc_micro", None),
-    elapsed
-]
+#         avg_loss = total_loss / len(train_loader)
+#         print(f"Epoch {epoch+1}/{config['epochs']} | Train Loss: {avg_loss:.4f}")
 
-central_results.to_csv("../History/centralized_results.csv", index=False)
-print("\n✅ Centralized training complete! Results saved to ../History/centralized_results.csv")
-display(central_results)
+#     # ---- Validation: find per-label thresholds ----
+#     _, per_label_thr = find_best_thresholds_per_label(model, val_loader, device)
+
+#     # ---- Test Evaluation ----
+#     test_loss, metrics = eval_model(model, device, test_loader, per_label_thr=per_label_thr)
+
+#     elapsed = time.time() - start_time
+#     return metrics, elapsed
+
+
+# %%
+# # === Centralized Experiment ===
+
+# central_results = pd.DataFrame(columns=[
+#     "Function", "Epochs",
+#     "AUC Macro", "AUC Micro",
+#     "F1 Macro", "F1 Micro",
+#     "PR-AUC Macro", "PR-AUC Micro",
+#     "Time"
+# ])
+
+# print("\n=== Running Centralized Training ===")
+
+# metrics, elapsed = run_centralized_experiment(
+#     config=central_config,
+#     train_loader=train_loader,
+#     val_loader=val_loader,
+#     test_loader=test_loader,
+#     device=device
+# )
+
+# central_results.loc[len(central_results)] = [
+#     "Centralized", central_config["epochs"],
+#     metrics.get("auc_macro", None),
+#     metrics.get("auc_micro", None),
+#     metrics.get("f1_macro", None),
+#     metrics.get("f1_micro", None),
+#     metrics.get("pr_auc_macro", None),
+#     metrics.get("pr_auc_micro", None),
+#     elapsed
+# ]
+
+# central_results.to_csv("../History/centralized_results.csv", index=False)
+# print("\n✅ Centralized training complete! Results saved to ../History/centralized_results.csv")
+# display(central_results)
 
 
 # %% [markdown]
@@ -994,11 +995,6 @@ def train_centralized_for_attention(epochs=100):
 
     model.load_state_dict(best_state)
     return model
-
-# Train + save
-central_model = train_centralized_for_attention(epochs=100)
-torch.save(central_model.state_dict(), ATTN_MODELS["central"])
-print("Saved →", ATTN_MODELS["central"])
 
 
 # %%
@@ -1103,17 +1099,22 @@ def train_fed_for_attention(algo, rounds=100, num_clients=2, local_epochs=3):
 
 
 # %%
-# === Train Fed Models (FedAvg, FedProx, SCAFFOLD) ===
+# === Train Models
 
-fedavg_model = train_fed_for_attention("FedAvg")
+# Train + save
+central_model = train_centralized_for_attention(epochs=100)
+torch.save(central_model.state_dict(), ATTN_MODELS["central"])
+print("Saved →", ATTN_MODELS["central"])
+
+fedavg_model = train_fed_for_attention("FedAvg", rounds=100, num_clients=2, local_epochs=3)
 torch.save(fedavg_model.state_dict(), ATTN_MODELS["fedavg"])
 print("Saved →", ATTN_MODELS["fedavg"])
 
-fedprox_model = train_fed_for_attention("FedProx")
+fedprox_model = train_fed_for_attention("FedProx", rounds=100, num_clients=2, local_epochs=3)
 torch.save(fedprox_model.state_dict(), ATTN_MODELS["fedprox"])
 print("Saved →", ATTN_MODELS["fedprox"])
 
-scaffold_model = train_fed_for_attention("SCAFFOLD")
+scaffold_model = train_fed_for_attention("SCAFFOLD", rounds=100, num_clients=2, local_epochs=3)
 torch.save(scaffold_model.state_dict(), ATTN_MODELS["scaffold"])
 print("Saved →", ATTN_MODELS["scaffold"])
 

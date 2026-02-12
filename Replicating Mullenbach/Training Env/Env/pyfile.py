@@ -341,7 +341,7 @@ def client_update(
     lr: float = 0.1,
     device: str = "cpu",
     use_focal: bool = False,
-    gamma: float = 2.0
+    gamma: float = 2.5
 ) -> tuple[float, dict]:
     """
     Perform local training for a single client using weighted BCE loss.
@@ -433,7 +433,7 @@ config = {
     "window_size": 6,
     "epochs": 3,            #how many times clint will go through its own local dataset each round
     "rounds": 100,           #for centralized, this is the epochs
-    "use_focal" : True,
+    "use_focal" : False,
     "gamma" : 2.5
 }
 
