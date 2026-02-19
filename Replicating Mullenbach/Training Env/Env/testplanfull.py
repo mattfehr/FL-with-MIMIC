@@ -933,257 +933,260 @@ test_loader = load_data("test")
 # ## Models for Attention Tests
 
 # %%
-# === Setup for Attention Model Training ===
+# # === Setup for Attention Model Training ===
 
-output_dir = "../History/models"
-os.makedirs(output_dir, exist_ok=True)
+# output_dir = "../History/models"
+# os.makedirs(output_dir, exist_ok=True)
 
-ATTN_MODELS = {
-    "central":  os.path.join(output_dir, "central_best_attention.pt"),
-    "fedavg":   os.path.join(output_dir, "fedavg_c2e3_best_attention.pt"),
-    "fedprox":  os.path.join(output_dir, "fedprox_c2e3_best_attention.pt"),
-    "scaffold": os.path.join(output_dir, "scaffold_c2e3_best_attention.pt"),
-}
+# ATTN_MODELS = {
+#     "central":  os.path.join(output_dir, "central_best_attention.pt"),
+#     "fedavg":   os.path.join(output_dir, "fedavg_c2e3_best_attention.pt"),
+#     "fedprox":  os.path.join(output_dir, "fedprox_c2e3_best_attention.pt"),
+#     "scaffold": os.path.join(output_dir, "scaffold_c2e3_best_attention.pt"),
+# }
 
-print("Model output paths:")
-ATTN_MODELS
-
-
-# %%
-# === Train Centralized Model for Attention Tests (optional: change epochs=100) ===
-
-def train_centralized_for_attention(epochs=100):
-    train_loader = load_data("train")
-    val_loader   = load_data("val")
-
-    model = GenerateModel(
-        table_path=os.path.join("..", "Model", "processed_full.w2v"),
-        num_of_filters=config["n_filters"],
-        kernel_size=config["window_size"]
-    ).to(device)
-
-    n_labels = train_loader.dataset[0][1].shape[0]
-    pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-    best_f1 = -1.0
-    best_state = None
-
-    for ep in tqdm(range(epochs), desc="Centralized (Attention Mode)", colour="green"):
-        model.train()
-        total_loss = 0
-
-        for Xb, yb in train_loader:
-            Xb, yb = Xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            preds, _ = model(Xb)
-            loss = loss_fn(preds, yb)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-        # Validation
-        _, per_thr = find_best_thresholds_per_label(model, val_loader, device)
-        _, metrics = eval_model(model, device, val_loader, per_label_thr=per_thr)
-
-        if metrics["f1_micro"] > best_f1:
-            best_f1 = metrics["f1_micro"]
-            best_state = copy.deepcopy(model.state_dict())
-
-        print(f"Epoch {ep+1}/{epochs} | F1_micro={metrics['f1_micro']:.4f} (best={best_f1:.4f})")
-
-    model.load_state_dict(best_state)
-    return model
+# print("Model output paths:")
+# ATTN_MODELS
 
 
 # %%
-# === Generic Federated Trainer for Attention Models ===
+# # === Train Centralized Model for Attention Tests (optional: change epochs=100) ===
 
-def train_fed_for_attention(algo, rounds=100, num_clients=2, local_epochs=3):
-    assert algo in {"FedAvg", "FedProx", "SCAFFOLD"}
+# def train_centralized_for_attention(epochs=100):
+#     train_loader = load_data("train")
+#     val_loader   = load_data("val")
+
+#     model = GenerateModel(
+#         table_path=os.path.join("..", "Model", "processed_full.w2v"),
+#         num_of_filters=config["n_filters"],
+#         kernel_size=config["window_size"]
+#     ).to(device)
+
+#     n_labels = train_loader.dataset[0][1].shape[0]
+#     pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
+#     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+#     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+#     best_f1 = -1.0
+#     best_state = None
+
+#     for ep in tqdm(range(epochs), desc="Centralized (Attention Mode)", colour="green"):
+#         model.train()
+#         total_loss = 0
+
+#         for Xb, yb in train_loader:
+#             Xb, yb = Xb.to(device), yb.to(device)
+#             optimizer.zero_grad()
+#             preds, _ = model(Xb)
+#             loss = loss_fn(preds, yb)
+#             loss.backward()
+#             optimizer.step()
+#             total_loss += loss.item()
+
+#         # Validation
+#         _, per_thr = find_best_thresholds_per_label(model, val_loader, device)
+#         _, metrics = eval_model(model, device, val_loader, per_label_thr=per_thr)
+
+#         if metrics["f1_micro"] > best_f1:
+#             best_f1 = metrics["f1_micro"]
+#             best_state = copy.deepcopy(model.state_dict())
+
+#         print(f"Epoch {ep+1}/{epochs} | F1_micro={metrics['f1_micro']:.4f} (best={best_f1:.4f})")
+
+#     model.load_state_dict(best_state)
+#     return model
+
+
+# %%
+# # === Generic Federated Trainer for Attention Models ===
+
+# def train_fed_for_attention(algo, rounds=100, num_clients=2, local_epochs=3):
+#     assert algo in {"FedAvg", "FedProx", "SCAFFOLD"}
     
-    print(f"\n=== Training {algo} for Attention Tests ===")
-    print(f"Rounds={rounds}, Clients={num_clients}, Local Epochs={local_epochs}")
+#     print(f"\n=== Training {algo} for Attention Tests ===")
+#     print(f"Rounds={rounds}, Clients={num_clients}, Local Epochs={local_epochs}")
 
-    # Split training set
-    splits = [1/num_clients] * num_clients
-    lengths = [int(len(train_dataset)*s) for s in splits[:-1]]
-    lengths.append(len(train_dataset) - sum(lengths))
-    generator = torch.Generator().manual_seed(42)
+#     # Split training set
+#     splits = [1/num_clients] * num_clients
+#     lengths = [int(len(train_dataset)*s) for s in splits[:-1]]
+#     lengths.append(len(train_dataset) - sum(lengths))
+#     generator = torch.Generator().manual_seed(42)
 
-    client_datasets = random_split(train_dataset, lengths, generator=generator)
-    client_loaders = [
-        DataLoader(c, batch_size=config["batch_size"], shuffle=True)
-        for c in client_datasets
-    ]
+#     client_datasets = random_split(train_dataset, lengths, generator=generator)
+#     client_loaders = [
+#         DataLoader(c, batch_size=config["batch_size"], shuffle=True)
+#         for c in client_datasets
+#     ]
 
-    # Global & client models
-    global_model = GenerateModel(
-        model_param_path,
-        num_of_filters=config["n_filters"],
-        kernel_size=config["window_size"]
-    ).to(device)
+#     # Global & client models
+#     global_model = GenerateModel(
+#         model_param_path,
+#         num_of_filters=config["n_filters"],
+#         kernel_size=config["window_size"]
+#     ).to(device)
 
-    client_model = copy.deepcopy(global_model)
-    val_loader = load_data("val")
+#     client_model = copy.deepcopy(global_model)
+#     val_loader = load_data("val")
 
-    # SCAFFOLD control variates
-    if algo == "SCAFFOLD":
-        c_global = {k: torch.zeros_like(v) for k, v in global_model.state_dict().items()}
-        c_clients = [
-            {k: torch.zeros_like(v) for k, v in global_model.state_dict().items()}
-            for _ in range(num_clients)
-        ]
-    else:
-        c_global = c_clients = None
+#     # SCAFFOLD control variates
+#     if algo == "SCAFFOLD":
+#         c_global = {k: torch.zeros_like(v) for k, v in global_model.state_dict().items()}
+#         c_clients = [
+#             {k: torch.zeros_like(v) for k, v in global_model.state_dict().items()}
+#             for _ in range(num_clients)
+#         ]
+#     else:
+#         c_global = c_clients = None
 
-    # Track best model
-    best_f1 = -1
-    best_state = None
+#     # Track best model
+#     best_f1 = -1
+#     best_state = None
 
-    # Federated loop
-    for rnd in tqdm(range(rounds), desc=f"{algo} FL Training", colour="blue"):
-        updates = []
-        new_c_clients = []
+#     # Federated loop
+#     for rnd in tqdm(range(rounds), desc=f"{algo} FL Training", colour="blue"):
+#         updates = []
+#         new_c_clients = []
 
-        # Local training
-        for i, loader in enumerate(client_loaders):
-            client_model.load_state_dict(global_model.state_dict())
+#         # Local training
+#         for i, loader in enumerate(client_loaders):
+#             client_model.load_state_dict(global_model.state_dict())
 
-            local_loss, client_state, c_local = client_update(
-                model=client_model,
-                train_loader=loader,
-                epochs=local_epochs,
-                lr=config["lr"],
-                device=device,
-                use_focal=config["use_focal"],
-                gamma=config["gamma"],
-                mu=config["mu"],
-                global_params=global_model.state_dict(),
-                c_global=c_global if algo=="SCAFFOLD" else None,
-                c_local=c_clients[i] if algo=="SCAFFOLD" else None,
-                algorithm=algo
-            )
+#             local_loss, client_state, c_local = client_update(
+#                 model=client_model,
+#                 train_loader=loader,
+#                 epochs=local_epochs,
+#                 lr=config["lr"],
+#                 device=device,
+#                 use_focal=config["use_focal"],
+#                 gamma=config["gamma"],
+#                 mu=config["mu"],
+#                 global_params=global_model.state_dict(),
+#                 c_global=c_global if algo=="SCAFFOLD" else None,
+#                 c_local=c_clients[i] if algo=="SCAFFOLD" else None,
+#                 algorithm=algo
+#             )
 
-            updates.append(client_state)
-            new_c_clients.append(c_local)
+#             updates.append(client_state)
+#             new_c_clients.append(c_local)
 
-        # Aggregate
-        if algo == "FedAvg":
-            global_model.load_state_dict(FedAvg(global_model.state_dict(), updates))
+#         # Aggregate
+#         if algo == "FedAvg":
+#             global_model.load_state_dict(FedAvg(global_model.state_dict(), updates))
 
-        elif algo == "FedProx":
-            global_model.load_state_dict(FedProx(global_model.state_dict(), updates, mu=config["mu"]))
+#         elif algo == "FedProx":
+#             global_model.load_state_dict(FedProx(global_model.state_dict(), updates, mu=config["mu"]))
 
-        elif algo == "SCAFFOLD":
-            new_params, c_global, c_clients = Scaffold(
-                global_model.state_dict(), updates, c_global, c_clients,
-                lr=config["lr"], num_clients=num_clients
-            )
-            global_model.load_state_dict(new_params)
-            c_clients = new_c_clients
+#         elif algo == "SCAFFOLD":
+#             new_params, c_global, c_clients = Scaffold(
+#                 global_model.state_dict(), updates, c_global, c_clients,
+#                 lr=config["lr"], num_clients=num_clients
+#             )
+#             global_model.load_state_dict(new_params)
+#             c_clients = new_c_clients
 
-        # Validation check
-        _, per_thr = find_best_thresholds_per_label(global_model, val_loader, device)
-        _, metrics = eval_model(global_model, device, val_loader, per_label_thr=per_thr)
+#         # Validation check
+#         _, per_thr = find_best_thresholds_per_label(global_model, val_loader, device)
+#         _, metrics = eval_model(global_model, device, val_loader, per_label_thr=per_thr)
 
-        if metrics["f1_micro"] > best_f1:
-            best_f1 = metrics["f1_micro"]
-            best_state = copy.deepcopy(global_model.state_dict())
+#         if metrics["f1_micro"] > best_f1:
+#             best_f1 = metrics["f1_micro"]
+#             best_state = copy.deepcopy(global_model.state_dict())
 
-        print(f"Round {rnd+1}/{rounds} | F1_micro={metrics['f1_micro']:.4f} (best={best_f1:.4f})")
+#         print(f"Round {rnd+1}/{rounds} | F1_micro={metrics['f1_micro']:.4f} (best={best_f1:.4f})")
 
-    global_model.load_state_dict(best_state)
-    return global_model
+#     global_model.load_state_dict(best_state)
+#     return global_model
 
 
 # %%
-# === Train Models
+# # === Train Models
 
-# Train + save
-central_model = train_centralized_for_attention(epochs=100)
-torch.save(central_model.state_dict(), ATTN_MODELS["central"])
-print("Saved →", ATTN_MODELS["central"])
+# # Train + save
+# central_model = train_centralized_for_attention(epochs=100)
+# torch.save(central_model.state_dict(), ATTN_MODELS["central"])
+# print("Saved →", ATTN_MODELS["central"])
 
-fedavg_model = train_fed_for_attention("FedAvg", rounds=100, num_clients=2, local_epochs=3)
-torch.save(fedavg_model.state_dict(), ATTN_MODELS["fedavg"])
-print("Saved →", ATTN_MODELS["fedavg"])
+# fedavg_model = train_fed_for_attention("FedAvg", rounds=100, num_clients=2, local_epochs=3)
+# torch.save(fedavg_model.state_dict(), ATTN_MODELS["fedavg"])
+# print("Saved →", ATTN_MODELS["fedavg"])
 
-fedprox_model = train_fed_for_attention("FedProx", rounds=100, num_clients=2, local_epochs=3)
-torch.save(fedprox_model.state_dict(), ATTN_MODELS["fedprox"])
-print("Saved →", ATTN_MODELS["fedprox"])
+# fedprox_model = train_fed_for_attention("FedProx", rounds=100, num_clients=2, local_epochs=3)
+# torch.save(fedprox_model.state_dict(), ATTN_MODELS["fedprox"])
+# print("Saved →", ATTN_MODELS["fedprox"])
 
-scaffold_model = train_fed_for_attention("SCAFFOLD", rounds=100, num_clients=2, local_epochs=3)
-torch.save(scaffold_model.state_dict(), ATTN_MODELS["scaffold"])
-print("Saved →", ATTN_MODELS["scaffold"])
+# scaffold_model = train_fed_for_attention("SCAFFOLD", rounds=100, num_clients=2, local_epochs=3)
+# torch.save(scaffold_model.state_dict(), ATTN_MODELS["scaffold"])
+# print("Saved →", ATTN_MODELS["scaffold"])
 
 
 # %% [markdown]
 # ### Eval Sanity Check
 
 # %%
-# === Eval helper for attention models (same logic as 27-config) ===
+# # === Eval helper for attention models (same logic as 27-config) ===
 
-def eval_attention_model_on_test(model, name: str):
-    """
-    Evaluate a trained model on the test set using per-label thresholds
-    derived from the validation set, exactly like the 27-config experiments.
-    """
-    # reuse loaders so we're consistent
-    val_loader  = load_data("val")
-    test_loader = load_data("test")
+# def eval_attention_model_on_test(model, name: str):
+#     """
+#     Evaluate a trained model on the test set using per-label thresholds
+#     derived from the validation set, exactly like the 27-config experiments.
+#     """
+#     # reuse loaders so we're consistent
+#     val_loader  = load_data("val")
+#     test_loader = load_data("test")
 
-    # thresholds from validation
-    _, per_label_thr = find_best_thresholds_per_label(model, val_loader, device)
+#     # thresholds from validation
+#     _, per_label_thr = find_best_thresholds_per_label(model, val_loader, device)
 
-    # test evaluation
-    test_loss, metrics = eval_model(
-        model,
-        device,
-        test_loader,
-        per_label_thr=per_label_thr
-    )
+#     # test evaluation
+#     test_loss, metrics = eval_model(
+#         model,
+#         device,
+#         test_loader,
+#         per_label_thr=per_label_thr
+#     )
 
-    print(f"\n📊 {name} — Test Evaluation for Attention Model")
-    print(f"  Test loss      : {test_loss:.4f}")
-    print(f"  AUC Macro      : {metrics['auc_macro']:.4f}")
-    print(f"  AUC Micro      : {metrics['auc_micro']:.4f}")
-    print(f"  F1 Macro       : {metrics['f1_macro']:.4f}")
-    print(f"  F1 Micro       : {metrics['f1_micro']:.4f}")
-    print(f"  PR-AUC Macro   : {metrics['pr_auc_macro']:.4f}")
-    print(f"  PR-AUC Micro   : {metrics['pr_auc_micro']:.4f}")
-    return metrics
+#     print(f"\n📊 {name} — Test Evaluation for Attention Model")
+#     print(f"  Test loss      : {test_loss:.4f}")
+#     print(f"  AUC Macro      : {metrics['auc_macro']:.4f}")
+#     print(f"  AUC Micro      : {metrics['auc_micro']:.4f}")
+#     print(f"  F1 Macro       : {metrics['f1_macro']:.4f}")
+#     print(f"  F1 Micro       : {metrics['f1_micro']:.4f}")
+#     print(f"  PR-AUC Macro   : {metrics['pr_auc_macro']:.4f}")
+#     print(f"  PR-AUC Micro   : {metrics['pr_auc_micro']:.4f}")
+#     return metrics
 
 
 # %%
-# === Quick sanity check: metrics for attention models ===
+# # === Quick sanity check: metrics for attention models ===
 
-attn_results = pd.DataFrame(columns=[
-    "Model", "AUC Macro", "AUC Micro",
-    "F1 Macro", "F1 Micro",
-    "PR-AUC Macro", "PR-AUC Micro"
-])
+# attn_results = pd.DataFrame(columns=[
+#     "Model", "AUC Macro", "AUC Micro",
+#     "F1 Macro", "F1 Micro",
+#     "PR-AUC Macro", "PR-AUC Micro"
+# ])
 
-for name, model in [
-    ("Centralized", central_model),
-    ("FedAvg",      fedavg_model),
-    ("FedProx",     fedprox_model),
-    ("SCAFFOLD",    scaffold_model),
-]:
-    metrics = eval_attention_model_on_test(model, name)
-    attn_results.loc[len(attn_results)] = [
-        name,
-        metrics["auc_macro"],
-        metrics["auc_micro"],
-        metrics["f1_macro"],
-        metrics["f1_micro"],
-        metrics["pr_auc_macro"],
-        metrics["pr_auc_micro"],
-    ]
+# for name, model in [
+#     ("Centralized", central_model),
+#     ("FedAvg",      fedavg_model),
+#     ("FedProx",     fedprox_model),
+#     ("SCAFFOLD",    scaffold_model),
+# ]:
+#     metrics = eval_attention_model_on_test(model, name)
+#     attn_results.loc[len(attn_results)] = [
+#         name,
+#         metrics["auc_macro"],
+#         metrics["auc_micro"],
+#         metrics["f1_macro"],
+#         metrics["f1_micro"],
+#         metrics["pr_auc_macro"],
+#         metrics["pr_auc_micro"],
+#     ]
 
-print("\n=== Attention Models — Test Metrics Summary ===")
-display(attn_results)
+# print("\n=== Attention Models — Test Metrics Summary ===")
+# display(attn_results)
 
+
+# %% [markdown]
+# ## Client Number Sensitivity Analysis
 
 
