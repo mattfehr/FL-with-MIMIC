@@ -15,7 +15,7 @@
 # ## Imports
 
 # %%
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset, random_split, Subset
 from gensim.models    import Word2Vec
 import torch.nn.functional as F
 import torch.nn as nn
@@ -1188,5 +1188,300 @@ test_loader = load_data("test")
 
 # %% [markdown]
 # ## Client Number Sensitivity Analysis
+# 
+# Goal: test how FL performance changes as the number of simulated clients increases.
+# 
+# **Option A (implemented now): IID split**
+# - Randomly split the same training dataset into K approximately equal partitions.
+# 
+# **Option B (later): non-IID split**
+# - Split data to mimic hospital heterogeneity (label prevalence shifts, size imbalance, etc.).
+# 
+# We keep everything else fixed (model, optimizer, rounds, local epochs) so the only change is
+# the number of clients and the resulting partitioning.
+
+# %%
+# do weighted by partition size instead of mean by clients (important for different sizes like part b)
+
+def FedAvg_weighted(client_state_dicts: list[dict], client_sizes: list[int]) -> dict:
+    """
+    Weighted FedAvg by client dataset size. Returns a NEW state_dict (does not mutate inputs).
+    client_state_dicts: list of state_dicts (as produced by model.state_dict())
+    client_sizes: list of ints (number of samples per client)
+    """
+    total = float(sum(client_sizes))
+    out = {}
+    # iterate keys from first client's state_dict
+    for key in client_state_dicts[0].keys():
+        # accumulate weighted sum
+        acc = None
+        for sd, n in zip(client_state_dicts, client_sizes):
+            term = sd[key].float() * (n / total)
+            acc = term if acc is None else acc + term
+        out[key] = acc
+    return out
+
+# %% [markdown]
+# ### IID Split
+
+# %%
+# IID split helper for option A
+
+def split_dataset_iid(dataset, num_clients: int, seed: int = 42):
+    """
+    IID split: shuffle indices and split into K chunks.
+    Returns list of Subset datasets.
+    """
+    rng = np.random.default_rng(seed)
+    indices = np.arange(len(dataset))
+    rng.shuffle(indices)
+
+    # chunk sizes (nearly equal)
+    base = len(dataset) // num_clients
+    rem  = len(dataset) % num_clients
+    sizes = [base + (1 if i < rem else 0) for i in range(num_clients)]
+
+    subsets = []
+    start = 0
+    for sz in sizes:
+        subsets.append(Subset(dataset, indices[start:start+sz].tolist()))
+        start += sz
+    return subsets
+
+# %%
+# Run ONE FL experiment for a given K
+# Simplified run_federated_experiment, but with: IID splits, weighted FedAvg, returns test metrics (using per-label thresholds from val)
+
+def run_fedavg_client_sensitivity(
+    num_clients: int,
+    local_epochs: int,
+    config: dict,
+    train_dataset,
+    val_loader,
+    test_loader,
+    device,
+    seed: int = 42
+):
+    start_time = time.time()
+
+    # --- Split IID into K clients ---
+    client_datasets = split_dataset_iid(train_dataset, num_clients=num_clients, seed=seed)
+    client_sizes = [len(cd) for cd in client_datasets]
+    client_loaders = [
+        DataLoader(cd, batch_size=config["batch_size"], shuffle=True)
+        for cd in client_datasets
+    ]
+
+    # --- Init global model ---
+    global_model = GenerateModel(
+        model_param_path,
+        num_of_filters=config["n_filters"],
+        kernel_size=config["window_size"]
+    ).to(device)
+
+    client_model = copy.deepcopy(global_model)
+
+    # --- FL rounds ---
+    for rnd in tqdm(range(config["rounds"]), colour="blue",
+                    desc=f"FedAvg IID | K={num_clients} | E={local_epochs}"):
+        client_params = []
+        for loader in client_loaders:
+            client_model.load_state_dict(global_model.state_dict())
+
+            _, client_state, _ = client_update(
+                model=client_model,
+                train_loader=loader,
+                epochs=local_epochs,
+                lr=config["lr"],
+                device=device,
+                use_focal=config["use_focal"],
+                gamma=config["gamma"],
+                mu=config["mu"],
+                global_params=None,
+                c_global=None,
+                c_local=None,
+                algorithm="FedAvg"
+            )
+            client_params.append(client_state)
+
+        # weighted aggregation
+        new_params = FedAvg_weighted(client_params, client_sizes)
+        global_model.load_state_dict(new_params)
+
+    # --- Thresholds from val, evaluation on test ---
+    _, per_label_thr = find_best_thresholds_per_label(global_model, val_loader, device)
+    _, metrics = eval_model(global_model, device, test_loader, per_label_thr=per_label_thr)
+
+    elapsed = time.time() - start_time
+    return metrics, elapsed
+
+# %%
+# Grid over client counts + plot metrics vs #clients
+# ---- Sensitivity sweep (Option A: IID) ----
+
+client_counts = range(2,11)   # adjust based on compute
+local_epochs  = 3                  # keep constant for sensitivity
+algo_name     = "FedAvg-IID"
+
+fast_config = config.copy()
+fast_config["rounds"] = 10   # <<< reduced from 100 to 10
+
+sens_results = pd.DataFrame(columns=[
+    "Algorithm", "Clients", "Local Epochs",
+    "AUC Macro", "AUC Micro",
+    "F1 Macro", "F1 Micro",
+    "PR-AUC Macro", "PR-AUC Micro",
+    "Time"
+])
+
+for k in client_counts:
+    print(f"\n=== Sensitivity: {algo_name} | Clients={k} | Local Epochs={local_epochs} ===")
+
+    metrics, elapsed = run_fedavg_client_sensitivity(
+        num_clients=k,
+        local_epochs=local_epochs,
+        config=fast_config,
+        train_dataset=train_dataset,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        device=device,
+        seed=42
+    )
+
+    sens_results.loc[len(sens_results)] = [
+        algo_name, k, local_epochs,
+        metrics.get("auc_macro"),
+        metrics.get("auc_micro"),
+        metrics.get("f1_macro"),
+        metrics.get("f1_micro"),
+        metrics.get("pr_auc_macro"),
+        metrics.get("pr_auc_micro"),
+        elapsed
+    ]
+
+    sens_results.to_csv("../History/client_sensitivity_fedavg_iid.csv", index=False)
+
+print("\nSensitivity sweep complete.")
+display(sens_results)
+
+# %%
+ # ---- Load sensitivity results if session restarted ----
+sens_path = "../History/client_sensitivity_fedavg_iid.csv"
+if "sens_results" not in globals():
+    if os.path.exists(sens_path):
+        sens_results = pd.read_csv(sens_path)
+        print(f"Loaded sens_results from {sens_path} ({len(sens_results)} rows).")
+    else:
+        raise FileNotFoundError(f"No saved sensitivity file found at: {sens_path}")
+
+# ---- Plot key metrics vs number of clients (Mullenbach-style) ----
+
+def plot_metric_vs_clients(df, metric_col: str, title: str):
+    xs = df["Clients"].values
+    ys = df[metric_col].values
+    plt.figure()
+    plt.plot(xs, ys, marker="o")
+    plt.xlabel("Number of Clients")
+    plt.ylabel(metric_col)
+    plt.title(title)
+    plt.grid(True)
+    plt.show()
+
+# AUC (micro/macro) + F1 (micro/macro)
+plot_metric_vs_clients(sens_results, "AUC Micro", "FedAvg IID Sensitivity: AUC Micro vs #Clients")
+plot_metric_vs_clients(sens_results, "AUC Macro", "FedAvg IID Sensitivity: AUC Macro vs #Clients")
+plot_metric_vs_clients(sens_results, "F1 Micro",  "FedAvg IID Sensitivity: F1 Micro vs #Clients")
+plot_metric_vs_clients(sens_results, "F1 Macro",  "FedAvg IID Sensitivity: F1 Macro vs #Clients")
+plot_metric_vs_clients(sens_results, "PR-AUC Macro",  "FedAvg IID Sensitivity: PR-AUC Macro vs #Clients")
+plot_metric_vs_clients(sens_results, "PR-AUC Micro",  "FedAvg IID Sensitivity: PR-AUC Micro vs #Clients")
+plot_metric_vs_clients(sens_results, "Time",  "FedAvg IID Sensitivity: Time vs #Clients")
+
+# %%
+# ---- Load sensitivity results if session restarted ----
+sens_path = "../History/client_sensitivity_fedavg_iid.csv"
+if "sens_results" not in globals():
+    if os.path.exists(sens_path):
+        sens_results = pd.read_csv(sens_path)
+        print(f"Loaded sens_results from {sens_path} ({len(sens_results)} rows).")
+    else:
+        raise FileNotFoundError(f"No saved sensitivity file found at: {sens_path}")
+
+# Ensure sorted
+sens_results = sens_results.sort_values("Clients")
+
+# Extract values
+x = sens_results["Clients"].values
+auc_micro = sens_results["AUC Micro"].values
+auc_macro = sens_results["AUC Macro"].values
+f1_micro  = sens_results["F1 Micro"].values
+f1_macro  = sens_results["F1 Macro"].values
+pr_micro  = sens_results["PR-AUC Micro"].values
+pr_macro  = sens_results["PR-AUC Macro"].values
+time_vals = sens_results["Time"].values
+
+
+# =========================================================
+# COLOR VERSION
+# =========================================================
+fig, ax1 = plt.subplots(figsize=(9, 5))
+
+ax1.plot(x, auc_micro, marker="o", label="AUC Micro")
+ax1.plot(x, auc_macro, marker="s", label="AUC Macro")
+ax1.plot(x, f1_micro,  marker="^", label="F1 Micro")
+ax1.plot(x, f1_macro,  marker="d", label="F1 Macro")
+ax1.plot(x, pr_micro,  marker="v", label="PR-AUC Micro")
+ax1.plot(x, pr_macro,  marker="x", label="PR-AUC Macro")
+
+ax1.set_xlabel("Number of Clients")
+ax1.set_ylabel("Metric Score")
+ax1.set_title("FedAvg IID Sensitivity: Metrics & Time vs Number of Clients")
+ax1.grid(True)
+
+# Secondary axis for time
+ax2 = ax1.twinx()
+ax2.plot(x, time_vals, marker="P", linestyle="--", label="Time (s)")
+ax2.set_ylabel("Time (seconds)")
+
+# Combined legend
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=9)
+
+plt.tight_layout()
+plt.show()
+
+
+# =========================================================
+# BLACK & WHITE VERSION
+# =========================================================
+fig, ax1 = plt.subplots(figsize=(9, 5))
+
+ax1.plot(x, auc_micro, linestyle="-",  marker="o", color="black", label="AUC Micro")
+ax1.plot(x, auc_macro, linestyle="--", marker="s", color="black", label="AUC Macro")
+ax1.plot(x, f1_micro,  linestyle="-.", marker="^", color="black", label="F1 Micro")
+ax1.plot(x, f1_macro,  linestyle=":",  marker="d", color="black", label="F1 Macro")
+ax1.plot(x, pr_micro,  linestyle=(0,(3,1,1,1)), marker="v", color="black", label="PR-AUC Micro")
+ax1.plot(x, pr_macro,  linestyle=(0,(1,1)),     marker="x", color="black", label="PR-AUC Macro")
+
+ax1.set_xlabel("Number of Clients")
+ax1.set_ylabel("Metric Score")
+ax1.set_title("FedAvg IID Sensitivity: Metrics & Time vs Number of Clients (B/W)")
+ax1.grid(True)
+
+# Secondary axis
+ax2 = ax1.twinx()
+ax2.plot(x, time_vals, linestyle=(0,(5,5)), marker="P", color="black", label="Time (s)")
+ax2.set_ylabel("Time (seconds)")
+
+# Combined legend
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=9)
+
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# ### Non-IID split
 
 
