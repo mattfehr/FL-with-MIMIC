@@ -9,7 +9,7 @@ import numpy as np
 import os
 import sys
 
-from sklearn.metrics import roc_curve, auc
+from sklearn.metrics import roc_curve, auc, average_precision_score
 from tqdm import tqdm
 
 # from constants import *
@@ -55,6 +55,10 @@ def all_metrics(yhat, y, k=8, yhat_raw=None, calc_auc=True):
         roc_auc = auc_metrics(yhat_raw, y, ymic)
         metrics.update(roc_auc)
 
+        # PR-AUC
+        pr_auc = pr_auc_metrics(yhat_raw, y)
+        metrics.update(pr_auc)
+
     return metrics
 
 def all_macro(yhat, y):
@@ -62,6 +66,26 @@ def all_macro(yhat, y):
 
 def all_micro(yhatmic, ymic):
     return micro_accuracy(yhatmic, ymic), micro_precision(yhatmic, ymic), micro_recall(yhatmic, ymic), micro_f1(yhatmic, ymic)
+
+from sklearn.metrics import average_precision_score
+
+def pr_auc_metrics(yhat_raw, y):
+    """
+    Compute Precision-Recall AUC (macro and micro).
+    Returns a dict: {'pr_auc_macro': val, 'pr_auc_micro': val}
+    """
+    y = np.array(y)
+    yhat_raw = np.array(yhat_raw)
+    metrics = {}
+
+    try:
+        metrics["pr_auc_macro"] = average_precision_score(y, yhat_raw, average="macro")
+        metrics["pr_auc_micro"] = average_precision_score(y, yhat_raw, average="micro")
+    except Exception as e:
+        print("[Warning] PR-AUC calculation failed:", e)
+        metrics["pr_auc_macro"], metrics["pr_auc_micro"] = 0.0, 0.0
+
+    return metrics
 
 #########################################################################
 #MACRO METRICS: calculate metric for each label and average across labels
