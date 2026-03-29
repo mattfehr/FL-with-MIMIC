@@ -1,6 +1,23 @@
-.venv
+# Byte-compiled / Cache files (matches in any directory)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments & Secrets (matches any variant in any directory)
+**/.env*
+.venv/
+env/
+venv/
+
+# Data & Model Weights
 *.npy
 *.w2v
-.env
 *.pt
-Replicating Mullenbach/AWS/S3_Bucket/results
+
+# Project Specific Results
+Replicating Mullenbach/AWS/S3_Bucket/results/
+
+# IDEs & OS Files
+.idea/
+.vscode/
+.DS_Store
