@@ -1090,17 +1090,43 @@ def run_fl_sensitivity_once(
 # 
 # Notes:
 # - These implementations are designed for **multi-label** prediction.
-# - Server-side distillation / FedDKD is intentionally deferred to a later section.
+# - Server-side distillation is supported as an optional post-aggregation refinement step.
 # - FedProx compatibility is included by applying the proximal penalty to the uploaded student model.
+# - In this notebook, server distillation follows the toy reference and uses client mini-batches
+#   as the distillation input source. For a stricter privacy setup, this can later be replaced
+#   with a proxy/public dataset without changing the client-side KD code.
 
 # %%
+# Suggested teacher pool:
+# - "medium" teacher: modest capacity increase over student
+# - "mullenbach" teacher: closer to stronger CAML-style settings
+# - "wide" teacher: even larger local teacher
+#
+# You can adjust these later, but this is a good first pool. 
+# We may have to track things like overfitting for the larger mdoels later
+
+option3_teacher_pool = [
+    {"name": "t1_light",     "num_of_filters": 28, "kernel_size": 4,  "drop_out": 0.2},
+    {"name": "t2_medium",    "num_of_filters": 36, "kernel_size": 6,  "drop_out": 0.2},
+    {"name": "t3_caml_ref",  "num_of_filters": 50, "kernel_size": 10, "drop_out": 0.2},  # Mullenbach
+    {"name": "t4_large",     "num_of_filters": 64, "kernel_size": 10, "drop_out": 0.2},
+    {"name": "t5_xlarge",    "num_of_filters": 80, "kernel_size": 12, "drop_out": 0.2},
+]
+
 # KD configuration defaults (can be adjusted later)
 
 kd_config = {
-    "kd_alpha": 0.5,          # weight on supervised loss
-    "kd_temperature": 2.0,    # temperature for KD
-    "teacher_filters": 32,    # larger local teacher for Option 3
-    "teacher_window_size": 6
+    "kd_alpha": 0.5,             # weight on supervised loss
+    "kd_temperature": 2.0,       # temperature for KD
+
+    # Option 3 teacher-pool config
+    "teacher_pool": option3_teacher_pool,
+    "teacher_assignment": "round_robin",
+    "teacher_steps_per_batch": 1,
+
+    # Server distillation config
+    "server_distill_steps": 10,   # number of server KD refinement steps after aggregation
+    "server_distill_lr": 0.002,   # optimizer LR for server KD phase
 }
 
 # %% [markdown]
@@ -1147,6 +1173,99 @@ def multilabel_kd_loss(student_logits, teacher_logits, temperature: float = 2.0)
     )
 
     return kd * (T * T)
+
+# %%
+# Helpers for FedDKD
+
+# Helper to rebuild client models from uploaded state dicts
+def build_student_model_from_state(
+    state_dict: dict,
+    table_path: str,
+    config: dict,
+    device: str = "cpu"
+):
+    """
+    Rebuild a student/global-compatible model from a state_dict.
+    Used so the server can treat returned client students/models as teachers
+    during the server distillation phase.
+    """
+    model = GenerateModel(
+        table_path,
+        num_of_filters=config["n_filters"],
+        kernel_size=config["window_size"]
+    ).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
+# Multi-label server distillation engine
+def execute_server_distillation(
+    global_model: nn.Module,
+    client_teacher_models: list[nn.Module],
+    client_loaders: list[DataLoader],
+    client_sizes: list[int],
+    kd_temperature: float = 2.0,
+    distill_steps: int = 10,
+    distill_lr: float = 0.002,
+    device: str = "cpu"
+):
+    """
+    Post-aggregation server distillation phase.
+
+    Procedure:
+    1. Global model is already initialized from weighted FedAvg.
+    2. Each returned client model/student acts as a teacher.
+    3. For each server KD step, the server pulls one batch from each client's loader.
+    4. The global model is optimized to match each teacher on that client's batch.
+
+    Important:
+    - This mirrors the toy notebook's pattern and is NOT privacy-clean for deployment.
+    - For stricter settings, replace client_loaders with a proxy/public distillation loader.
+    """
+    global_model.train()
+    optimizer = torch.optim.Adam(global_model.parameters(), lr=distill_lr, betas=(0.9, 0.99))
+
+    total_size = float(sum(client_sizes))
+    client_weights = [sz / total_size for sz in client_sizes]
+
+    client_iters = [iter(loader) for loader in client_loaders]
+
+    for teacher in client_teacher_models:
+        teacher.eval()
+
+    for _ in range(distill_steps):
+        optimizer.zero_grad()
+        total_loss = 0.0
+
+        for cid, teacher in enumerate(client_teacher_models):
+            try:
+                X_batch, _ = next(client_iters[cid])
+            except StopIteration:
+                client_iters[cid] = iter(client_loaders[cid])
+                X_batch, _ = next(client_iters[cid])
+
+            X_batch = X_batch.to(device)
+
+            with torch.no_grad():
+                teacher_logits, _ = teacher(X_batch)
+
+            student_logits, _ = global_model(X_batch)
+
+            kd_loss = multilabel_kd_loss(
+                student_logits,
+                teacher_logits,
+                temperature=kd_temperature
+            )
+
+            weighted_loss = client_weights[cid] * kd_loss
+            weighted_loss.backward()
+            total_loss += weighted_loss.item()
+
+        optimizer.step()
+
+    return global_model
 
 # %% [markdown]
 # ### Proximal Regularization Helper
@@ -1245,33 +1364,71 @@ def client_update_option1(
     return last_loss, student.state_dict()
 
 # %% [markdown]
-# ### Option 3 — Local Heterogeneous Teacher → Global Student
+# ### Option 3 — Local Heterogeneous Teacher Pool -> Global Student
 # 
-# Teacher: persistent local client model  
+# Teacher: persistent local client model drawn from a heterogeneous CAML-style teacher pool  
 # Student: shared global model copied locally each round
 # 
-# For now, heterogeneity is implemented as a **larger local teacher** from the same model family.
+# Instead of assigning every client the same larger teacher, we assign each client
+# a persistent teacher profile from a pool of five ConvAttnPool variants. The pool
+# is centered around a CAML reference configuration inspired by Mullenbach et al.,
+# with both smaller and larger capacity variants included.
+# 
+# This keeps the student architecture homogeneous for aggregation while making the
+# local teachers more meaningfully heterogeneous in capacity and receptive field.
 
 # %%
+def build_teacher_from_profile(table_path: str, profile: dict) -> ConvAttnPool:
+    """
+    Build a local Option 3 teacher from a teacher profile dictionary.
+    """
+    return ConvAttnPool(
+        table_path=table_path,
+        label_space=50,
+        num_of_filters=profile["num_of_filters"],
+        kernel_size=profile["kernel_size"],
+        drop_out=profile.get("drop_out", 0.2)
+    )
+
 def initialize_option3_teachers(
     num_clients: int,
     table_path: str,
-    teacher_filters: int = 32,
-    teacher_window_size: int = 6,
+    teacher_pool: list[dict],
+    assignment: str = "round_robin",
+    seed: int = 42,
     device: str = "cpu"
 ):
     """
-    Create one persistent local teacher per client.
+    Create one persistent local teacher per client from a heterogeneous teacher pool.
+
+    Returns:
+        teachers: list of nn.Module
+        teacher_profiles: list of dicts describing the assigned profile for each client
     """
+    if len(teacher_pool) == 0:
+        raise ValueError("teacher_pool must contain at least one teacher profile")
+
+    rng = np.random.default_rng(seed)
+
+    if assignment == "round_robin":
+        teacher_profiles = [
+            copy.deepcopy(teacher_pool[i % len(teacher_pool)])
+            for i in range(num_clients)
+        ]
+    elif assignment == "random":
+        teacher_profiles = [
+            copy.deepcopy(teacher_pool[rng.integers(0, len(teacher_pool))])
+            for _ in range(num_clients)
+        ]
+    else:
+        raise ValueError("assignment must be 'round_robin' or 'random'")
+
     teachers = []
-    for _ in range(num_clients):
-        teacher = GenerateModel(
-            table_path=table_path,
-            num_of_filters=teacher_filters,
-            kernel_size=teacher_window_size
-        ).to(device)
+    for profile in teacher_profiles:
+        teacher = build_teacher_from_profile(table_path, profile).to(device)
         teachers.append(teacher)
-    return teachers
+
+    return teachers, teacher_profiles
 
 # %%
 def client_update_option3(
@@ -1286,7 +1443,8 @@ def client_update_option3(
     kd_alpha: float = 0.5,
     kd_temperature: float = 2.0,
     use_fedprox: bool = False,
-    mu: float = 0.01
+    mu: float = 0.01,
+    teacher_steps_per_batch: int = 1
 ):
     """
     Option 3:
@@ -1295,6 +1453,10 @@ def client_update_option3(
     - student trains on supervised + KD from teacher
     - only student weights are uploaded
     - optional FedProx penalty is applied to the student only
+
+    teacher_steps_per_batch:
+        number of teacher optimization steps before one student update.
+        keep at 1 initially.
     """
     student = copy.deepcopy(global_student).to(device)
     teacher = local_teacher.to(device)
@@ -1320,16 +1482,18 @@ def client_update_option3(
     teacher_opt = torch.optim.Adam(teacher.parameters(), lr=lr, betas=(0.9, 0.99))
 
     last_loss = 0.0
+
     for _ in range(epochs):
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
 
             # ---- Teacher update on hard labels ----
-            teacher_opt.zero_grad()
-            teacher_logits, _ = teacher(X_batch)
-            teacher_loss = sup_loss_fn(teacher_logits, y_batch)
-            teacher_loss.backward()
-            teacher_opt.step()
+            for _ts in range(teacher_steps_per_batch):
+                teacher_opt.zero_grad()
+                teacher_logits, _ = teacher(X_batch)
+                teacher_loss = sup_loss_fn(teacher_logits, y_batch)
+                teacher_loss.backward()
+                teacher_opt.step()
 
             # ---- Student update on hard labels + teacher KD ----
             student_opt.zero_grad()
@@ -1382,6 +1546,7 @@ def run_fl_kd_once(
     method: str = "baseline",    # "baseline", "option1", "option3"
     base_algo: str = "FedAvg",   # "FedAvg" or "FedProx"
     mu: float = 0.01,
+    server_distill: bool = False,
     # non-IID params
     size_alpha: float = 0.5,
     labels_per_client: int = 10,
@@ -1419,12 +1584,14 @@ def run_fl_kd_once(
 
     # --- persistent teachers for Option 3 ---
     local_teachers = None
+    teacher_profiles = None
     if method == "option3":
-        local_teachers = initialize_option3_teachers(
+        local_teachers, teacher_profiles = initialize_option3_teachers(
             num_clients=num_clients,
             table_path=model_param_path,
-            teacher_filters=kd_config["teacher_filters"],
-            teacher_window_size=kd_config["teacher_window_size"],
+            teacher_pool=kd_config["teacher_pool"],
+            assignment=kd_config.get("teacher_assignment", "round_robin"),
+            seed=seed,
             device=device
         )
 
@@ -1432,9 +1599,13 @@ def run_fl_kd_once(
     for rnd in tqdm(
         range(config["rounds"]),
         colour="blue",
-        desc=f"{method} | {base_algo} | {split_mode} | K={num_clients} | E={local_epochs}"
+        desc=(
+            f"{method} | {base_algo}"
+            f"{' + SD' if server_distill else ''} | {split_mode} | K={num_clients} | E={local_epochs}"
+        )
     ):
         client_params = []
+        client_teacher_models = []
 
         for cid, loader in enumerate(client_loaders):
             if method == "baseline":
@@ -1456,6 +1627,15 @@ def run_fl_kd_once(
                 )
                 client_params.append(client_state)
 
+                if server_distill:
+                    teacher_model = build_student_model_from_state(
+                        state_dict=client_state,
+                        table_path=model_param_path,
+                        config=config,
+                        device=device
+                    )
+                    client_teacher_models.append(teacher_model)
+
             elif method == "option1":
                 _, client_state = client_update_option1(
                     global_model=global_model,
@@ -1472,6 +1652,15 @@ def run_fl_kd_once(
                 )
                 client_params.append(client_state)
 
+                if server_distill:
+                    teacher_model = build_student_model_from_state(
+                        state_dict=client_state,
+                        table_path=model_param_path,
+                        config=config,
+                        device=device
+                    )
+                    client_teacher_models.append(teacher_model)
+
             elif method == "option3":
                 _, client_state, updated_teacher = client_update_option3(
                     global_student=global_model,
@@ -1485,23 +1674,54 @@ def run_fl_kd_once(
                     kd_alpha=kd_config["kd_alpha"],
                     kd_temperature=kd_config["kd_temperature"],
                     use_fedprox=(base_algo == "FedProx"),
-                    mu=mu
+                    mu=mu,
+                    teacher_steps_per_batch=kd_config.get("teacher_steps_per_batch", 1)
                 )
                 local_teachers[cid] = updated_teacher
                 client_params.append(client_state)
 
+                if server_distill:
+                    teacher_model = build_student_model_from_state(
+                        state_dict=client_state,
+                        table_path=model_param_path,
+                        config=config,
+                        device=device
+                    )
+                    client_teacher_models.append(teacher_model)
+
             else:
                 raise ValueError("method must be one of: baseline, option1, option3")
 
-        # aggregate uploaded students / models
+        # --- first do standard weighted aggregation ---
         new_params = FedAvg_weighted(client_params, client_sizes)
         global_model.load_state_dict(new_params)
+
+        # --- optional server distillation refinement ---
+        if server_distill:
+            global_model = execute_server_distillation(
+                global_model=global_model,
+                client_teacher_models=client_teacher_models,
+                client_loaders=client_loaders,
+                client_sizes=client_sizes,
+                kd_temperature=kd_config["kd_temperature"],
+                distill_steps=kd_config.get("server_distill_steps", 10),
+                distill_lr=kd_config.get("server_distill_lr", config["lr"]),
+                device=device
+            )
 
     # --- eval ---
     _, per_label_thr = find_best_thresholds_per_label(global_model, val_loader, device)
     _, metrics = eval_model(global_model, device, test_loader, per_label_thr=per_label_thr)
 
     elapsed = time.time() - start_time
+
+    # optional logging fields for bookkeeping
+    metrics["server_distill"] = bool(server_distill)
+    metrics["method"] = method
+    metrics["base_algo"] = base_algo
+    if method == "option3" and teacher_profiles is not None:
+        metrics["teacher_profiles"] = [tp["name"] for tp in teacher_profiles]
+
     return metrics, elapsed
 
 # %% [markdown]
@@ -1513,9 +1733,13 @@ def run_fl_kd_once(
 # - Baseline FedAvg
 # - Baseline FedProx (mu = 0.01)
 # - Option 1 + FedAvg
+# - Option 1 + FedAvg + Server Distillation
 # - Option 1 + FedProx (mu = 0.01)
+# - Option 1 + FedProx + Server Distillation
 # - Option 3 + FedAvg
+# - Option 3 + FedAvg + Server Distillation
 # - Option 3 + FedProx (mu = 0.01)
+# - Option 3 + FedProx + Server Distillation
 # 
 # Setup:
 # - non-IID split
@@ -1592,81 +1816,366 @@ smoke_kwargs = dict(
 )
 
 # %%
-# 1) Baseline FedAvg
+# # 1) Baseline FedAvg
 
-smoke_metrics_baseline_fedavg, smoke_time_baseline_fedavg = run_fl_kd_once(
-    method="baseline",
-    base_algo="FedAvg",
-    **smoke_kwargs
-)
+# smoke_metrics_baseline_fedavg, smoke_time_baseline_fedavg = run_fl_kd_once(
+#     method="baseline",
+#     base_algo="FedAvg",
+#     server_distill=False,
+#     **smoke_kwargs
+# )
 
-print_metrics("Baseline FedAvg", smoke_metrics_baseline_fedavg, smoke_time_baseline_fedavg)
-
-# %%
-# 2) Baseline FedProx
-
-smoke_metrics_baseline_fedprox, smoke_time_baseline_fedprox = run_fl_kd_once(
-    method="baseline",
-    base_algo="FedProx",
-    **smoke_kwargs
-)
-
-print_metrics("Baseline FedProx (mu=0.01)", smoke_metrics_baseline_fedprox, smoke_time_baseline_fedprox)
+# print_metrics("Baseline FedAvg", smoke_metrics_baseline_fedavg, smoke_time_baseline_fedavg)
 
 # %%
-# 3) Option 1 + FedAvg
+# # 2) Baseline FedProx
 
-smoke_metrics_opt1_fedavg, smoke_time_opt1_fedavg = run_fl_kd_once(
-    method="option1",
-    base_algo="FedAvg",
-    **smoke_kwargs
-)
+# smoke_metrics_baseline_fedprox, smoke_time_baseline_fedprox = run_fl_kd_once(
+#     method="baseline",
+#     base_algo="FedProx",
+#     server_distill=False,
+#     **smoke_kwargs
+# )
 
-print_metrics("Option 1 + FedAvg", smoke_metrics_opt1_fedavg, smoke_time_opt1_fedavg)
-
-# %%
-# 4) Option 1 + FedProx
-
-smoke_metrics_opt1_fedprox, smoke_time_opt1_fedprox = run_fl_kd_once(
-    method="option1",
-    base_algo="FedProx",
-    **smoke_kwargs
-)
-
-print_metrics("Option 1 + FedProx (mu=0.01)", smoke_metrics_opt1_fedprox, smoke_time_opt1_fedprox)
+# print_metrics("Baseline FedProx (mu=0.01)", smoke_metrics_baseline_fedprox, smoke_time_baseline_fedprox)
 
 # %%
-# 5) Option 3 + FedAvg
+# # 3) Option 1 + FedAvg
 
-smoke_metrics_opt3_fedavg, smoke_time_opt3_fedavg = run_fl_kd_once(
-    method="option3",
-    base_algo="FedAvg",
-    **smoke_kwargs
-)
+# smoke_metrics_opt1_fedavg, smoke_time_opt1_fedavg = run_fl_kd_once(
+#     method="option1",
+#     base_algo="FedAvg",
+#     server_distill=False,
+#     **smoke_kwargs
+# )
 
-print_metrics("Option 3 + FedAvg", smoke_metrics_opt3_fedavg, smoke_time_opt3_fedavg)
-
-# %%
-# 6) Option 3 + FedProx
-
-smoke_metrics_opt3_fedprox, smoke_time_opt3_fedprox = run_fl_kd_once(
-    method="option3",
-    base_algo="FedProx",
-    **smoke_kwargs
-)
-
-print_metrics("Option 3 + FedProx (mu=0.01)", smoke_metrics_opt3_fedprox, smoke_time_opt3_fedprox)
+# print_metrics("Option 1 + FedAvg", smoke_metrics_opt1_fedavg, smoke_time_opt1_fedavg)
 
 # %%
-# Combined comparison table
+# # 4) Option 1 + FedAvg + FedDKD
 
-smoke_df = compare_methods({
-    "Baseline_FedAvg": (smoke_metrics_baseline_fedavg, smoke_time_baseline_fedavg),
-    "Baseline_FedProx_mu0.01": (smoke_metrics_baseline_fedprox, smoke_time_baseline_fedprox),
-    "Opt1_FedAvg": (smoke_metrics_opt1_fedavg, smoke_time_opt1_fedavg),
-    "Opt1_FedProx_mu0.01": (smoke_metrics_opt1_fedprox, smoke_time_opt1_fedprox),
-    "Opt3_FedAvg": (smoke_metrics_opt3_fedavg, smoke_time_opt3_fedavg),
-    "Opt3_FedProx_mu0.01": (smoke_metrics_opt3_fedprox, smoke_time_opt3_fedprox),
-})
+# smoke_metrics_opt1_fedavg_sd, smoke_time_opt1_fedavg_sd = run_fl_kd_once(
+#     method="option1",
+#     base_algo="FedAvg",
+#     server_distill=True,
+#     **smoke_kwargs
+# )
+
+# print_metrics("Option 1 + FedAvg + Server Distill", smoke_metrics_opt1_fedavg_sd, smoke_time_opt1_fedavg_sd)
+
+# %%
+# # 5) Option 1 + FedProx
+
+# smoke_metrics_opt1_fedprox, smoke_time_opt1_fedprox = run_fl_kd_once(
+#     method="option1",
+#     base_algo="FedProx",
+#     server_distill=False,
+#     **smoke_kwargs
+# )
+
+# print_metrics("Option 1 + FedProx (mu=0.01)", smoke_metrics_opt1_fedprox, smoke_time_opt1_fedprox)
+
+# %%
+# # 6) Option 1 + FedProx + FedDKD
+
+# smoke_metrics_opt1_fedprox_sd, smoke_time_opt1_fedprox_sd = run_fl_kd_once(
+#     method="option1",
+#     base_algo="FedProx",
+#     server_distill=True,
+#     **smoke_kwargs
+# )
+
+# print_metrics("Option 1 + FedProx + Server Distill (mu=0.01)", smoke_metrics_opt1_fedprox_sd, smoke_time_opt1_fedprox_sd)
+
+# %%
+# # 7) Option 3 + FedAvg
+
+# smoke_metrics_opt3_fedavg, smoke_time_opt3_fedavg = run_fl_kd_once(
+#     method="option3",
+#     base_algo="FedAvg",
+#     server_distill=False,
+#     **smoke_kwargs
+# )
+
+# print_metrics("Option 3 + FedAvg", smoke_metrics_opt3_fedavg, smoke_time_opt3_fedavg)
+
+# %%
+# # 8) Option 3 + FedAvg + FedDKD
+
+# smoke_metrics_opt3_fedavg_sd, smoke_time_opt3_fedavg_sd = run_fl_kd_once(
+#     method="option3",
+#     base_algo="FedAvg",
+#     server_distill=True,
+#     **smoke_kwargs
+# )
+
+# print_metrics("Option 3 + FedAvg + Server Distill", smoke_metrics_opt3_fedavg_sd, smoke_time_opt3_fedavg_sd)
+
+# %%
+# # 9) Option 3 + FedProx
+
+# smoke_metrics_opt3_fedprox, smoke_time_opt3_fedprox = run_fl_kd_once(
+#     method="option3",
+#     base_algo="FedProx",
+#     server_distill=False,
+#     **smoke_kwargs
+# )
+
+# print_metrics("Option 3 + FedProx (mu=0.01)", smoke_metrics_opt3_fedprox, smoke_time_opt3_fedprox)
+
+# %%
+# # 10) Option 3 + FedProx + FedDKD
+
+# smoke_metrics_opt3_fedprox_sd, smoke_time_opt3_fedprox_sd = run_fl_kd_once(
+#     method="option3",
+#     base_algo="FedProx",
+#     server_distill=True,
+#     **smoke_kwargs
+# )
+
+# print_metrics("Option 3 + FedProx + Server Distill (mu=0.01)", smoke_metrics_opt3_fedprox_sd, smoke_time_opt3_fedprox_sd)
+
+# %%
+# # Combined comparison table
+
+# smoke_df = compare_methods({
+#     "Baseline_FedAvg": (smoke_metrics_baseline_fedavg, smoke_time_baseline_fedavg),
+#     "Baseline_FedProx_mu0.01": (smoke_metrics_baseline_fedprox, smoke_time_baseline_fedprox),
+
+#     "Opt1_FedAvg": (smoke_metrics_opt1_fedavg, smoke_time_opt1_fedavg),
+#     "Opt1_FedAvg_SD": (smoke_metrics_opt1_fedavg_sd, smoke_time_opt1_fedavg_sd),
+#     "Opt1_FedProx_mu0.01": (smoke_metrics_opt1_fedprox, smoke_time_opt1_fedprox),
+#     "Opt1_FedProx_mu0.01_SD": (smoke_metrics_opt1_fedprox_sd, smoke_time_opt1_fedprox_sd),
+
+#     "Opt3_FedAvg": (smoke_metrics_opt3_fedavg, smoke_time_opt3_fedavg),
+#     "Opt3_FedAvg_SD": (smoke_metrics_opt3_fedavg_sd, smoke_time_opt3_fedavg_sd),
+#     "Opt3_FedProx_mu0.01": (smoke_metrics_opt3_fedprox, smoke_time_opt3_fedprox),
+#     "Opt3_FedProx_mu0.01_SD": (smoke_metrics_opt3_fedprox_sd, smoke_time_opt3_fedprox_sd),
+# })
+
+# %% [markdown]
+# ### Actual Client Sweep for KD
+
+# %%
+# This section runs the full experiment matrix across client counts and split types.
+# Results are saved incrementally to CSV and can be plotted afterward.
+
+client_counts = [2, 3, 5, 8, 10]
+
+sweep_config = config.copy()
+sweep_config["rounds"] = 10   # keep or change as needed
+
+noniid_params = dict(
+    size_alpha=0.5,
+    labels_per_client=10,
+    bias_strength=0.85
+)
+
+KD_METHODS = [
+    dict(method_name="Baseline_FedAvg",            method="baseline", base_algo="FedAvg",  mu=0.0,  server_distill=False),
+    dict(method_name="Baseline_FedProx_mu0.01",    method="baseline", base_algo="FedProx", mu=0.01, server_distill=False),
+
+    dict(method_name="Opt1_FedAvg",                method="option1",  base_algo="FedAvg",  mu=0.0,  server_distill=False),
+    dict(method_name="Opt1_FedAvg_SD",             method="option1",  base_algo="FedAvg",  mu=0.0,  server_distill=True),
+    dict(method_name="Opt1_FedProx_mu0.01",        method="option1",  base_algo="FedProx", mu=0.01, server_distill=False),
+    dict(method_name="Opt1_FedProx_mu0.01_SD",     method="option1",  base_algo="FedProx", mu=0.01, server_distill=True),
+
+    dict(method_name="Opt3_FedAvg",                method="option3",  base_algo="FedAvg",  mu=0.0,  server_distill=False),
+    dict(method_name="Opt3_FedAvg_SD",             method="option3",  base_algo="FedAvg",  mu=0.0,  server_distill=True),
+    dict(method_name="Opt3_FedProx_mu0.01",        method="option3",  base_algo="FedProx", mu=0.01, server_distill=False),
+    dict(method_name="Opt3_FedProx_mu0.01_SD",     method="option3",  base_algo="FedProx", mu=0.01, server_distill=True),
+]
+
+out_path = "../History/kd_client_sweep_results_r10_e1.csv"
+
+# %%
+# %%
+# Sweep runner with resume / skip-completed support
+
+if os.path.exists(out_path):
+    kd_sweep_df_existing = pd.read_csv(out_path)
+    all_rows = kd_sweep_df_existing.to_dict(orient="records")
+    completed_keys = set(
+        zip(
+            kd_sweep_df_existing["split"],
+            kd_sweep_df_existing["method_name"],
+            kd_sweep_df_existing["clients"]
+        )
+    )
+    print(f"Found existing results at {out_path}")
+    print(f"Loaded {len(kd_sweep_df_existing)} completed rows.")
+else:
+    all_rows = []
+    completed_keys = set()
+    print("No existing results found. Starting fresh.")
+
+for split_mode in ["iid", "noniid"]:
+    for m in KD_METHODS:
+        for k in client_counts:
+            run_key = (split_mode, m["method_name"], k)
+
+            if run_key in completed_keys:
+                print(f"Skipping completed run: {split_mode} | {m['method_name']} | K={k}")
+                continue
+
+            print(f"\n=== {split_mode.upper()} | {m['method_name']} | K={k} ===")
+
+            try:
+                metrics, elapsed = run_fl_kd_once(
+                    split_mode=split_mode,
+                    num_clients=k,
+                    local_epochs=1,   # or 3 if you want the heavier final setting
+                    config=sweep_config,
+                    kd_config=kd_config,
+                    train_dataset=train_dataset,
+                    val_loader=val_loader,
+                    test_loader=test_loader,
+                    device=device,
+                    seed=42,
+                    method=m["method"],
+                    base_algo=m["base_algo"],
+                    mu=m["mu"],
+                    server_distill=m["server_distill"],
+                    **(noniid_params if split_mode == "noniid" else {})
+                )
+
+                row = {
+                    "split": split_mode,
+                    "clients": k,
+
+                    "method_name": m["method_name"],
+                    "method": m["method"],
+                    "base_algo": m["base_algo"],
+                    "mu": m["mu"],
+                    "server_distill": m["server_distill"],
+
+                    "local_epochs": 1,
+                    "rounds": sweep_config["rounds"],
+
+                    "kd_alpha": kd_config["kd_alpha"],
+                    "kd_temperature": kd_config["kd_temperature"],
+                    "server_distill_steps": kd_config.get("server_distill_steps", None),
+                    "server_distill_lr": kd_config.get("server_distill_lr", None),
+
+                    "f1_macro": metrics.get("f1_macro"),
+                    "f1_micro": metrics.get("f1_micro"),
+                    "pr_auc_macro": metrics.get("pr_auc_macro"),
+                    "pr_auc_micro": metrics.get("pr_auc_micro"),
+                    "auc_macro": metrics.get("auc_macro"),
+                    "auc_micro": metrics.get("auc_micro"),
+                    "best_f1_micro": metrics.get("best_f1_micro"),
+                    "best_thr": metrics.get("best_thr"),
+
+                    "time_sec": elapsed,
+                }
+
+                if split_mode == "noniid":
+                    row.update(noniid_params)
+
+                all_rows.append(row)
+                completed_keys.add(run_key)
+
+                pd.DataFrame(all_rows).to_csv(out_path, index=False)
+                print(f"Saved result to {out_path}")
+
+            except Exception as e:
+                print(f"FAILED: {split_mode} | {m['method_name']} | K={k}")
+                print(f"Reason: {e}")
+
+print(f"\nSweep finished. Results saved to: {out_path}")
+
+kd_sweep_df = pd.DataFrame(all_rows)
+display(kd_sweep_df.head())
+
+# %%
+# Reload saved CSV later if needed
+
+kd_sweep_df = pd.read_csv(out_path)
+print("Loaded:", out_path, "rows=", len(kd_sweep_df))
+display(kd_sweep_df.head())
+
+# %%
+# Best-performing rows by split (summary table)
+summary_cols = [
+    "split", "clients", "method_name",
+    "f1_macro", "f1_micro",
+    "pr_auc_macro", "pr_auc_micro",
+    "auc_macro", "auc_micro",
+    "time_sec"
+]
+
+summary_table = kd_sweep_df[summary_cols].copy()
+display(summary_table)
+
+# %%
+# Pivot table for Macro F1
+
+pivot_f1 = kd_sweep_df.pivot_table(
+    index=["split", "clients"],
+    columns="method_name",
+    values="f1_macro"
+)
+
+display(pivot_f1)
+
+# %%
+# General plotting helper
+
+MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">"]
+LINESTYLES = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 5)), (0, (1, 1))]
+
+def plot_metric_all_methods(df, split_mode: str, metric: str = "f1_macro", bw: bool = False):
+    d = df[df["split"] == split_mode].copy()
+    methods = sorted(d["method_name"].unique())
+
+    plt.figure(figsize=(11, 5))
+    style_pairs = list(itertools.product(MARKERS, LINESTYLES))
+
+    for i, method in enumerate(methods):
+        g = d[d["method_name"] == method].sort_values("clients")
+        marker, ls = style_pairs[i % len(style_pairs)]
+
+        if bw:
+            plt.plot(
+                g["clients"], g[metric],
+                color="black",
+                linestyle=ls,
+                marker=marker,
+                markersize=6,
+                linewidth=2,
+                label=method
+            )
+        else:
+            plt.plot(
+                g["clients"], g[metric],
+                linestyle=ls,
+                marker=marker,
+                markersize=6,
+                linewidth=2,
+                label=method
+            )
+
+    plt.xlabel("Number of Clients")
+    plt.ylabel(metric.replace("_", " ").title())
+    plt.title(f"{metric.replace('_', ' ').title()} vs Number of Clients ({split_mode.upper()})")
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=8, ncols=2, frameon=True)
+    plt.tight_layout()
+    plt.show()
+
+# %%
+# Plot Macro F1 and PR-AUC Macro
+
+plot_metric_all_methods(kd_sweep_df, split_mode="iid", metric="f1_macro", bw=False)
+plot_metric_all_methods(kd_sweep_df, split_mode="noniid", metric="f1_macro", bw=False)
+
+plot_metric_all_methods(kd_sweep_df, split_mode="iid", metric="pr_auc_macro", bw=False)
+plot_metric_all_methods(kd_sweep_df, split_mode="noniid", metric="pr_auc_macro", bw=False)
+
+# %%
+# Black-and-white versions for paper drafting
+
+plot_metric_all_methods(kd_sweep_df, split_mode="iid", metric="f1_macro", bw=True)
+plot_metric_all_methods(kd_sweep_df, split_mode="noniid", metric="f1_macro", bw=True)
 
 
