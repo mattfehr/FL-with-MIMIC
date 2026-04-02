@@ -65,6 +65,15 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 
+# %%
+# Base output directory for this notebook
+KD_HISTORY_DIR = os.path.join("..", "History", "KD")
+
+# Create directory if it doesn't exist
+os.makedirs(KD_HISTORY_DIR, exist_ok=True)
+
+print(f"Saving KD results to: {KD_HISTORY_DIR}")
+
 # %% [markdown]
 # ## Data Loading and JSON Utilities
 # 
@@ -287,9 +296,9 @@ def FedAvg(global_model: dict, client_state_dicts: list[dict]) -> dict:
 
 def FedProx(global_model_dict, client_state_dicts, mu=0.01):
     """
-    FedProx aggregation (same averaging as FedAvg, 
+    FedProx aggregation (same averaging as FedAvg,
     since proximal regularization happens in local training).
-    
+
     Args:
         global_model_dict (dict): Global model parameters.
         client_state_dicts (list[dict]): List of client parameter dicts.
@@ -303,7 +312,7 @@ def Scaffold(global_model_dict, client_state_dicts, c_global, c_clients, lr, num
     """
     SCAFFOLD server update rule:
         w_{t+1} = w_t + (1/K) * Σ [Δw_k - lr * (c_k - c)]
-    
+
     Args:
         global_model_dict: current global weights (dict of tensors)
         client_state_dicts: list of client state_dicts after local updates
@@ -311,7 +320,7 @@ def Scaffold(global_model_dict, client_state_dicts, c_global, c_clients, lr, num
         c_clients: list of local control variate dicts
         lr: learning rate
         num_clients: number of clients participating this round
-    
+
     Returns:
         Updated (global_model_dict, c_global, c_clients)
     """
@@ -483,7 +492,7 @@ config = {
     "window_size": 6,
     "epochs": 3,             # default (overridden per experiment)
     "rounds": 10,            # communication rounds per experiment
-    "use_focal": False,      
+    "use_focal": False,
     "gamma": 2.5,            # focal loss focusing parameter
     "mu": 0.01,              # FedProx proximal term coefficient
     "algorithm": "FedAvg"    # will be updated in loop to FedAvg, FedProx, or SCAFFOLD
@@ -512,7 +521,7 @@ test_loader = load_data("test")
 @torch.no_grad()
 def find_best_threshold(model: nn.Module, data_loader: DataLoader, device: torch.device):
     """
-    Sweeps multiple thresholds on the validation set to find the one 
+    Sweeps multiple thresholds on the validation set to find the one
     that maximizes F1_micro.
 
     Returns:
@@ -1102,7 +1111,7 @@ def run_fl_sensitivity_once(
 # - "mullenbach" teacher: closer to stronger CAML-style settings
 # - "wide" teacher: even larger local teacher
 #
-# You can adjust these later, but this is a good first pool. 
+# You can adjust these later, but this is a good first pool.
 # We may have to track things like overfitting for the larger mdoels later
 
 option3_teacher_pool = [
@@ -1954,7 +1963,7 @@ smoke_kwargs = dict(
 # })
 
 # %% [markdown]
-# ### Actual Client Sweep for KD
+# ## Actual Client Sweep for KD
 
 # %%
 # This section runs the full experiment matrix across client counts and split types.
@@ -1986,106 +1995,106 @@ KD_METHODS = [
     dict(method_name="Opt3_FedProx_mu0.01_SD",     method="option3",  base_algo="FedProx", mu=0.01, server_distill=True),
 ]
 
-out_path = "../History/kd_client_sweep_results_r10_e1.csv"
+# out_path = "../History/kd_client_sweep_results_r10_e1.csv"
+out_path = os.path.join(KD_HISTORY_DIR, "kd_client_sweep_results_r10_e1.csv")
 
 # %%
-# %%
-# Sweep runner with resume / skip-completed support
+# # Sweep runner with resume / skip-completed support
 
-if os.path.exists(out_path):
-    kd_sweep_df_existing = pd.read_csv(out_path)
-    all_rows = kd_sweep_df_existing.to_dict(orient="records")
-    completed_keys = set(
-        zip(
-            kd_sweep_df_existing["split"],
-            kd_sweep_df_existing["method_name"],
-            kd_sweep_df_existing["clients"]
-        )
-    )
-    print(f"Found existing results at {out_path}")
-    print(f"Loaded {len(kd_sweep_df_existing)} completed rows.")
-else:
-    all_rows = []
-    completed_keys = set()
-    print("No existing results found. Starting fresh.")
+# if os.path.exists(out_path):
+#     kd_sweep_df_existing = pd.read_csv(out_path)
+#     all_rows = kd_sweep_df_existing.to_dict(orient="records")
+#     completed_keys = set(
+#         zip(
+#             kd_sweep_df_existing["split"],
+#             kd_sweep_df_existing["method_name"],
+#             kd_sweep_df_existing["clients"]
+#         )
+#     )
+#     print(f"Found existing results at {out_path}")
+#     print(f"Loaded {len(kd_sweep_df_existing)} completed rows.")
+# else:
+#     all_rows = []
+#     completed_keys = set()
+#     print("No existing results found. Starting fresh.")
 
-for split_mode in ["iid", "noniid"]:
-    for m in KD_METHODS:
-        for k in client_counts:
-            run_key = (split_mode, m["method_name"], k)
+# for split_mode in ["iid", "noniid"]:
+#     for m in KD_METHODS:
+#         for k in client_counts:
+#             run_key = (split_mode, m["method_name"], k)
 
-            if run_key in completed_keys:
-                print(f"Skipping completed run: {split_mode} | {m['method_name']} | K={k}")
-                continue
+#             if run_key in completed_keys:
+#                 print(f"Skipping completed run: {split_mode} | {m['method_name']} | K={k}")
+#                 continue
 
-            print(f"\n=== {split_mode.upper()} | {m['method_name']} | K={k} ===")
+#             print(f"\n=== {split_mode.upper()} | {m['method_name']} | K={k} ===")
 
-            try:
-                metrics, elapsed = run_fl_kd_once(
-                    split_mode=split_mode,
-                    num_clients=k,
-                    local_epochs=1,   # or 3 if you want the heavier final setting
-                    config=sweep_config,
-                    kd_config=kd_config,
-                    train_dataset=train_dataset,
-                    val_loader=val_loader,
-                    test_loader=test_loader,
-                    device=device,
-                    seed=42,
-                    method=m["method"],
-                    base_algo=m["base_algo"],
-                    mu=m["mu"],
-                    server_distill=m["server_distill"],
-                    **(noniid_params if split_mode == "noniid" else {})
-                )
+#             try:
+#                 metrics, elapsed = run_fl_kd_once(
+#                     split_mode=split_mode,
+#                     num_clients=k,
+#                     local_epochs=1,   # or 3 if you want the heavier final setting
+#                     config=sweep_config,
+#                     kd_config=kd_config,
+#                     train_dataset=train_dataset,
+#                     val_loader=val_loader,
+#                     test_loader=test_loader,
+#                     device=device,
+#                     seed=42,
+#                     method=m["method"],
+#                     base_algo=m["base_algo"],
+#                     mu=m["mu"],
+#                     server_distill=m["server_distill"],
+#                     **(noniid_params if split_mode == "noniid" else {})
+#                 )
 
-                row = {
-                    "split": split_mode,
-                    "clients": k,
+#                 row = {
+#                     "split": split_mode,
+#                     "clients": k,
 
-                    "method_name": m["method_name"],
-                    "method": m["method"],
-                    "base_algo": m["base_algo"],
-                    "mu": m["mu"],
-                    "server_distill": m["server_distill"],
+#                     "method_name": m["method_name"],
+#                     "method": m["method"],
+#                     "base_algo": m["base_algo"],
+#                     "mu": m["mu"],
+#                     "server_distill": m["server_distill"],
 
-                    "local_epochs": 1,
-                    "rounds": sweep_config["rounds"],
+#                     "local_epochs": 1,
+#                     "rounds": sweep_config["rounds"],
 
-                    "kd_alpha": kd_config["kd_alpha"],
-                    "kd_temperature": kd_config["kd_temperature"],
-                    "server_distill_steps": kd_config.get("server_distill_steps", None),
-                    "server_distill_lr": kd_config.get("server_distill_lr", None),
+#                     "kd_alpha": kd_config["kd_alpha"],
+#                     "kd_temperature": kd_config["kd_temperature"],
+#                     "server_distill_steps": kd_config.get("server_distill_steps", None),
+#                     "server_distill_lr": kd_config.get("server_distill_lr", None),
 
-                    "f1_macro": metrics.get("f1_macro"),
-                    "f1_micro": metrics.get("f1_micro"),
-                    "pr_auc_macro": metrics.get("pr_auc_macro"),
-                    "pr_auc_micro": metrics.get("pr_auc_micro"),
-                    "auc_macro": metrics.get("auc_macro"),
-                    "auc_micro": metrics.get("auc_micro"),
-                    "best_f1_micro": metrics.get("best_f1_micro"),
-                    "best_thr": metrics.get("best_thr"),
+#                     "f1_macro": metrics.get("f1_macro"),
+#                     "f1_micro": metrics.get("f1_micro"),
+#                     "pr_auc_macro": metrics.get("pr_auc_macro"),
+#                     "pr_auc_micro": metrics.get("pr_auc_micro"),
+#                     "auc_macro": metrics.get("auc_macro"),
+#                     "auc_micro": metrics.get("auc_micro"),
+#                     "best_f1_micro": metrics.get("best_f1_micro"),
+#                     "best_thr": metrics.get("best_thr"),
 
-                    "time_sec": elapsed,
-                }
+#                     "time_sec": elapsed,
+#                 }
 
-                if split_mode == "noniid":
-                    row.update(noniid_params)
+#                 if split_mode == "noniid":
+#                     row.update(noniid_params)
 
-                all_rows.append(row)
-                completed_keys.add(run_key)
+#                 all_rows.append(row)
+#                 completed_keys.add(run_key)
 
-                pd.DataFrame(all_rows).to_csv(out_path, index=False)
-                print(f"Saved result to {out_path}")
+#                 pd.DataFrame(all_rows).to_csv(out_path, index=False)
+#                 print(f"Saved result to {out_path}")
 
-            except Exception as e:
-                print(f"FAILED: {split_mode} | {m['method_name']} | K={k}")
-                print(f"Reason: {e}")
+#             except Exception as e:
+#                 print(f"FAILED: {split_mode} | {m['method_name']} | K={k}")
+#                 print(f"Reason: {e}")
 
-print(f"\nSweep finished. Results saved to: {out_path}")
+# print(f"\nSweep finished. Results saved to: {out_path}")
 
-kd_sweep_df = pd.DataFrame(all_rows)
-display(kd_sweep_df.head())
+# kd_sweep_df = pd.DataFrame(all_rows)
+# display(kd_sweep_df.head())
 
 # %%
 # Reload saved CSV later if needed
@@ -2177,5 +2186,915 @@ plot_metric_all_methods(kd_sweep_df, split_mode="noniid", metric="pr_auc_macro",
 
 plot_metric_all_methods(kd_sweep_df, split_mode="iid", metric="f1_macro", bw=True)
 plot_metric_all_methods(kd_sweep_df, split_mode="noniid", metric="f1_macro", bw=True)
+
+# %% [markdown]
+# ## Targeted Tuning Plan: Option 3 + FedAvg + Non-IID
+# 
+# This section performs a focused two-phase tuning study on the strongest KD setting observed so far:
+# 
+# - **Method:** Option 3
+# - **Base algorithm:** FedAvg
+# - **Split:** non-IID
+# 
+# ### Phase 1
+# Tune the core local KD parameters:
+# - `kd_alpha`
+# - `kd_temperature`
+# 
+# ### Phase 2
+# Fix the best Phase 1 setting, then tune server-side distillation:
+# - `server_distill_steps`
+# - `server_distill_lr`
+# 
+# This targeted approach is more efficient than tuning all methods and settings jointly,
+# and aligns with the current evidence that Option 3 under non-IID is the most promising configuration.
+
+# %% [markdown]
+# ### Phase 1: Tune plain Option 3 + FedAvg + non-IID
+
+# %%
+# Phase 1: tune Option 3 + FedAvg + non-IID over kd_alpha x kd_temperature
+
+phase1_client_counts = [3, 10]   # one moderate, one harder fragmentation setting
+
+phase1_alpha_grid = [0.3, 0.5, 0.7]
+phase1_temp_grid = [1.0, 2.0, 4.0]
+
+phase1_config = config.copy()
+phase1_config["rounds"] = 10   # increase later if needed
+
+phase1_noniid_params = dict(
+    size_alpha=0.5,
+    labels_per_client=10,
+    bias_strength=0.85
+)
+
+#phase1_out_path = "../History/opt3_fedavg_noniid_phase1_tuning.csv"
+phase1_out_path = os.path.join(KD_HISTORY_DIR, "opt3_phase1_tuning_r10_e1.csv")
+
+# %%
+# # Phase 1 sweep runner with resume support
+
+# if os.path.exists(phase1_out_path):
+#     phase1_existing = pd.read_csv(phase1_out_path)
+#     phase1_rows = phase1_existing.to_dict(orient="records")
+#     phase1_completed = set(
+#         zip(
+#             phase1_existing["clients"],
+#             phase1_existing["kd_alpha"],
+#             phase1_existing["kd_temperature"]
+#         )
+#     )
+#     print(f"Found existing Phase 1 results at {phase1_out_path}")
+#     print(f"Loaded {len(phase1_existing)} completed rows.")
+# else:
+#     phase1_rows = []
+#     phase1_completed = set()
+#     print("No existing Phase 1 results found. Starting fresh.")
+
+# for k in phase1_client_counts:
+#     for alpha in phase1_alpha_grid:
+#         for temp in phase1_temp_grid:
+#             run_key = (k, alpha, temp)
+
+#             if run_key in phase1_completed:
+#                 print(f"Skipping completed Phase 1 run: K={k} | alpha={alpha} | T={temp}")
+#                 continue
+
+#             print(f"\n=== Phase 1 | Opt3 FedAvg NONIID | K={k} | alpha={alpha} | T={temp} ===")
+
+#             try:
+#                 phase1_kd_config = copy.deepcopy(kd_config)
+#                 phase1_kd_config["kd_alpha"] = alpha
+#                 phase1_kd_config["kd_temperature"] = temp
+
+#                 metrics, elapsed = run_fl_kd_once(
+#                     split_mode="noniid",
+#                     num_clients=k,
+#                     local_epochs=1,
+#                     config=phase1_config,
+#                     kd_config=phase1_kd_config,
+#                     train_dataset=train_dataset,
+#                     val_loader=val_loader,
+#                     test_loader=test_loader,
+#                     device=device,
+#                     seed=42,
+#                     method="option3",
+#                     base_algo="FedAvg",
+#                     mu=0.0,
+#                     server_distill=False,
+#                     **phase1_noniid_params
+#                 )
+
+#                 row = {
+#                     "phase": 1,
+#                     "split": "noniid",
+#                     "clients": k,
+#                     "method_name": "Opt3_FedAvg",
+#                     "method": "option3",
+#                     "base_algo": "FedAvg",
+#                     "server_distill": False,
+#                     "mu": 0.0,
+
+#                     "local_epochs": 1,
+#                     "rounds": phase1_config["rounds"],
+
+#                     "kd_alpha": alpha,
+#                     "kd_temperature": temp,
+#                     "teacher_steps_per_batch": phase1_kd_config.get("teacher_steps_per_batch", 1),
+
+#                     "server_distill_steps": None,
+#                     "server_distill_lr": None,
+
+#                     "f1_macro": metrics.get("f1_macro"),
+#                     "f1_micro": metrics.get("f1_micro"),
+#                     "pr_auc_macro": metrics.get("pr_auc_macro"),
+#                     "pr_auc_micro": metrics.get("pr_auc_micro"),
+#                     "auc_macro": metrics.get("auc_macro"),
+#                     "auc_micro": metrics.get("auc_micro"),
+#                     "best_f1_micro": metrics.get("best_f1_micro"),
+#                     "best_thr": metrics.get("best_thr"),
+#                     "time_sec": elapsed,
+
+#                     "size_alpha": phase1_noniid_params["size_alpha"],
+#                     "labels_per_client": phase1_noniid_params["labels_per_client"],
+#                     "bias_strength": phase1_noniid_params["bias_strength"],
+#                 }
+
+#                 phase1_rows.append(row)
+#                 phase1_completed.add(run_key)
+
+#                 pd.DataFrame(phase1_rows).to_csv(phase1_out_path, index=False)
+#                 print(f"Saved Phase 1 result to {phase1_out_path}")
+
+#             except Exception as e:
+#                 print(f"FAILED Phase 1: K={k} | alpha={alpha} | T={temp}")
+#                 print(f"Reason: {e}")
+
+# print(f"\nPhase 1 finished. Results saved to: {phase1_out_path}")
+
+# phase1_df = pd.DataFrame(phase1_rows)
+# display(phase1_df.head())
+
+# %%
+# Load Phase 1 results
+
+phase1_df = pd.read_csv(phase1_out_path)
+print("Loaded:", phase1_out_path, "rows=", len(phase1_df))
+display(phase1_df.head())
+
+# %%
+# Phase 1 summary tables
+
+phase1_summary = phase1_df.sort_values(
+    by=["clients", "f1_macro", "pr_auc_macro", "auc_macro"],
+    ascending=[True, False, False, False]
+).reset_index(drop=True)
+
+display(phase1_summary)
+
+phase1_pivot = phase1_df.pivot_table(
+    index=["clients", "kd_alpha"],
+    columns="kd_temperature",
+    values="f1_macro"
+)
+
+display(phase1_pivot)
+
+# %%
+# Best Phase 1 setting per client count
+
+phase1_best_per_k = (
+    phase1_df.sort_values(
+        by=["clients", "f1_macro", "pr_auc_macro", "auc_macro"],
+        ascending=[True, False, False, False]
+    )
+    .groupby("clients", as_index=False)
+    .first()
+)
+
+display(phase1_best_per_k)
+
+# %%
+# Choose one global best Phase 1 setting across the tested client counts
+# Preference order: mean F1_macro, then mean PR-AUC_macro, then mean AUC_macro
+
+phase1_global_summary = (
+    phase1_df.groupby(["kd_alpha", "kd_temperature"], as_index=False)
+    .agg({
+        "f1_macro": "mean",
+        "pr_auc_macro": "mean",
+        "auc_macro": "mean",
+        "time_sec": "mean"
+    })
+    .sort_values(
+        by=["f1_macro", "pr_auc_macro", "auc_macro"],
+        ascending=False
+    )
+    .reset_index(drop=True)
+)
+
+display(phase1_global_summary)
+
+best_phase1_alpha = float(phase1_global_summary.loc[0, "kd_alpha"])
+best_phase1_temp = float(phase1_global_summary.loc[0, "kd_temperature"])
+
+print(f"Best Phase 1 global setting: kd_alpha={best_phase1_alpha}, kd_temperature={best_phase1_temp}")
+
+# %%
+# Phase 1 plotting helper
+
+def plot_phase1_metric(df, clients_value: int, metric: str = "f1_macro"):
+    d = df[df["clients"] == clients_value].copy()
+    temps = sorted(d["kd_temperature"].unique())
+
+    plt.figure(figsize=(8, 5))
+    for temp in temps:
+        g = d[d["kd_temperature"] == temp].sort_values("kd_alpha")
+        plt.plot(
+            g["kd_alpha"],
+            g[metric],
+            marker="o",
+            linewidth=2,
+            label=f"T={temp}"
+        )
+
+    plt.xlabel("KD Alpha")
+    plt.ylabel(metric.replace("_", " ").title())
+    plt.title(f"Phase 1: {metric.replace('_', ' ').title()} | Opt3 FedAvg NONIID | K={clients_value}")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+plot_phase1_metric(phase1_df, clients_value=3, metric="f1_macro")
+plot_phase1_metric(phase1_df, clients_value=10, metric="f1_macro")
+
+plot_phase1_metric(phase1_df, clients_value=3, metric="pr_auc_macro")
+plot_phase1_metric(phase1_df, clients_value=10, metric="pr_auc_macro")
+
+# %% [markdown]
+# ### Phase 2: Server Distillation Tuning
+# 
+# Using the best Phase 1 Option 3 setting, this phase tunes:
+# - `server_distill_steps`
+# - `server_distill_lr`
+# 
+# The goal is to determine whether server-side refinement can improve the strongest local KD setup.
+
+# %%
+# Phase 2: tune server distillation on top of best Phase 1 setting
+
+phase2_client_counts = [3, 10]
+
+phase2_steps_grid = [5, 10, 20]
+phase2_lr_grid = [0.001, 0.002, 0.005]
+
+phase2_config = config.copy()
+phase2_config["rounds"] = 10
+
+phase2_noniid_params = dict(
+    size_alpha=0.5,
+    labels_per_client=10,
+    bias_strength=0.85
+)
+
+#phase2_out_path = "../History/opt3_fedavg_noniid_phase2_serverdistill_tuning.csv"
+phase2_out_path = os.path.join(KD_HISTORY_DIR, "opt3_phase2_serverdistill_tuning_r10_e1.csv")
+
+# %%
+# # Phase 2 sweep runner with resume support
+
+# if os.path.exists(phase2_out_path):
+#     phase2_existing = pd.read_csv(phase2_out_path)
+#     phase2_rows = phase2_existing.to_dict(orient="records")
+#     phase2_completed = set(
+#         zip(
+#             phase2_existing["clients"],
+#             phase2_existing["server_distill_steps"],
+#             phase2_existing["server_distill_lr"]
+#         )
+#     )
+#     print(f"Found existing Phase 2 results at {phase2_out_path}")
+#     print(f"Loaded {len(phase2_existing)} completed rows.")
+# else:
+#     phase2_rows = []
+#     phase2_completed = set()
+#     print("No existing Phase 2 results found. Starting fresh.")
+
+# for k in phase2_client_counts:
+#     for sd_steps in phase2_steps_grid:
+#         for sd_lr in phase2_lr_grid:
+#             run_key = (k, sd_steps, sd_lr)
+
+#             if run_key in phase2_completed:
+#                 print(f"Skipping completed Phase 2 run: K={k} | SD_steps={sd_steps} | SD_lr={sd_lr}")
+#                 continue
+
+#             print(
+#                 f"\n=== Phase 2 | Opt3 FedAvg NONIID + SD | "
+#                 f"K={k} | alpha={best_phase1_alpha} | T={best_phase1_temp} | "
+#                 f"SD_steps={sd_steps} | SD_lr={sd_lr} ==="
+#             )
+
+#             try:
+#                 phase2_kd_config = copy.deepcopy(kd_config)
+#                 phase2_kd_config["kd_alpha"] = best_phase1_alpha
+#                 phase2_kd_config["kd_temperature"] = best_phase1_temp
+#                 phase2_kd_config["server_distill_steps"] = sd_steps
+#                 phase2_kd_config["server_distill_lr"] = sd_lr
+
+#                 metrics, elapsed = run_fl_kd_once(
+#                     split_mode="noniid",
+#                     num_clients=k,
+#                     local_epochs=1,
+#                     config=phase2_config,
+#                     kd_config=phase2_kd_config,
+#                     train_dataset=train_dataset,
+#                     val_loader=val_loader,
+#                     test_loader=test_loader,
+#                     device=device,
+#                     seed=42,
+#                     method="option3",
+#                     base_algo="FedAvg",
+#                     mu=0.0,
+#                     server_distill=True,
+#                     **phase2_noniid_params
+#                 )
+
+#                 row = {
+#                     "phase": 2,
+#                     "split": "noniid",
+#                     "clients": k,
+#                     "method_name": "Opt3_FedAvg_SD",
+#                     "method": "option3",
+#                     "base_algo": "FedAvg",
+#                     "server_distill": True,
+#                     "mu": 0.0,
+
+#                     "local_epochs": 1,
+#                     "rounds": phase2_config["rounds"],
+
+#                     "kd_alpha": best_phase1_alpha,
+#                     "kd_temperature": best_phase1_temp,
+#                     "teacher_steps_per_batch": phase2_kd_config.get("teacher_steps_per_batch", 1),
+
+#                     "server_distill_steps": sd_steps,
+#                     "server_distill_lr": sd_lr,
+
+#                     "f1_macro": metrics.get("f1_macro"),
+#                     "f1_micro": metrics.get("f1_micro"),
+#                     "pr_auc_macro": metrics.get("pr_auc_macro"),
+#                     "pr_auc_micro": metrics.get("pr_auc_micro"),
+#                     "auc_macro": metrics.get("auc_macro"),
+#                     "auc_micro": metrics.get("auc_micro"),
+#                     "best_f1_micro": metrics.get("best_f1_micro"),
+#                     "best_thr": metrics.get("best_thr"),
+#                     "time_sec": elapsed,
+
+#                     "size_alpha": phase2_noniid_params["size_alpha"],
+#                     "labels_per_client": phase2_noniid_params["labels_per_client"],
+#                     "bias_strength": phase2_noniid_params["bias_strength"],
+#                 }
+
+#                 phase2_rows.append(row)
+#                 phase2_completed.add(run_key)
+
+#                 pd.DataFrame(phase2_rows).to_csv(phase2_out_path, index=False)
+#                 print(f"Saved Phase 2 result to {phase2_out_path}")
+
+#             except Exception as e:
+#                 print(f"FAILED Phase 2: K={k} | SD_steps={sd_steps} | SD_lr={sd_lr}")
+#                 print(f"Reason: {e}")
+
+# print(f"\nPhase 2 finished. Results saved to: {phase2_out_path}")
+
+# phase2_df = pd.DataFrame(phase2_rows)
+# display(phase2_df.head())
+
+# %%
+# Load Phase 2 results
+
+phase2_df = pd.read_csv(phase2_out_path)
+print("Loaded:", phase2_out_path, "rows=", len(phase2_df))
+display(phase2_df.head())
+
+# %%
+# Phase 2 summary tables
+
+phase2_summary = phase2_df.sort_values(
+    by=["clients", "f1_macro", "pr_auc_macro", "auc_macro"],
+    ascending=[True, False, False, False]
+).reset_index(drop=True)
+
+display(phase2_summary)
+
+phase2_pivot = phase2_df.pivot_table(
+    index=["clients", "server_distill_steps"],
+    columns="server_distill_lr",
+    values="f1_macro"
+)
+
+display(phase2_pivot)
+
+# %%
+# Best Phase 2 setting per client count
+
+phase2_best_per_k = (
+    phase2_df.sort_values(
+        by=["clients", "f1_macro", "pr_auc_macro", "auc_macro"],
+        ascending=[True, False, False, False]
+    )
+    .groupby("clients", as_index=False)
+    .first()
+)
+
+display(phase2_best_per_k)
+
+# %%
+# Compare best Phase 2 SD settings against best non-SD Phase 1 setting
+
+phase1_best_compare = phase1_best_per_k[[
+    "clients", "kd_alpha", "kd_temperature",
+    "f1_macro", "pr_auc_macro", "auc_macro", "time_sec"
+]].copy()
+phase1_best_compare["variant"] = "Opt3_FedAvg_Best_Phase1"
+
+phase2_best_compare = phase2_best_per_k[[
+    "clients", "server_distill_steps", "server_distill_lr",
+    "f1_macro", "pr_auc_macro", "auc_macro", "time_sec"
+]].copy()
+phase2_best_compare["variant"] = "Opt3_FedAvg_SD_Best_Phase2"
+
+display(phase1_best_compare)
+display(phase2_best_compare)
+
+# %%
+# Phase 2 plotting helper
+
+def plot_phase2_metric(df, clients_value: int, metric: str = "f1_macro"):
+    d = df[df["clients"] == clients_value].copy()
+    lrs = sorted(d["server_distill_lr"].unique())
+
+    plt.figure(figsize=(8, 5))
+    for sd_lr in lrs:
+        g = d[d["server_distill_lr"] == sd_lr].sort_values("server_distill_steps")
+        plt.plot(
+            g["server_distill_steps"],
+            g[metric],
+            marker="o",
+            linewidth=2,
+            label=f"SD LR={sd_lr}"
+        )
+
+    plt.xlabel("Server Distill Steps")
+    plt.ylabel(metric.replace("_", " ").title())
+    plt.title(
+        f"Phase 2: {metric.replace('_', ' ').title()} | "
+        f"Opt3 FedAvg NONIID + SD | K={clients_value}"
+    )
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+plot_phase2_metric(phase2_df, clients_value=3, metric="f1_macro")
+plot_phase2_metric(phase2_df, clients_value=10, metric="f1_macro")
+
+plot_phase2_metric(phase2_df, clients_value=3, metric="pr_auc_macro")
+plot_phase2_metric(phase2_df, clients_value=10, metric="pr_auc_macro")
+
+# %%
+# Final combined comparison: best non-SD vs best SD settings
+
+final_compare = []
+
+for k in sorted(set(phase1_best_per_k["clients"]).intersection(set(phase2_best_per_k["clients"]))):
+    p1 = phase1_best_per_k[phase1_best_per_k["clients"] == k].iloc[0]
+    p2 = phase2_best_per_k[phase2_best_per_k["clients"] == k].iloc[0]
+
+    final_compare.append({
+        "clients": k,
+
+        "best_phase1_alpha": p1["kd_alpha"],
+        "best_phase1_temp": p1["kd_temperature"],
+        "phase1_f1_macro": p1["f1_macro"],
+        "phase1_pr_auc_macro": p1["pr_auc_macro"],
+        "phase1_auc_macro": p1["auc_macro"],
+
+        "best_phase2_sd_steps": p2["server_distill_steps"],
+        "best_phase2_sd_lr": p2["server_distill_lr"],
+        "phase2_f1_macro": p2["f1_macro"],
+        "phase2_pr_auc_macro": p2["pr_auc_macro"],
+        "phase2_auc_macro": p2["auc_macro"],
+
+        "delta_f1_macro": p2["f1_macro"] - p1["f1_macro"],
+        "delta_pr_auc_macro": p2["pr_auc_macro"] - p1["pr_auc_macro"],
+        "delta_auc_macro": p2["auc_macro"] - p1["auc_macro"],
+    })
+
+final_compare_df = pd.DataFrame(final_compare)
+display(final_compare_df)
+
+# %% [markdown]
+# ## Final Focused Sweep: Tuned Option 3 under Non-IID
+# 
+# This section runs a focused final comparison under the setting where KD was most effective:
+# - non-IID split
+# - FedAvg base algorithm
+# - tuned Option 3 local KD
+# 
+# Methods compared:
+# - Baseline FedAvg
+# - Tuned Option 3 + FedAvg
+# - Tuned Option 3 + FedAvg + Server Distillation
+# 
+# Tuned Option 3 parameters from Phase 1:
+# - kd_alpha = 0.7
+# - kd_temperature = 2.0
+# 
+# Server distillation parameters from Phase 2:
+# - server_distill_steps = 5
+# - server_distill_lr = 0.002
+
+# %%
+final_client_counts = [2, 3, 4, 8, 10, 12, 15, 20]
+
+final_config = config.copy()
+final_config["rounds"] = 100
+final_local_epochs = 3
+
+final_noniid_params = dict(
+    size_alpha=0.5,
+    labels_per_client=10,
+    bias_strength=0.85
+)
+
+final_opt3_kd_config = copy.deepcopy(kd_config)
+final_opt3_kd_config["kd_alpha"] = 0.7
+final_opt3_kd_config["kd_temperature"] = 2.0
+final_opt3_kd_config["server_distill_steps"] = 5
+final_opt3_kd_config["server_distill_lr"] = 0.002
+
+FINAL_METHODS = [
+    dict(method_name="Baseline_FedAvg",        method="baseline", base_algo="FedAvg", mu=0.0, server_distill=False),
+    dict(method_name="Opt3_FedAvg_Tuned",      method="option3",  base_algo="FedAvg", mu=0.0, server_distill=False),
+    dict(method_name="Opt3_FedAvg_Tuned_SD",   method="option3",  base_algo="FedAvg", mu=0.0, server_distill=True),
+]
+
+final_opt3_out_path = os.path.join(KD_HISTORY_DIR, "final_opt3_noniid_sweep_r100_e3.csv")
+
+# %%
+# # Focused sweep runner with resume support
+
+# if os.path.exists(final_opt3_out_path):
+#     final_existing = pd.read_csv(final_opt3_out_path)
+#     final_rows = final_existing.to_dict(orient="records")
+#     final_completed = set(
+#         zip(
+#             final_existing["method_name"],
+#             final_existing["clients"]
+#         )
+#     )
+#     print(f"Found existing results at {final_opt3_out_path}")
+#     print(f"Loaded {len(final_existing)} completed rows.")
+# else:
+#     final_rows = []
+#     final_completed = set()
+#     print("No existing focused sweep results found. Starting fresh.")
+
+# for m in FINAL_METHODS:
+#     for k in final_client_counts:
+#         run_key = (m["method_name"], k)
+
+#         if run_key in final_completed:
+#             print(f"Skipping completed run: {m['method_name']} | K={k}")
+#             continue
+
+#         print(f"\n=== FINAL NONIID | {m['method_name']} | K={k} ===")
+
+#         try:
+#             metrics, elapsed = run_fl_kd_once(
+#                 split_mode="noniid",
+#                 num_clients=k,
+#                 local_epochs=final_local_epochs,
+#                 config=final_config,
+#                 kd_config=final_opt3_kd_config,
+#                 train_dataset=train_dataset,
+#                 val_loader=val_loader,
+#                 test_loader=test_loader,
+#                 device=device,
+#                 seed=42,
+#                 method=m["method"],
+#                 base_algo=m["base_algo"],
+#                 mu=m["mu"],
+#                 server_distill=m["server_distill"],
+#                 **final_noniid_params
+#             )
+
+#             row = {
+#                 "split": "noniid",
+#                 "clients": k,
+
+#                 "method_name": m["method_name"],
+#                 "method": m["method"],
+#                 "base_algo": m["base_algo"],
+#                 "mu": m["mu"],
+#                 "server_distill": m["server_distill"],
+
+#                 "local_epochs": final_local_epochs,
+#                 "rounds": final_config["rounds"],
+
+#                 "kd_alpha": final_opt3_kd_config["kd_alpha"],
+#                 "kd_temperature": final_opt3_kd_config["kd_temperature"],
+#                 "server_distill_steps": final_opt3_kd_config["server_distill_steps"] if m["server_distill"] else None,
+#                 "server_distill_lr": final_opt3_kd_config["server_distill_lr"] if m["server_distill"] else None,
+
+#                 "f1_macro": metrics.get("f1_macro"),
+#                 "f1_micro": metrics.get("f1_micro"),
+#                 "pr_auc_macro": metrics.get("pr_auc_macro"),
+#                 "pr_auc_micro": metrics.get("pr_auc_micro"),
+#                 "auc_macro": metrics.get("auc_macro"),
+#                 "auc_micro": metrics.get("auc_micro"),
+#                 "best_f1_micro": metrics.get("best_f1_micro"),
+#                 "best_thr": metrics.get("best_thr"),
+
+#                 "time_sec": elapsed,
+
+#                 "size_alpha": final_noniid_params["size_alpha"],
+#                 "labels_per_client": final_noniid_params["labels_per_client"],
+#                 "bias_strength": final_noniid_params["bias_strength"],
+#             }
+
+#             final_rows.append(row)
+#             final_completed.add(run_key)
+
+#             pd.DataFrame(final_rows).to_csv(final_opt3_out_path, index=False)
+#             print(f"Saved result to {final_opt3_out_path}")
+
+#         except Exception as e:
+#             print(f"FAILED: {m['method_name']} | K={k}")
+#             print(f"Reason: {e}")
+
+# print(f"\nFocused sweep finished. Results saved to: {final_opt3_out_path}")
+
+# final_opt3_df = pd.DataFrame(final_rows)
+# display(final_opt3_df.head())
+
+# %%
+final_opt3_df = pd.read_csv(final_opt3_out_path)
+print("Loaded:", final_opt3_out_path, "rows=", len(final_opt3_df))
+display(final_opt3_df)
+
+# %%
+final_opt3_pivot = final_opt3_df.pivot_table(
+    index="clients",
+    columns="method_name",
+    values="f1_macro"
+)
+display(final_opt3_pivot)
+
+# %%
+def plot_final_opt3_metric(df, metric="f1_macro", bw=False):
+    methods = [
+        "Baseline_FedAvg",
+        "Opt3_FedAvg_Tuned",
+        "Opt3_FedAvg_Tuned_SD"
+    ]
+
+    plt.figure(figsize=(9, 5))
+
+    for method in methods:
+        g = df[df["method_name"] == method].sort_values("clients")
+
+        if bw:
+            plt.plot(
+                g["clients"], g[metric],
+                color="black",
+                marker="o",
+                linewidth=2,
+                label=method
+            )
+        else:
+            plt.plot(
+                g["clients"], g[metric],
+                marker="o",
+                linewidth=2,
+                label=method
+            )
+
+    plt.xlabel("Number of Clients")
+    plt.ylabel(metric.replace("_", " ").title())
+    plt.title(f"{metric.replace('_', ' ').title()} vs Number of Clients (NONIID)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+plot_final_opt3_metric(final_opt3_df, metric="f1_macro", bw=False)
+plot_final_opt3_metric(final_opt3_df, metric="pr_auc_macro", bw=False)
+plot_final_opt3_metric(final_opt3_df, metric="f1_macro", bw=True)
+
+# %% [markdown]
+# ## Final Focused Sweep: Tuned Option 3 under IID
+# 
+# This section runs the IID counterpart to the final non-IID sweep, using the same
+# tuned Option 3 configuration. The goal is to test whether KD remains beneficial
+# when client heterogeneity is removed.
+
+# %%
+# New config cell for IID-only final sweep
+
+final_client_counts = [2, 3, 4, 8, 10, 12, 15, 20]
+final_split_mode = "iid"
+
+final_config = config.copy()
+final_config["rounds"] = 100
+final_local_epochs = 3
+
+final_opt3_kd_config = copy.deepcopy(kd_config)
+final_opt3_kd_config["kd_alpha"] = 0.7
+final_opt3_kd_config["kd_temperature"] = 2.0
+final_opt3_kd_config["server_distill_steps"] = 5
+final_opt3_kd_config["server_distill_lr"] = 0.002
+
+FINAL_METHODS = [
+    dict(method_name="Baseline_FedAvg",        method="baseline", base_algo="FedAvg", mu=0.0, server_distill=False),
+    dict(method_name="Opt3_FedAvg_Tuned",      method="option3",  base_algo="FedAvg", mu=0.0, server_distill=False),
+    dict(method_name="Opt3_FedAvg_Tuned_SD",   method="option3",  base_algo="FedAvg", mu=0.0, server_distill=True),
+]
+
+final_opt3_iid_out_path = os.path.join(KD_HISTORY_DIR, "final_opt3_iid_sweep_r100_e3.csv")
+
+# %%
+# IID-only focused sweep runner with resume support
+
+if os.path.exists(final_opt3_iid_out_path):
+    final_existing = pd.read_csv(final_opt3_iid_out_path)
+    final_rows = final_existing.to_dict(orient="records")
+    final_completed = set(
+        zip(
+            final_existing["method_name"],
+            final_existing["clients"]
+        )
+    )
+    print(f"Found existing IID results at {final_opt3_iid_out_path}")
+    print(f"Loaded {len(final_existing)} completed rows.")
+else:
+    final_rows = []
+    final_completed = set()
+    print("No existing IID focused sweep results found. Starting fresh.")
+
+for m in FINAL_METHODS:
+    for k in final_client_counts:
+        run_key = (m["method_name"], k)
+
+        if run_key in final_completed:
+            print(f"Skipping completed run: {m['method_name']} | K={k}")
+            continue
+
+        print(f"\n=== FINAL IID | {m['method_name']} | K={k} ===")
+
+        try:
+            metrics, elapsed = run_fl_kd_once(
+                split_mode=final_split_mode,
+                num_clients=k,
+                local_epochs=final_local_epochs,
+                config=final_config,
+                kd_config=final_opt3_kd_config,
+                train_dataset=train_dataset,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                device=device,
+                seed=42,
+                method=m["method"],
+                base_algo=m["base_algo"],
+                mu=m["mu"],
+                server_distill=m["server_distill"]
+            )
+
+            row = {
+                "split": final_split_mode,
+                "clients": k,
+
+                "method_name": m["method_name"],
+                "method": m["method"],
+                "base_algo": m["base_algo"],
+                "mu": m["mu"],
+                "server_distill": m["server_distill"],
+
+                "local_epochs": final_local_epochs,
+                "rounds": final_config["rounds"],
+
+                "kd_alpha": final_opt3_kd_config["kd_alpha"],
+                "kd_temperature": final_opt3_kd_config["kd_temperature"],
+                "server_distill_steps": final_opt3_kd_config["server_distill_steps"] if m["server_distill"] else None,
+                "server_distill_lr": final_opt3_kd_config["server_distill_lr"] if m["server_distill"] else None,
+
+                "f1_macro": metrics.get("f1_macro"),
+                "f1_micro": metrics.get("f1_micro"),
+                "pr_auc_macro": metrics.get("pr_auc_macro"),
+                "pr_auc_micro": metrics.get("pr_auc_micro"),
+                "auc_macro": metrics.get("auc_macro"),
+                "auc_micro": metrics.get("auc_micro"),
+                "best_f1_micro": metrics.get("best_f1_micro"),
+                "best_thr": metrics.get("best_thr"),
+
+                "time_sec": elapsed,
+            }
+
+            final_rows.append(row)
+            final_completed.add(run_key)
+
+            pd.DataFrame(final_rows).to_csv(final_opt3_iid_out_path, index=False)
+            print(f"Saved result to {final_opt3_iid_out_path}")
+
+        except Exception as e:
+            print(f"FAILED: {m['method_name']} | K={k}")
+            print(f"Reason: {e}")
+
+print(f"\nIID focused sweep finished. Results saved to: {final_opt3_iid_out_path}")
+
+final_opt3_iid_df = pd.DataFrame(final_rows)
+display(final_opt3_iid_df.head())
+
+# %%
+# Load and inspect IID results
+
+final_opt3_iid_df = pd.read_csv(final_opt3_iid_out_path)
+print("Loaded:", final_opt3_iid_out_path, "rows=", len(final_opt3_iid_df))
+display(final_opt3_iid_df)
+
+final_opt3_iid_pivot = final_opt3_iid_df.pivot_table(
+    index="clients",
+    columns="method_name",
+    values="f1_macro"
+)
+display(final_opt3_iid_pivot)
+
+# %%
+# Plot IID only
+
+def plot_final_opt3_iid_metric(df, metric="f1_macro", bw=False):
+    methods = [
+        "Baseline_FedAvg",
+        "Opt3_FedAvg_Tuned",
+        "Opt3_FedAvg_Tuned_SD"
+    ]
+
+    plt.figure(figsize=(9, 5))
+
+    for method in methods:
+        g = df[df["method_name"] == method].sort_values("clients")
+
+        if bw:
+            plt.plot(
+                g["clients"], g[metric],
+                color="black",
+                marker="o",
+                linewidth=2,
+                label=method
+            )
+        else:
+            plt.plot(
+                g["clients"], g[metric],
+                marker="o",
+                linewidth=2,
+                label=method
+            )
+
+    plt.xlabel("Number of Clients")
+    plt.ylabel(metric.replace("_", " ").title())
+    plt.title(f"{metric.replace('_', ' ').title()} vs Number of Clients (IID)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+plot_final_opt3_iid_metric(final_opt3_iid_df, metric="f1_macro", bw=False)
+plot_final_opt3_iid_metric(final_opt3_iid_df, metric="pr_auc_macro", bw=False)
+plot_final_opt3_iid_metric(final_opt3_iid_df, metric="f1_macro", bw=True)
+
+# %%
+# Combine IID + non-IID into a single CSV (while keeping originals)
+
+final_opt3_noniid_out_path = os.path.join(KD_HISTORY_DIR, "final_opt3_noniid_sweep_r100_e3.csv")
+final_opt3_iid_out_path    = os.path.join(KD_HISTORY_DIR, "final_opt3_iid_sweep_r100_e3.csv")
+
+final_opt3_combined_path   = os.path.join(KD_HISTORY_DIR, "final_opt3_combined_sweep_r100_e3.csv")
+
+# Load individual results
+df_noniid = pd.read_csv(final_opt3_noniid_out_path)
+df_iid    = pd.read_csv(final_opt3_iid_out_path)
+
+# Combine
+df_combined = pd.concat([df_iid, df_noniid], ignore_index=True)
+
+# Save combined file
+df_combined.to_csv(final_opt3_combined_path, index=False)
+
+print(f"Saved combined results to: {final_opt3_combined_path}")
+
+display(df_combined.head())
 
 

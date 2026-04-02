@@ -31,6 +31,7 @@ import math
 import json
 import os
 import copy
+import csv
 
 # Optional: to ensure reproducibility
 torch.manual_seed(42)
@@ -39,6 +40,12 @@ torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+
+# %%
+OUTPUT_DIR = os.path.join("..", "History", "original_comparison")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"Saving section CSVs to: {OUTPUT_DIR}")
 
 # %% [markdown]
 # ## Data Loading and JSON Utilities
@@ -99,6 +106,44 @@ def load_json(filepath: str) -> dict:
     """
     with open(filepath, mode="r") as f:
         return json.load(f)
+
+# %%
+def save_dict_rows_to_csv(rows: list[dict], filepath: str) -> None:
+    """
+    Save a list of dictionaries to a CSV file.
+    """
+    if not rows:
+        print(f"[save_dict_rows_to_csv] No rows to save for {filepath}")
+        return
+
+    fieldnames = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
+
+    with open(filepath, mode="w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Saved CSV: {filepath}")
+
+def to_serializable_row(row: dict) -> dict:
+    """
+    Convert metric values to plain Python scalars when possible.
+    """
+    cleaned = {}
+    for k, v in row.items():
+        if isinstance(v, (np.floating, np.integer)):
+            cleaned[k] = v.item()
+        elif isinstance(v, torch.Tensor):
+            cleaned[k] = v.item() if v.numel() == 1 else v.detach().cpu().tolist()
+        else:
+            cleaned[k] = v
+    return cleaned
 
 # %% [markdown]
 # ## Model Definition — ConvAttnPool
@@ -387,7 +432,7 @@ def client_update(
             loss.backward()
             optimizer.step()
 
-    return loss.item(), model.state_dict()
+    return loss.item(), {k: v.detach().clone() for k, v in model.state_dict().items()}
 
 
 # %%
@@ -697,6 +742,7 @@ def eval_model(
 # --- Quick gamma tuning experiment ---
 gamma_values = [1.0, 1.5, 2.0, 2.5, 3.0]
 results = {}
+gamma_rows = []
 
 for gamma in gamma_values:
     print(f"\n===== Testing gamma={gamma} =====")
@@ -731,9 +777,20 @@ for gamma in gamma_values:
         print(f"Epoch {epoch+1}/5 | Train Loss: {avg_train_loss:.4f}")
 
     # --- Evaluate F1 on validation set ---
-    _, per_label_thr = find_best_thresholds_per_label(model, val_loader, device)
+    macro_f1_thr, per_label_thr = find_best_thresholds_per_label(model, val_loader, device)
     val_loss, metrics = eval_model(model, device, val_loader, per_label_thr=per_label_thr)
     results[gamma] = metrics["f1_micro"]
+
+    gamma_rows.append({
+        "gamma": float(gamma),
+        "train_loss_last_epoch": float(avg_train_loss),
+        "val_loss": float(val_loss),
+        "f1_micro": float(metrics["f1_micro"]),
+        "f1_macro": float(metrics["f1_macro"]),
+        "auc_micro": float(metrics["auc_micro"]),
+        "auc_macro": float(metrics["auc_macro"]),
+        "per_label_macro_f1": float(macro_f1_thr)
+    })
 
 print("\nGamma tuning results:")
 for g, f1 in results.items():
@@ -742,6 +799,11 @@ for g, f1 in results.items():
 best_gamma = max(results, key=results.get)
 print(f"\nBest gamma: {best_gamma} (F1_micro={results[best_gamma]:.4f})")
 config["gamma"] = best_gamma
+
+save_dict_rows_to_csv(
+    gamma_rows,
+    os.path.join(OUTPUT_DIR, "gamma_tuning_results.csv")
+)
 
 # %%
 # Gamma plot
@@ -769,14 +831,58 @@ history = {
 max_auc_macro = 0.0
 max_f1_micro = 0.0
 
+FED_LOCAL_CSV = os.path.join(OUTPUT_DIR, "federated_local_losses.csv")
+FED_EVAL_CSV = os.path.join(OUTPUT_DIR, "federated_eval_history.csv")
+FED_PROGRESS_JSON = os.path.join(OUTPUT_DIR, "federated_progress.json")
+FED_HISTORY_JSON = "../History/logs/metric_history.json"
+FED_LATEST_MODEL = "../History/logs/latest_model.pt"
+FED_MAX_AUC_MODEL = "../History/logs/max_auc.pt"
+FED_MAX_F1_MODEL = "../History/logs/max_f1_micro.pt"
+
 # %%
 # Federated training loop 
+
+fed_local_loss_rows = []
+fed_eval_rows = []
+
+resume_fed = False
+start_round = 0
+
+if (
+    resume_fed
+    and os.path.exists(FED_LATEST_MODEL)
+    and os.path.exists(FED_HISTORY_JSON)
+    and os.path.exists(FED_PROGRESS_JSON)
+):
+    print("Found federated checkpoint. Resuming run...")
+
+    Global_Model.load_state_dict(torch.load(FED_LATEST_MODEL, map_location=device))
+    history = load_json(FED_HISTORY_JSON)
+    progress = load_json(FED_PROGRESS_JSON)
+
+    start_round = progress["last_completed_round"]
+
+    if os.path.exists(FED_LOCAL_CSV):
+        import pandas as pd
+        fed_local_loss_rows = pd.read_csv(FED_LOCAL_CSV).to_dict(orient="records")
+
+    if os.path.exists(FED_EVAL_CSV):
+        import pandas as pd
+        fed_eval_rows = pd.read_csv(FED_EVAL_CSV).to_dict(orient="records")
+
+    if len(history["global_metrics"]) > 0:
+        max_auc_macro = max(m["auc_macro"] for m in history["global_metrics"])
+        max_f1_micro = max(m["f1_micro"] for m in history["global_metrics"])
+
+    print(f"Restarting at round {start_round + 1}")
+else:
+    print("No federated checkpoint found. Starting fresh.")
 
 config["rounds"] = 100  # important for testing time
 target_evals = 100
 eval_interval = max(1, round(config["rounds"] / target_evals))
 
-for rnd in tqdm(range(config["rounds"]), colour="blue"):
+for rnd in tqdm(range(start_round, config["rounds"]), colour="blue"):
     client_params = []
     total_local_loss = 0.0  # for averaging client losses
 
@@ -790,12 +896,20 @@ for rnd in tqdm(range(config["rounds"]), colour="blue"):
             epochs=config["epochs"],
             lr=config["lr"],
             device=device,
-            use_focal=config["use_focal"]
+            use_focal=config["use_focal"],
+            gamma=config["gamma"]
         )
 
         client_params.append(c_param)
         history["local_loss"][c_idx].append(local_loss)
         total_local_loss += local_loss
+
+        # for saving
+        fed_local_loss_rows.append({
+            "round": rnd + 1,
+            "client": c_idx,
+            "local_loss": float(local_loss)
+        })
 
     avg_local_loss = total_local_loss / len(c_loaders)
 
@@ -805,34 +919,51 @@ for rnd in tqdm(range(config["rounds"]), colour="blue"):
 
     # ---- Evaluation phase (same as centralized) ----
     if (rnd + 1) % eval_interval == 0 or rnd == config["rounds"] - 1:
-        # Evaluation with global threshold
-        # g_loss, metrics = eval_model(Global_Model, device, val_loader)
-
         # Compute per-label thresholds dynamically for this checkpoint
         _, per_label_thr = find_best_thresholds_per_label(Global_Model, val_loader, device)
         g_loss, metrics = eval_model(
             Global_Model, device, val_loader,
             per_label_thr=per_label_thr,
             use_focal=config["use_focal"],
-            alpha= torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device), 
+            alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device), 
             gamma=config["gamma"]
         )
 
         history["global_loss"].append(g_loss)
         history["global_metrics"].append(metrics)
 
+        # for saving
+        fed_eval_rows.append({
+            "round": rnd + 1,
+            "avg_local_loss": float(avg_local_loss),
+            "global_val_loss": float(g_loss),
+            **to_serializable_row(metrics)
+        })
+
         # ---- Save checkpoints ----
-        save_json(history, "../History/logs/metric_history.json")
-        torch.save(Global_Model.state_dict(), "../History/logs/latest_model.pt")
+        save_json(history, FED_HISTORY_JSON)
+        torch.save(Global_Model.state_dict(), FED_LATEST_MODEL)
+
+        save_dict_rows_to_csv(fed_local_loss_rows, FED_LOCAL_CSV)
+        save_dict_rows_to_csv(fed_eval_rows, FED_EVAL_CSV)
+
+        save_json(
+            {
+                "last_completed_round": rnd + 1,
+                "rounds_total": config["rounds"],
+                "eval_interval": eval_interval
+            },
+            FED_PROGRESS_JSON
+        )
 
         # Track best-performing models
         if metrics["auc_macro"] > max_auc_macro:
             max_auc_macro = metrics["auc_macro"]
-            torch.save(Global_Model.state_dict(), "../History/logs/max_auc.pt")
+            torch.save(Global_Model.state_dict(), FED_MAX_AUC_MODEL)
 
         if metrics["f1_micro"] > max_f1_micro:
             max_f1_micro = metrics["f1_micro"]
-            torch.save(Global_Model.state_dict(), "../History/logs/max_f1_micro.pt")
+            torch.save(Global_Model.state_dict(), FED_MAX_F1_MODEL)
 
         # Print progress
         thr_display = metrics["best_thr"] if isinstance(metrics["best_thr"], str) else f"{metrics['best_thr']:.2f}"
@@ -844,9 +975,18 @@ for rnd in tqdm(range(config["rounds"]), colour="blue"):
 
 print("Federated training complete!")
 
+save_dict_rows_to_csv(
+    fed_local_loss_rows,
+    FED_LOCAL_CSV
+)
+
+save_dict_rows_to_csv(
+    fed_eval_rows,
+    FED_EVAL_CSV
+)
+
 best_f1, best_thr = find_best_threshold(Global_Model, val_loader, device)
 print(f"Best threshold on validation set: {best_thr} (F1={best_f1:.4f})")
-
 
 # %% [markdown]
 # ### Federated Training Results Visualization
@@ -945,9 +1085,10 @@ plt.show()
 # The centralized model acts as an upper performance bound for comparison.
 
 # %%
-# Config - same as FL
+# Config - same as FL, but force BCE for the main reported centralized baseline
 
-central_config = config.copy()  # same parameters as FL
+central_config = config.copy()
+central_config["use_focal"] = False
 print(central_config)
 
 # %%
@@ -974,9 +1115,8 @@ with torch.no_grad():
 
 print("Centralized model and data ready.")
 
-
 # %%
-# Centralized training history set up
+# Centralized training history setup
 
 central_history = {
     "train_loss": [],
@@ -987,24 +1127,70 @@ central_history = {
 cent_max_auc_macro = 0.0
 cent_max_f1_micro = 0.0
 
+CENTRAL_TRAIN_CSV = os.path.join(OUTPUT_DIR, "centralized_train_history.csv")
+CENTRAL_EVAL_CSV = os.path.join(OUTPUT_DIR, "centralized_eval_history.csv")
+CENTRAL_PROGRESS_JSON = os.path.join(OUTPUT_DIR, "centralized_progress.json")
+CENTRAL_HISTORY_JSON = "../History/logs/central_metric_history.json"
+CENTRAL_LATEST_MODEL = "../History/logs/latest_central_model.pt"
+CENTRAL_MAX_AUC_MODEL = "../History/logs/max_central_auc.pt"
+CENTRAL_MAX_F1_MODEL = "../History/logs/max_central_f1.pt"
+
 # %%
 # Centralized Training Loop
 
-# ---- Initialize optimizer and loss ----
-optimizer = torch.optim.Adam(central_model.parameters(), lr=central_config["lr"], betas=(0.9, 0.99))
+central_train_rows = []
+central_eval_rows = []
+
+resume_central = False
+start_round = 0
+
+if (
+    resume_central
+    and os.path.exists(CENTRAL_LATEST_MODEL)
+    and os.path.exists(CENTRAL_HISTORY_JSON)
+    and os.path.exists(CENTRAL_PROGRESS_JSON)
+):
+    print("Found centralized checkpoint. Resuming run...")
+
+    central_model.load_state_dict(torch.load(CENTRAL_LATEST_MODEL, map_location=device))
+    central_history = load_json(CENTRAL_HISTORY_JSON)
+    progress = load_json(CENTRAL_PROGRESS_JSON)
+
+    start_round = progress["last_completed_round"]
+
+    if os.path.exists(CENTRAL_TRAIN_CSV):
+        import pandas as pd
+        central_train_rows = pd.read_csv(CENTRAL_TRAIN_CSV).to_dict(orient="records")
+
+    if os.path.exists(CENTRAL_EVAL_CSV):
+        import pandas as pd
+        central_eval_rows = pd.read_csv(CENTRAL_EVAL_CSV).to_dict(orient="records")
+
+    if len(central_history["metrics"]) > 0:
+        cent_max_auc_macro = max(m["auc_macro"] for m in central_history["metrics"])
+        cent_max_f1_micro = max(m["f1_micro"] for m in central_history["metrics"])
+
+    print(f"Restarting at round {start_round + 1}")
+else:
+    print("No centralized checkpoint found. Starting fresh.")
+
+optimizer = torch.optim.Adam(
+    central_model.parameters(),
+    lr=central_config["lr"],
+    betas=(0.9, 0.99)
+)
+
 if central_config.get("use_focal", False):
-    # Smooth alpha to prevent excessive weighting of rare labels
     alpha = torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device)
     loss_fn = FocalLoss(alpha=alpha, gamma=central_config.get("gamma", 2.0))
 else:
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-# ---- Centralized training loop ----
 central_config["rounds"] = 100
 target_evals = 100
 eval_interval = max(1, round(central_config["rounds"] / target_evals))
 
-for rnd in tqdm(range(central_config["rounds"]), colour="green"):
+for rnd in tqdm(range(start_round, central_config["rounds"]), colour="green"):
     central_model.train()
     total_loss = 0.0
 
@@ -1021,16 +1207,18 @@ for rnd in tqdm(range(central_config["rounds"]), colour="green"):
     avg_train_loss = total_loss / len(train_loader)
     central_history["train_loss"].append(avg_train_loss)
 
+    central_train_rows.append({
+        "round": rnd + 1,
+        "train_loss": float(avg_train_loss)
+    })
+
     # ---- Evaluation + saving ----
     if (rnd + 1) % eval_interval == 0 or rnd == central_config["rounds"] - 1:
-        # Evaluate model global
-        # val_loss, metrics = eval_model(central_model, device, val_loader)
-
-        #Evaluate model per label thresh
-        # Compute per-label thresholds dynamically for this checkpoint
         _, per_label_thr = find_best_thresholds_per_label(central_model, val_loader, device)
         val_loss, metrics = eval_model(
-            central_model, device, val_loader,
+            central_model,
+            device,
+            val_loader,
             per_label_thr=per_label_thr,
             use_focal=central_config["use_focal"],
             alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
@@ -1040,32 +1228,57 @@ for rnd in tqdm(range(central_config["rounds"]), colour="green"):
         central_history["val_loss"].append(val_loss)
         central_history["metrics"].append(metrics)
 
-        # Save checkpoints and logs
-        save_json(central_history, "../History/logs/central_metric_history.json")
-        torch.save(central_model.state_dict(), "../History/logs/latest_central_model.pt")
+        central_eval_rows.append({
+            "round": rnd + 1,
+            "train_loss": float(avg_train_loss),
+            "val_loss": float(val_loss),
+            **to_serializable_row(metrics)
+        })
 
-        # Track best-performing centralized models
+        save_json(central_history, CENTRAL_HISTORY_JSON)
+        torch.save(central_model.state_dict(), CENTRAL_LATEST_MODEL)
+
+        save_dict_rows_to_csv(central_train_rows, CENTRAL_TRAIN_CSV)
+        save_dict_rows_to_csv(central_eval_rows, CENTRAL_EVAL_CSV)
+
+        save_json(
+            {
+                "last_completed_round": rnd + 1,
+                "rounds_total": central_config["rounds"],
+                "eval_interval": eval_interval
+            },
+            CENTRAL_PROGRESS_JSON
+        )
+
         if metrics["auc_macro"] > cent_max_auc_macro:
             cent_max_auc_macro = metrics["auc_macro"]
-            torch.save(central_model.state_dict(), "../History/logs/max_central_auc.pt")
+            torch.save(central_model.state_dict(), CENTRAL_MAX_AUC_MODEL)
 
         if metrics["f1_micro"] > cent_max_f1_micro:
             cent_max_f1_micro = metrics["f1_micro"]
-            torch.save(central_model.state_dict(), "../History/logs/max_central_f1.pt")
+            torch.save(central_model.state_dict(), CENTRAL_MAX_F1_MODEL)
 
-        # Print progress
         thr_display = metrics["best_thr"] if isinstance(metrics["best_thr"], str) else f"{metrics['best_thr']:.2f}"
         print(f"Round {rnd+1}/{central_config['rounds']} | "
-            f"Train Loss: {avg_train_loss:.4f} | "
-            f"Val Loss: {val_loss:.4f} | "
-            f"F1_micro: {metrics['f1_micro']:.4f} | "
-            f"Best_F1: {metrics['best_f1_micro']:.4f} (thr={thr_display})")
+              f"Train Loss: {avg_train_loss:.4f} | "
+              f"Val Loss: {val_loss:.4f} | "
+              f"F1_micro: {metrics['f1_micro']:.4f} | "
+              f"Best_F1: {metrics['best_f1_micro']:.4f} (thr={thr_display})")
 
 print("Centralized training complete!")
 
+save_dict_rows_to_csv(
+    central_train_rows,
+    CENTRAL_TRAIN_CSV
+)
+
+save_dict_rows_to_csv(
+    central_eval_rows,
+    CENTRAL_EVAL_CSV
+)
+
 best_f1, best_thr = find_best_threshold(central_model, val_loader, device)
 print(f"Best threshold on validation set: {best_thr} (F1={best_f1:.4f})")
-
 
 # %% [markdown]
 # ### Centralized Training Results Visualization
@@ -1080,7 +1293,7 @@ print(f"Best threshold on validation set: {best_thr} (F1={best_f1:.4f})")
 # %%
 # Load centralized history
 
-central_history = load_json(filepath="../History/logs/central_metric_history.json")
+central_history = load_json(filepath=CENTRAL_HISTORY_JSON)
 print(f"Total Rounds Logged: {len(central_history['val_loss'])}")
 
 # %%
@@ -1100,14 +1313,14 @@ plt.show()
 for X_batch, y_batch in train_loader:
     X_batch = X_batch.to(device)
     y_batch = y_batch.to(device)
-    preds, _ = model(X_batch)
+    preds, _ = central_model(X_batch)
     print("Pred shape:", preds.shape)
     print("Label shape:", y_batch.shape)
     print("Unique label values:", torch.unique(y_batch))
     break
 
 # %%
-# Validaton Metrics Overview
+# Validation Metrics Overview
 
 plt.figure(figsize=(15, 5))
 plt.title("Centralized Model — Validation Metrics")
