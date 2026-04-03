@@ -42,10 +42,60 @@ print(f"Using device: {device}")
 
 
 # %%
+# Output directory structure
+
 OUTPUT_DIR = os.path.join("..", "History", "original_comparison")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-print(f"Saving section CSVs to: {OUTPUT_DIR}")
+def ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+RUN_DIRS = {
+    "bce_federated": ensure_dir(os.path.join(OUTPUT_DIR, "bce_federated")),
+    "bce_centralized": ensure_dir(os.path.join(OUTPUT_DIR, "bce_centralized")),
+    "focal_federated": ensure_dir(os.path.join(OUTPUT_DIR, "focal_federated")),
+    "focal_centralized": ensure_dir(os.path.join(OUTPUT_DIR, "focal_centralized")),
+    "comparison_bce": ensure_dir(os.path.join(OUTPUT_DIR, "comparison_bce")),
+    "comparison_focal": ensure_dir(os.path.join(OUTPUT_DIR, "comparison_focal")),
+}
+
+def get_federated_paths(run_dir: str) -> dict:
+    return {
+        "local_csv": os.path.join(run_dir, "federated_local_losses.csv"),
+        "eval_csv": os.path.join(run_dir, "federated_eval_history.csv"),
+        "progress_json": os.path.join(run_dir, "federated_progress.json"),
+        "history_json": os.path.join(run_dir, "federated_metric_history.json"),
+        "latest_model": os.path.join(run_dir, "latest_model.pt"),
+        "best_auc_model": os.path.join(run_dir, "best_auc_model.pt"),
+        "best_f1_model": os.path.join(run_dir, "best_f1_model.pt"),
+        "thresholds_pt": os.path.join(run_dir, "per_label_thresholds.pt"),
+    }
+
+def get_centralized_paths(run_dir: str) -> dict:
+    return {
+        "train_csv": os.path.join(run_dir, "centralized_train_history.csv"),
+        "eval_csv": os.path.join(run_dir, "centralized_eval_history.csv"),
+        "progress_json": os.path.join(run_dir, "centralized_progress.json"),
+        "history_json": os.path.join(run_dir, "centralized_metric_history.json"),
+        "latest_model": os.path.join(run_dir, "latest_model.pt"),
+        "best_auc_model": os.path.join(run_dir, "best_auc_model.pt"),
+        "best_f1_model": os.path.join(run_dir, "best_f1_model.pt"),
+        "thresholds_pt": os.path.join(run_dir, "per_label_thresholds.pt"),
+    }
+
+def get_comparison_paths(run_dir: str) -> dict:
+    return {
+        "loss_csv": os.path.join(run_dir, "federated_vs_centralized_loss.csv"),
+        "metric_trends_csv": os.path.join(run_dir, "federated_vs_centralized_metric_trends.csv"),
+        "f1_csv": os.path.join(run_dir, "f1_comparison.csv"),
+        "auc_csv": os.path.join(run_dir, "auc_comparison.csv"),
+        "best_scores_csv": os.path.join(run_dir, "best_scores_summary.csv"),
+        "test_results_csv": os.path.join(run_dir, "test_results.csv"),
+        "test_threshold_summary_csv": os.path.join(run_dir, "test_threshold_summary.csv"),
+    }
+
+print(f"Saving experiment outputs under: {OUTPUT_DIR}")
 
 # %% [markdown]
 # ## Data Loading and JSON Utilities
@@ -484,6 +534,19 @@ config = {
 
 model_param_path = os.path.join("..", "Model", "processed_full.w2v")
 
+def get_run_paths(use_focal: bool):
+    run_prefix = "focal" if use_focal else "bce"
+    fed_dir = RUN_DIRS[f"{run_prefix}_federated"]
+    central_dir = RUN_DIRS[f"{run_prefix}_centralized"]
+    compare_dir = RUN_DIRS[f"comparison_{run_prefix}"]
+    return (
+        get_federated_paths(fed_dir),
+        get_centralized_paths(central_dir),
+        get_comparison_paths(compare_dir),
+    )
+
+FED_PATHS, CENTRAL_PATHS, COMPARE_PATHS = get_run_paths(config["use_focal"])
+
 # %%
 # Client data partitioning
 
@@ -800,10 +863,6 @@ best_gamma = max(results, key=results.get)
 print(f"\nBest gamma: {best_gamma} (F1_micro={results[best_gamma]:.4f})")
 config["gamma"] = best_gamma
 
-save_dict_rows_to_csv(
-    gamma_rows,
-    os.path.join(OUTPUT_DIR, "gamma_tuning_results.csv")
-)
 
 # %%
 # Gamma plot
@@ -831,13 +890,14 @@ history = {
 max_auc_macro = 0.0
 max_f1_micro = 0.0
 
-FED_LOCAL_CSV = os.path.join(OUTPUT_DIR, "federated_local_losses.csv")
-FED_EVAL_CSV = os.path.join(OUTPUT_DIR, "federated_eval_history.csv")
-FED_PROGRESS_JSON = os.path.join(OUTPUT_DIR, "federated_progress.json")
-FED_HISTORY_JSON = "../History/logs/metric_history.json"
-FED_LATEST_MODEL = "../History/logs/latest_model.pt"
-FED_MAX_AUC_MODEL = "../History/logs/max_auc.pt"
-FED_MAX_F1_MODEL = "../History/logs/max_f1_micro.pt"
+FED_LOCAL_CSV = FED_PATHS["local_csv"]
+FED_EVAL_CSV = FED_PATHS["eval_csv"]
+FED_PROGRESS_JSON = FED_PATHS["progress_json"]
+FED_HISTORY_JSON = FED_PATHS["history_json"]
+FED_LATEST_MODEL = FED_PATHS["latest_model"]
+FED_MAX_AUC_MODEL = FED_PATHS["best_auc_model"]
+FED_MAX_F1_MODEL = FED_PATHS["best_f1_model"]
+FED_THRESHOLDS_PT = FED_PATHS["thresholds_pt"]
 
 # %%
 # Federated training loop 
@@ -1005,7 +1065,7 @@ print(f"Best threshold on validation set: {best_thr} (F1={best_f1:.4f})")
 # %%
 # Load training history
 
-history = load_json(filepath="../History/logs/metric_history.json")
+history = load_json(filepath=FED_HISTORY_JSON)
 print(f"Total Global Rounds Logged: {len(history['global_loss'])}")
 
 # %%
@@ -1088,7 +1148,6 @@ plt.show()
 # Config - same as FL, but force BCE for the main reported centralized baseline
 
 central_config = config.copy()
-central_config["use_focal"] = False
 print(central_config)
 
 # %%
@@ -1127,13 +1186,14 @@ central_history = {
 cent_max_auc_macro = 0.0
 cent_max_f1_micro = 0.0
 
-CENTRAL_TRAIN_CSV = os.path.join(OUTPUT_DIR, "centralized_train_history.csv")
-CENTRAL_EVAL_CSV = os.path.join(OUTPUT_DIR, "centralized_eval_history.csv")
-CENTRAL_PROGRESS_JSON = os.path.join(OUTPUT_DIR, "centralized_progress.json")
-CENTRAL_HISTORY_JSON = "../History/logs/central_metric_history.json"
-CENTRAL_LATEST_MODEL = "../History/logs/latest_central_model.pt"
-CENTRAL_MAX_AUC_MODEL = "../History/logs/max_central_auc.pt"
-CENTRAL_MAX_F1_MODEL = "../History/logs/max_central_f1.pt"
+CENTRAL_TRAIN_CSV = CENTRAL_PATHS["train_csv"]
+CENTRAL_EVAL_CSV = CENTRAL_PATHS["eval_csv"]
+CENTRAL_PROGRESS_JSON = CENTRAL_PATHS["progress_json"]
+CENTRAL_HISTORY_JSON = CENTRAL_PATHS["history_json"]
+CENTRAL_LATEST_MODEL = CENTRAL_PATHS["latest_model"]
+CENTRAL_MAX_AUC_MODEL = CENTRAL_PATHS["best_auc_model"]
+CENTRAL_MAX_F1_MODEL = CENTRAL_PATHS["best_f1_model"]
+CENTRAL_THRESHOLDS_PT = CENTRAL_PATHS["thresholds_pt"]
 
 # %%
 # Centralized Training Loop
@@ -1186,8 +1246,8 @@ if central_config.get("use_focal", False):
 else:
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-central_config["rounds"] = 100
-target_evals = 100
+central_config["rounds"] = 300 #make even with FL
+target_evals = 300
 eval_interval = max(1, round(central_config["rounds"] / target_evals))
 
 for rnd in tqdm(range(start_round, central_config["rounds"]), colour="green"):
@@ -1362,28 +1422,26 @@ plt.show()
 
 # %% [markdown]
 # ## Federated vs Centralized Comparison
-# 
+#  
 # This section compares the **Federated Learning (FL)** and **Centralized Training (CL)** experiments:
-# 
+#  
 # - Overlayed loss curves
 # - Validation metric trends
 # - Best-performing metrics summary (F1, AUC, etc.)
-# 
+#  
 # The goal is to analyze the trade-offs between distributed vs. centralized optimization.
-# 
 
 # %%
 # Load Both Training Histories
 
-fed_history = load_json(filepath="../History/logs/metric_history.json")
-central_history = load_json(filepath="../History/logs/central_metric_history.json")
+fed_history = load_json(filepath=FED_HISTORY_JSON)
+central_history = load_json(filepath=CENTRAL_HISTORY_JSON)
 
 print(f"FL rounds logged: {len(fed_history['global_loss'])}")
 print(f"CL rounds logged: {len(central_history['val_loss'])}")
 
-
 # %%
-# FL vs Certralized - Loss Comparison
+# FL vs Centralized - Loss Comparison
 
 plt.figure(figsize=(10, 5))
 plt.plot(fed_history["global_loss"], label="Federated (Global Loss)", linewidth=2)
@@ -1395,9 +1453,22 @@ plt.legend()
 plt.grid(alpha=0.3)
 plt.show()
 
+loss_comparison_rows = []
+n_loss_points = min(len(fed_history["global_loss"]), len(central_history["val_loss"]))
+
+for i in range(n_loss_points):
+    loss_comparison_rows.append({
+        "checkpoint": i + 1,
+        "federated_global_loss": float(fed_history["global_loss"][i]),
+        "centralized_val_loss": float(central_history["val_loss"][i])
+    })
+
+save_dict_rows_to_csv(
+    loss_comparison_rows,
+    COMPARE_PATHS["loss_csv"]
+)
 
 # %%
-
 # Federated vs Centralized — Validation Metric Trends
 
 plt.figure(figsize=(15, 5))
@@ -1421,6 +1492,20 @@ plt.legend()
 plt.grid(alpha=0.3)
 plt.show()
 
+comparison_metric_rows = []
+n_checkpoints = min(len(fed_history["global_metrics"]), len(central_history["metrics"]))
+
+for i in range(n_checkpoints):
+    row = {"checkpoint": i + 1}
+    for key in shared_metrics:
+        row[f"fl_{key}"] = fed_history["global_metrics"][i][key]
+        row[f"cl_{key}"] = central_history["metrics"][i][key]
+    comparison_metric_rows.append(to_serializable_row(row))
+
+save_dict_rows_to_csv(
+    comparison_metric_rows,
+    COMPARE_PATHS["metric_trends_csv"]
+)
 
 # %%
 # F1 Comparison (Macro & Micro)
@@ -1439,6 +1524,23 @@ plt.legend()
 plt.grid(alpha=0.3)
 plt.show()
 
+f1_comparison_rows = []
+n_f1_points = min(len(fed_history["global_metrics"]), len(central_history["metrics"]))
+
+for i in range(n_f1_points):
+    f1_comparison_rows.append({
+        "checkpoint": i + 1,
+        "fl_f1_macro": float(fed_history["global_metrics"][i]["f1_macro"]),
+        "fl_f1_micro": float(fed_history["global_metrics"][i]["f1_micro"]),
+        "cl_f1_macro": float(central_history["metrics"][i]["f1_macro"]),
+        "cl_f1_micro": float(central_history["metrics"][i]["f1_micro"])
+    })
+
+save_dict_rows_to_csv(
+    f1_comparison_rows,
+    COMPARE_PATHS["f1_csv"]
+)
+
 # %%
 # AUC Comparison (Macro & Micro)
 
@@ -1456,6 +1558,22 @@ plt.legend()
 plt.grid(alpha=0.3)
 plt.show()
 
+auc_comparison_rows = []
+n_auc_points = min(len(fed_history["global_metrics"]), len(central_history["metrics"]))
+
+for i in range(n_auc_points):
+    auc_comparison_rows.append({
+        "checkpoint": i + 1,
+        "fl_auc_macro": float(fed_history["global_metrics"][i]["auc_macro"]),
+        "fl_auc_micro": float(fed_history["global_metrics"][i]["auc_micro"]),
+        "cl_auc_macro": float(central_history["metrics"][i]["auc_macro"]),
+        "cl_auc_micro": float(central_history["metrics"][i]["auc_micro"])
+    })
+
+save_dict_rows_to_csv(
+    auc_comparison_rows,
+    COMPARE_PATHS["auc_csv"]
+)
 
 # %%
 # Quantitative Comparison — Best Scores
@@ -1470,9 +1588,26 @@ print("Federated vs Centralized Results Summary")
 print(f"Federated  → Best F1 (micro): {fed_best_f1:.4f} | Best AUC (macro): {fed_best_auc:.4f}")
 print(f"Centralized → Best F1 (micro): {cent_best_f1:.4f} | Best AUC (macro): {cent_best_auc:.4f}")
 
+comparison_rows = [
+    {
+        "model": "federated",
+        "best_f1_micro": float(fed_best_f1),
+        "best_auc_macro": float(fed_best_auc)
+    },
+    {
+        "model": "centralized",
+        "best_f1_micro": float(cent_best_f1),
+        "best_auc_macro": float(cent_best_auc)
+    }
+]
+
+save_dict_rows_to_csv(
+    comparison_rows,
+    COMPARE_PATHS["best_scores_csv"]
+)
 
 # %% [markdown]
-# ## Metric Stuff
+# ## Threshold Analysis (Per-Label vs Global)
 
 # %%
 print(history["global_metrics"][-3:])
@@ -1498,7 +1633,7 @@ print(f"Max threshold: {per_label_thr.max():.3f}")
 print(f"Mean threshold: {per_label_thr.mean():.3f}")
 print(f"Std dev: {per_label_thr.std():.3f}")
 
-torch.save(per_label_thr, "../History/logs/per_label_thresholds.pt")
+torch.save(per_label_thr, CENTRAL_THRESHOLDS_PT)
 
 plt.figure(figsize=(12, 4))
 plt.bar(np.arange(len(per_label_thr)), per_label_thr.cpu().numpy(), color='skyblue')
@@ -1519,58 +1654,19 @@ print(f"Per-label tuned F1: {macro_f1_per_label:.4f}")
 # ## Test Set Comparison
 
 # %%
-# # --- Test set evaluation (for paper comparison) ---
-# test_loader = load_data(split="test")
-
-# # Load best-performing models (by val F1 or AUC)
-# central_model.load_state_dict(torch.load("../History/logs/max_central_f1.pt"))
-# Global_Model.load_state_dict(torch.load("../History/logs/max_f1_micro.pt"))
-
-# # Compute per-label thresholds from validation set (to keep protocol consistent)
-# _, per_label_thr = find_best_thresholds_per_label(central_model, val_loader, device)
-
-# # ---- Centralized Test Evaluation ----
-# test_loss_c, test_metrics_c = eval_model(
-#     central_model,
-#     device,
-#     test_loader,
-#     per_label_thr=per_label_thr,
-#     use_focal=central_config["use_focal"],
-#     alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
-#     gamma=central_config["gamma"]
-# )
-# print(f"Centralized Test — F1_micro={test_metrics_c['f1_micro']:.3f}, "
-#       f"F1_macro={test_metrics_c['f1_macro']:.3f}, "
-#       f"AUC_micro={test_metrics_c['auc_micro']:.3f}, "
-#       f"AUC_macro={test_metrics_c['auc_macro']:.3f}")
-
-# # ---- Federated Test Evaluation ----
-# test_loss_f, test_metrics_f = eval_model(
-#     Global_Model,
-#     device,
-#     test_loader,
-#     per_label_thr=per_label_thr,
-#     use_focal=config["use_focal"],
-#     alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
-#     gamma=config["gamma"]
-# )
-# print(f"Federated Test — F1_micro={test_metrics_f['f1_micro']:.3f}, "
-#       f"F1_macro={test_metrics_f['f1_macro']:.3f}, "
-#       f"AUC_micro={test_metrics_f['auc_micro']:.3f}, "
-#       f"AUC_macro={test_metrics_f['auc_macro']:.3f}")
-
-
-# %%
 # --- Test set evaluation (for paper comparison) ---
 test_loader = load_data(split="test")
 
-# Load best-performing models (by val F1 or AUC)
-central_model.load_state_dict(torch.load("../History/logs/max_central_f1.pt"))
-Global_Model.load_state_dict(torch.load("../History/logs/max_f1_micro.pt"))
+# Load best-performing models (selected by validation F1_micro)
+central_model.load_state_dict(torch.load(CENTRAL_MAX_F1_MODEL, map_location=device))
+Global_Model.load_state_dict(torch.load(FED_MAX_F1_MODEL, map_location=device))
 
-# Compute per-label thresholds from validation set (to keep protocol consistent)
+# Compute per-label thresholds from validation set separately for each model
 _, thr_c = find_best_thresholds_per_label(central_model, val_loader, device)
 _, thr_f = find_best_thresholds_per_label(Global_Model, val_loader, device)
+
+torch.save(thr_c, CENTRAL_THRESHOLDS_PT)
+torch.save(thr_f, FED_THRESHOLDS_PT)
 
 # ---- Centralized Test Evaluation ----
 test_loss_c, test_metrics_c = eval_model(
@@ -1578,14 +1674,16 @@ test_loss_c, test_metrics_c = eval_model(
     device,
     test_loader,
     per_label_thr=thr_c,
-    use_focal=central_config["use_focal"], #note this only affects loss which we dont report not the metrics results
+    use_focal=central_config["use_focal"],  # only affects reported loss, not thresholded metrics
     alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
     gamma=central_config["gamma"]
 )
 print(f"Centralized Test — F1_micro={test_metrics_c['f1_micro']:.3f}, "
       f"F1_macro={test_metrics_c['f1_macro']:.3f}, "
       f"AUC_micro={test_metrics_c['auc_micro']:.3f}, "
-      f"AUC_macro={test_metrics_c['auc_macro']:.3f}")
+      f"AUC_macro={test_metrics_c['auc_macro']:.3f}, "
+      f"PR-AUC_micro={test_metrics_c['pr_auc_micro']:.3f}, "
+      f"PR-AUC_macro={test_metrics_c['pr_auc_macro']:.3f}")
 
 # ---- Federated Test Evaluation ----
 test_loss_f, test_metrics_f = eval_model(
@@ -1600,7 +1698,52 @@ test_loss_f, test_metrics_f = eval_model(
 print(f"Federated Test — F1_micro={test_metrics_f['f1_micro']:.3f}, "
       f"F1_macro={test_metrics_f['f1_macro']:.3f}, "
       f"AUC_micro={test_metrics_f['auc_micro']:.3f}, "
-      f"AUC_macro={test_metrics_f['auc_macro']:.3f}")
+      f"AUC_macro={test_metrics_f['auc_macro']:.3f}, "
+      f"PR-AUC_micro={test_metrics_f['pr_auc_micro']:.3f}, "
+      f"PR-AUC_macro={test_metrics_f['pr_auc_macro']:.3f}")
 
+test_rows = [
+    {
+        "model": "centralized",
+        "checkpoint_selection": "best_val_f1_micro",
+        "threshold_source": "centralized_validation",
+        "test_loss": float(test_loss_c),
+        **to_serializable_row(test_metrics_c)
+    },
+    {
+        "model": "federated",
+        "checkpoint_selection": "best_val_f1_micro",
+        "threshold_source": "federated_validation",
+        "test_loss": float(test_loss_f),
+        **to_serializable_row(test_metrics_f)
+    }
+]
+
+save_dict_rows_to_csv(
+    test_rows,
+    COMPARE_PATHS["test_results_csv"]
+)
+
+test_threshold_rows = [
+    {
+        "model": "centralized",
+        "min_threshold": float(thr_c.min()),
+        "max_threshold": float(thr_c.max()),
+        "mean_threshold": float(thr_c.mean()),
+        "std_threshold": float(thr_c.std())
+    },
+    {
+        "model": "federated",
+        "min_threshold": float(thr_f.min()),
+        "max_threshold": float(thr_f.max()),
+        "mean_threshold": float(thr_f.mean()),
+        "std_threshold": float(thr_f.std())
+    }
+]
+
+save_dict_rows_to_csv(
+    test_threshold_rows,
+    COMPARE_PATHS["test_threshold_summary_csv"]
+)
 
 
