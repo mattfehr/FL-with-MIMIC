@@ -34,6 +34,7 @@ import copy
 import pandas as pd    # NEW – to store experiment results
 import time             # NEW – to track runtime for each config
 import itertools
+import csv
 
 # Optional: to ensure reproducibility
 torch.manual_seed(42)
@@ -42,6 +43,28 @@ torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+
+# %%
+TESTPLAN_DIR = os.path.join("..", "History", "TestPlan")
+os.makedirs(TESTPLAN_DIR, exist_ok=True)
+
+GRID_RESULTS_CSV = os.path.join(TESTPLAN_DIR, "summary_results_fixed.csv")
+GRID_RESULTS_JSON = os.path.join(TESTPLAN_DIR, "summary_results_fixed.json")
+
+ATTN_EVAL_CSV = os.path.join(TESTPLAN_DIR, "attention_model_test_metrics_fixed.csv")
+ATTN_EVAL_JSON = os.path.join(TESTPLAN_DIR, "attention_model_test_metrics_fixed.json")
+
+ATTN_MODELS = {
+    "central":  os.path.join("..", "History", "models", "central_best_attention.pt"),
+    "fedavg":   os.path.join("..", "History", "models", "fedavg_c2e3_best_attention.pt"),
+    "fedprox":  os.path.join("..", "History", "models", "fedprox_c2e3_best_attention.pt"),
+    "scaffold": os.path.join("..", "History", "models", "scaffold_c2e3_best_attention.pt"),
+}
+
+print(f"TestPlan outputs will be saved under: {TESTPLAN_DIR}")
+print("Attention models will be saved to:")
+for k, v in ATTN_MODELS.items():
+    print(f"  {k}: {v}")
 
 # %% [markdown]
 # ## Data Loading and JSON Utilities
@@ -102,6 +125,44 @@ def load_json(filepath: str) -> dict:
     """
     with open(filepath, mode="r") as f:
         return json.load(f)
+
+# %%
+def save_dict_rows_to_csv(rows: list[dict], filepath: str) -> None:
+    """
+    Save a list of dictionaries to a CSV file.
+    """
+    if not rows:
+        print(f"[save_dict_rows_to_csv] No rows to save for {filepath}")
+        return
+
+    fieldnames = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
+
+    with open(filepath, mode="w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Saved CSV: {filepath}")
+
+def to_serializable_row(row: dict) -> dict:
+    """
+    Convert metric values to plain Python scalars when possible.
+    """
+    cleaned = {}
+    for k, v in row.items():
+        if isinstance(v, (np.floating, np.integer)):
+            cleaned[k] = v.item()
+        elif isinstance(v, torch.Tensor):
+            cleaned[k] = v.item() if v.numel() == 1 else v.detach().cpu().tolist()
+        else:
+            cleaned[k] = v
+    return cleaned
 
 # %% [markdown]
 # ## Model Definition — ConvAttnPool
@@ -265,64 +326,55 @@ def FedAvg(global_model: dict, client_state_dicts: list[dict]) -> dict:
 
 def FedProx(global_model_dict, client_state_dicts, mu=0.01):
     """
-    FedProx aggregation (same averaging as FedAvg, 
+    FedProx aggregation (same averaging as FedAvg,
     since proximal regularization happens in local training).
-    
+
     Args:
         global_model_dict (dict): Global model parameters.
         client_state_dicts (list[dict]): List of client parameter dicts.
         mu (float): Proximal term weight (applied during local updates).
     """
-    # FedProx uses FedAvg-style aggregation; proximal term affects client training only.
     return FedAvg(global_model_dict, client_state_dicts)
 
 
-def Scaffold(global_model_dict, client_state_dicts, c_global, c_clients, lr, num_clients):
+def Scaffold(global_model_dict, client_state_dicts, c_global, c_clients_old, c_clients_new):
     """
-    SCAFFOLD server update rule:
-        w_{t+1} = w_t + (1/K) * Σ [Δw_k - lr * (c_k - c)]
-    
+    SCAFFOLD server update.
+
+    Model update:
+        same aggregation as FedAvg over corrected local client models
+
+    Global control variate update:
+        c <- c + average(c_i_new - c_i_old)
+
     Args:
-        global_model_dict: current global weights (dict of tensors)
-        client_state_dicts: list of client state_dicts after local updates
-        c_global: global control variate dict
-        c_clients: list of local control variate dicts
-        lr: learning rate
-        num_clients: number of clients participating this round
-    
+        global_model_dict (dict): Current global model state_dict.
+        client_state_dicts (list[dict]): Client model state_dicts after local training.
+        c_global (dict): Global control variate dict, keyed by parameter name.
+        c_clients_old (list[dict]): Client control variates before this round.
+        c_clients_new (list[dict]): Client control variates after this round.
+
     Returns:
-        Updated (global_model_dict, c_global, c_clients)
+        tuple[dict, dict]:
+            - new global model state_dict
+            - new global control variate dict
     """
-    new_global = copy.deepcopy(global_model_dict)
+    # Global model update is just FedAvg of the corrected local models
+    new_global = FedAvg(global_model_dict, client_state_dicts)
 
-    # Average model deltas with control variate correction
-    for key in global_model_dict.keys():
-        # Δw_k = w_k - w_global
-        deltas = torch.stack(
-            [client_state_dicts[k][key] - global_model_dict[key] for k in range(num_clients)],
-            dim=0
-        )
-        mean_delta = torch.mean(deltas, dim=0)
+    # Global control variate update
+    new_c_global = {}
+    num_clients = len(c_clients_new)
 
-        # correction term from c_k - c
-        correction = torch.stack(
-            [c_clients[k][key] - c_global[key] for k in range(num_clients)],
+    for name in c_global.keys():
+        delta_c = torch.stack(
+            [c_clients_new[k][name] - c_clients_old[k][name] for k in range(num_clients)],
             dim=0
         ).mean(dim=0)
 
-        # apply update
-        new_global[key] = global_model_dict[key] + mean_delta - lr * correction
+        new_c_global[name] = c_global[name] + delta_c
 
-    # update global control variate
-    for key in c_global.keys():
-        delta_cs = torch.stack(
-            [c_clients[k][key] - c_global[key] for k in range(num_clients)],
-            dim=0
-        )
-        c_global[key] = c_global[key] + (1 / num_clients) * delta_cs.mean(dim=0)
-
-    return new_global, c_global, c_clients
-
+    return new_global, new_c_global
 
 # %% [markdown]
 # ### Client Update Routine
@@ -383,21 +435,29 @@ def client_update(
     gamma: float = 2.5,
     mu: float = 0.01,                   # FedProx proximal coefficient
     global_params: dict = None,         # for FedProx / SCAFFOLD
-    c_global: dict = None,              # for SCAFFOLD
-    c_local: dict = None,               # for SCAFFOLD
-    algorithm: str = "FedAvg"           # which algorithm is being used
+    c_global: dict = None,              # for SCAFFOLD (parameter names only)
+    c_local: dict = None,               # for SCAFFOLD (parameter names only)
+    algorithm: str = "FedAvg"           # "FedAvg", "FedProx", or "SCAFFOLD"
 ) -> tuple[float, dict, dict]:
     """
     Perform local training for a single client.
     Supports FedAvg, FedProx, and SCAFFOLD.
-    Returns (final_loss, updated_model_state, updated_c_local)
+
+    Returns:
+        tuple:
+            - final loss
+            - cloned model state_dict after local training
+            - updated local control variate dict (or original c_local / None)
     """
     model.to(device)
     model.train()
 
     n_labels = train_loader.dataset[0][1].shape[0]
     pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.99))
+    if algorithm == "SCAFFOLD":
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.99))
 
     if use_focal:
         alpha = torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device)
@@ -405,34 +465,68 @@ def client_update(
     else:
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # --- Training loop ---
+    last_loss = None
+
+    # Count optimizer steps for SCAFFOLD local control update
+    step_count = 0
+
     for _ in range(epochs):
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
             preds, _ = model(X_batch)
             loss = loss_fn(preds, y_batch)
 
             # --- FedProx proximal term ---
             if algorithm == "FedProx" and global_params is not None:
                 prox_term = 0.0
-                for w, w_global in zip(model.parameters(), global_params.values()):
-                    prox_term += (w - w_global.to(device)).norm(2) ** 2
-                loss += (mu / 2) * prox_term
+                for name, w in model.named_parameters():
+                    w_global = global_params[name].to(device)
+                    prox_term += (w - w_global).norm(2) ** 2
+                loss += (mu / 2.0) * prox_term
 
             optimizer.zero_grad()
             loss.backward()
 
-            # --- SCAFFOLD correction ---
+            # --- SCAFFOLD gradient correction ---
             if algorithm == "SCAFFOLD" and c_global is not None and c_local is not None:
                 with torch.no_grad():
-                    for w, cg, cl in zip(model.parameters(), c_global.values(), c_local.values()):
+                    for name, w in model.named_parameters():
                         if w.grad is not None:
-                            w.grad -= (cg.to(device) - cl.to(device))
+                            w.grad += c_global[name].to(device) - c_local[name].to(device)
 
             optimizer.step()
+            step_count += 1
+            last_loss = loss.item()
 
-    return loss.item(), model.state_dict(), c_local
+    # Safe cloned return for aggregation
+    new_weights = {
+        k: v.detach().clone()
+        for k, v in model.state_dict().items()
+    }
 
+    # --- SCAFFOLD local control variate update ---
+    new_c_local = c_local
+    if algorithm == "SCAFFOLD" and c_global is not None and c_local is not None:
+        if global_params is None:
+            raise ValueError("global_params must be provided for SCAFFOLD")
+
+        if step_count == 0:
+            raise ValueError("SCAFFOLD step_count is zero; train_loader appears empty")
+
+        new_c_local = {}
+        with torch.no_grad():
+            for name in c_global.keys():
+                w_global = global_params[name].to(device)
+                w_local = new_weights[name].to(device)
+                c_g = c_global[name].to(device)
+                c_l = c_local[name].to(device)
+
+                # c_i_new = c_i_old - c + (w_global - w_local) / (K * lr)
+                updated_c = c_l - c_g + (w_global - w_local) / (step_count * lr)
+                new_c_local[name] = updated_c.detach().cpu().clone()
+
+    return last_loss, new_weights, new_c_local
 
 # %% [markdown]
 # ## Federated Training — Full Experiment Pipeline
@@ -571,8 +665,6 @@ def find_best_thresholds_per_label(model: nn.Module, data_loader: DataLoader, de
     return macro_f1, best_thresholds.cpu()
 
 # %%
-import math
-
 def _fmt(x):
     """Safely format floats that might be None or NaN."""
     if x is None:
@@ -665,141 +757,160 @@ val_loader = load_data("val")
 test_loader = load_data("test")
 
 # %%
-# def run_federated_experiment(algo, num_clients, local_epochs, config, train_dataset, val_loader, test_loader, device):
-#     """
-#     Runs one federated configuration (FedAvg, FedProx, or SCAFFOLD)
-#     and returns evaluation metrics on the test set.
-#     """
-#     start_time = time.time()
+def run_federated_experiment(algo, num_clients, local_epochs, config, train_dataset, val_loader, test_loader, device):
+    """
+    Runs one federated configuration (FedAvg, FedProx, or SCAFFOLD)
+    and returns evaluation metrics on the test set.
+    """
+    start_time = time.time()
 
-#     # --- Split dataset into clients dynamically ---
-#     splits = [1 / num_clients] * num_clients
-#     lengths = [int(len(train_dataset) * s) for s in splits[:-1]]
-#     lengths.append(len(train_dataset) - sum(lengths))
-#     client_datasets = random_split(train_dataset, lengths=lengths)
-#     c_loaders = [DataLoader(c, batch_size=config["batch_size"], shuffle=True) for c in client_datasets]
+    # --- Split dataset into clients dynamically ---
+    splits = [1 / num_clients] * num_clients
+    lengths = [int(len(train_dataset) * s) for s in splits[:-1]]
+    lengths.append(len(train_dataset) - sum(lengths))
+    generator = torch.Generator().manual_seed(42)
+    client_datasets = random_split(train_dataset, lengths=lengths, generator=generator)
+    c_loaders = [DataLoader(c, batch_size=config["batch_size"], shuffle=True) for c in client_datasets]
 
-#     # --- Initialize global and client models ---
-#     global_model = GenerateModel(
-#         model_param_path,
-#         num_of_filters=config["n_filters"],
-#         kernel_size=config["window_size"]
-#     ).to(device)
+    # --- Initialize global and client models ---
+    global_model = GenerateModel(
+        model_param_path,
+        num_of_filters=config["n_filters"],
+        kernel_size=config["window_size"]
+    ).to(device)
 
-#     client_model = copy.deepcopy(global_model)
+    client_model = copy.deepcopy(global_model)
 
-#     # --- Initialize control variates if SCAFFOLD ---
-#     if algo == "SCAFFOLD":
-#         c_global = {k: torch.zeros_like(v) for k, v in global_model.state_dict().items()}
-#         c_clients = [{k: torch.zeros_like(v) for k, v in global_model.state_dict().items()} for _ in range(num_clients)]
-#     else:
-#         c_global = c_clients = None
+    # --- Initialize control variates if SCAFFOLD ---
+    if algo == "SCAFFOLD":
+        c_global = {
+            name: torch.zeros_like(param.detach().cpu())
+            for name, param in global_model.named_parameters()
+        }
+        c_clients = [
+            {
+                name: torch.zeros_like(param.detach().cpu())
+                for name, param in global_model.named_parameters()
+            }
+            for _ in range(num_clients)
+        ]
+    else:
+        c_global = c_clients = None
 
-#     # --- Federated training rounds ---
-#     for rnd in tqdm(range(config["rounds"]), colour="blue", desc=f"{algo} | Clients={num_clients} | Epochs={local_epochs}"):
-#         client_params = []
-#         new_c_clients = []
+    # --- Federated training rounds ---
+    for rnd in tqdm(range(config["rounds"]), colour="blue", desc=f"{algo} | Clients={num_clients} | Epochs={local_epochs}"):
+        client_params = []
+        new_c_clients = []
 
-#         # ---- Each client trains locally ----
-#         for idx, loader in enumerate(c_loaders):
-#             client_model.load_state_dict(global_model.state_dict())
+        global_params_snapshot = {
+            k: v.detach().clone()
+            for k, v in global_model.state_dict().items()
+        }
 
-#             local_loss, client_state, c_local = client_update(
-#                 model=client_model,
-#                 train_loader=loader,
-#                 epochs=local_epochs,
-#                 lr=config["lr"],
-#                 device=device,
-#                 use_focal=config["use_focal"],
-#                 gamma=config["gamma"],
-#                 mu=config["mu"],
-#                 global_params=global_model.state_dict(),
-#                 c_global=c_global if algo == "SCAFFOLD" else None,
-#                 c_local=c_clients[idx] if algo == "SCAFFOLD" else None,
-#                 algorithm=algo
-#             )
+        # ---- Each client trains locally ----
+        for idx, loader in enumerate(c_loaders):
+            client_model.load_state_dict(global_model.state_dict())
 
-#             client_params.append(client_state)
-#             new_c_clients.append(c_local)
+            local_loss, client_state, c_local = client_update(
+                model=client_model,
+                train_loader=loader,
+                epochs=local_epochs,
+                lr=config["lr"],
+                device=device,
+                use_focal=config["use_focal"],
+                gamma=config["gamma"],
+                mu=config["mu"],
+                global_params=global_params_snapshot,
+                c_global=c_global if algo == "SCAFFOLD" else None,
+                c_local=c_clients[idx] if algo == "SCAFFOLD" else None,
+                algorithm=algo
+            )
 
-#         # ---- Aggregate updates ----
-#         if algo == "FedAvg":
-#             new_params = FedAvg(global_model.state_dict(), client_params)
-#             global_model.load_state_dict(new_params)
+            client_params.append(client_state)
+            new_c_clients.append(c_local)
 
-#         elif algo == "FedProx":
-#             new_params = FedProx(global_model.state_dict(), client_params, mu=config["mu"])
-#             global_model.load_state_dict(new_params)
+        # ---- Aggregate updates ----
+        if algo == "FedAvg":
+            new_params = FedAvg(global_model.state_dict(), client_params)
+            global_model.load_state_dict(new_params)
 
-#         elif algo == "SCAFFOLD":
-#             new_params, c_global, c_clients = Scaffold(
-#                 global_model.state_dict(),
-#                 client_params,
-#                 c_global,
-#                 c_clients,
-#                 lr=config["lr"],
-#                 num_clients=num_clients
-#             )
-#             global_model.load_state_dict(new_params)
+        elif algo == "FedProx":
+            new_params = FedProx(global_model.state_dict(), client_params, mu=config["mu"])
+            global_model.load_state_dict(new_params)
 
-#     # --- Evaluate on test set using per-label thresholds from validation ---
-#     _, per_label_thr = find_best_thresholds_per_label(global_model, val_loader, device)
-#     _, metrics = eval_model(global_model, device, test_loader, per_label_thr=per_label_thr)
+        elif algo == "SCAFFOLD":
+            new_params, c_global = Scaffold(
+                global_model.state_dict(),
+                client_params,
+                c_global,
+                c_clients,
+                new_c_clients
+            )
+            global_model.load_state_dict(new_params)
+            c_clients = new_c_clients
 
-#     elapsed = time.time() - start_time
-#     return metrics, elapsed
+    # --- Evaluate on test set using per-label thresholds from validation ---
+    _, per_label_thr = find_best_thresholds_per_label(global_model, val_loader, device)
+    _, metrics = eval_model(global_model, device, test_loader, per_label_thr=per_label_thr)
+
+    elapsed = time.time() - start_time
+    return metrics, elapsed
 
 
 # %%
-# # === Federated Experiment Grid: FedAvg, FedProx, SCAFFOLD ===
+# === Federated Experiment Grid: FedAvg, FedProx, SCAFFOLD ===
 
-# results = pd.DataFrame(columns=[
-#     "Function", "Clients", "Local Epochs",
-#     "AUC Macro", "AUC Micro",
-#     "F1 Macro", "F1 Micro",
-#     "PR-AUC Macro", "PR-AUC Micro",
-#     "Time"
-# ])
+results = pd.DataFrame(columns=[
+    "Function", "Clients", "Local Epochs",
+    "AUC Macro", "AUC Micro",
+    "F1 Macro", "F1 Micro",
+    "PR-AUC Macro", "PR-AUC Micro",
+    "Time"
+])
 
-# algorithms = ["FedAvg", "FedProx", "SCAFFOLD"]
-# client_counts = [2, 3, 4]
-# local_epochs = [1, 2, 3]
+algorithms = ["FedAvg", "FedProx", "SCAFFOLD"]
+client_counts = [2, 3, 4]
+local_epochs = [1, 2, 3]
 
-# for algo in algorithms:
-#     for n_clients in client_counts:
-#         for epochs in local_epochs:
-#             print(f"\n=== Running {algo} | Clients={n_clients} | Local Epochs={epochs} ===")
-#             config["algorithm"] = algo
-#             config["epochs"] = epochs
+for algo in algorithms:
+    for n_clients in client_counts:
+        for epochs in local_epochs:
+            print(f"\n=== Running {algo} | Clients={n_clients} | Local Epochs={epochs} ===")
+            config["algorithm"] = algo
+            config["epochs"] = epochs
 
-#             metrics, elapsed = run_federated_experiment(
-#                 algo=algo,
-#                 num_clients=n_clients,
-#                 local_epochs=epochs,
-#                 config=config.copy(),
-#                 train_dataset=train_dataset,
-#                 val_loader=val_loader,
-#                 test_loader=test_loader,
-#                 device=device
-#             )
+            metrics, elapsed = run_federated_experiment(
+                algo=algo,
+                num_clients=n_clients,
+                local_epochs=epochs,
+                config=config.copy(),
+                train_dataset=train_dataset,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                device=device
+            )
 
-#             results.loc[len(results)] = [
-#                 algo, n_clients, epochs,
-#                 metrics.get("auc_macro", None),
-#                 metrics.get("auc_micro", None),
-#                 metrics.get("f1_macro", None),
-#                 metrics.get("f1_micro", None),
-#                 metrics.get("pr_auc_macro", None),
-#                 metrics.get("pr_auc_micro", None),
-#                 elapsed
-#             ]
+            results.loc[len(results)] = [
+                algo, n_clients, epochs,
+                metrics.get("auc_macro", None),
+                metrics.get("auc_micro", None),
+                metrics.get("f1_macro", None),
+                metrics.get("f1_micro", None),
+                metrics.get("pr_auc_macro", None),
+                metrics.get("pr_auc_micro", None),
+                elapsed
+            ]
 
-#             # Save after each run to preserve progress
-#             results.to_csv("../History/summary_results.csv", index=False)
-#             print(f"Completed: {algo} | Clients={n_clients} | Epochs={epochs}\n")
+            # Save after each run to preserve progress
+            results.to_csv(GRID_RESULTS_CSV, index=False)
+            save_json(
+                {"rows": [to_serializable_row(r) for r in results.to_dict(orient="records")]},
+                GRID_RESULTS_JSON
+            )
+            print(f"Completed: {algo} | Clients={n_clients} | Epochs={epochs}\n")
 
-# print("\nAll 27 configurations complete!")
-# print(results)
+print("\nAll 27 configurations complete!")
+print(results)
 
 
 # %% [markdown]
@@ -1031,9 +1142,15 @@ test_loader = load_data("test")
 
 #     # SCAFFOLD control variates
 #     if algo == "SCAFFOLD":
-#         c_global = {k: torch.zeros_like(v) for k, v in global_model.state_dict().items()}
+#         c_global = {
+#             name: torch.zeros_like(param.detach().cpu())
+#             for name, param in global_model.named_parameters()
+#         }
 #         c_clients = [
-#             {k: torch.zeros_like(v) for k, v in global_model.state_dict().items()}
+#             {
+#                 name: torch.zeros_like(param.detach().cpu())
+#                 for name, param in global_model.named_parameters()
+#             }
 #             for _ in range(num_clients)
 #         ]
 #     else:
@@ -1047,7 +1164,12 @@ test_loader = load_data("test")
 #     for rnd in tqdm(range(rounds), desc=f"{algo} FL Training", colour="blue"):
 #         updates = []
 #         new_c_clients = []
-
+#
+#         global_params_snapshot = {
+#             k: v.detach().clone()
+#             for k, v in global_model.state_dict().items()
+#         }
+#
 #         # Local training
 #         for i, loader in enumerate(client_loaders):
 #             client_model.load_state_dict(global_model.state_dict())
@@ -1061,7 +1183,7 @@ test_loader = load_data("test")
 #                 use_focal=config["use_focal"],
 #                 gamma=config["gamma"],
 #                 mu=config["mu"],
-#                 global_params=global_model.state_dict(),
+#                 global_params=global_params_snapshot,
 #                 c_global=c_global if algo=="SCAFFOLD" else None,
 #                 c_local=c_clients[i] if algo=="SCAFFOLD" else None,
 #                 algorithm=algo
@@ -1078,9 +1200,12 @@ test_loader = load_data("test")
 #             global_model.load_state_dict(FedProx(global_model.state_dict(), updates, mu=config["mu"]))
 
 #         elif algo == "SCAFFOLD":
-#             new_params, c_global, c_clients = Scaffold(
-#                 global_model.state_dict(), updates, c_global, c_clients,
-#                 lr=config["lr"], num_clients=num_clients
+#             new_params, c_global = Scaffold(
+#                 global_model.state_dict(),
+#                 updates,
+#                 c_global,
+#                 c_clients,
+#                 new_c_clients
 #             )
 #             global_model.load_state_dict(new_params)
 #             c_clients = new_c_clients
@@ -1183,871 +1308,14 @@ test_loader = load_data("test")
 #         metrics["pr_auc_micro"],
 #     ]
 
+# attn_results.to_csv(ATTN_EVAL_CSV, index=False)
+# save_json(
+#     {"rows": [to_serializable_row(r) for r in attn_results.to_dict(orient="records")]},
+#     ATTN_EVAL_JSON
+# )
+
 # print("\n=== Attention Models — Test Metrics Summary ===")
 # display(attn_results)
 
-
-# %% [markdown]
-# ## Client Number Sensitivity Analysis
-# 
-# Goal: test how FL performance changes as the number of simulated clients increases.
-# 
-# **Option A (implemented now): IID split**
-# - Randomly split the same training dataset into K approximately equal partitions.
-# 
-# **Option B (later): non-IID split**
-# - Split data to mimic hospital heterogeneity (label prevalence shifts, size imbalance, etc.).
-# 
-# We keep everything else fixed (model, optimizer, rounds, local epochs) so the only change is
-# the number of clients and the resulting partitioning.
-
-# %%
-# do weighted by partition size instead of mean by clients (important for different sizes like part b)
-
-def FedAvg_weighted(client_state_dicts: list[dict], client_sizes: list[int]) -> dict:
-    """
-    Weighted FedAvg by client dataset size. Returns a NEW state_dict (does not mutate inputs).
-    client_state_dicts: list of state_dicts (as produced by model.state_dict())
-    client_sizes: list of ints (number of samples per client)
-    """
-    total = float(sum(client_sizes))
-    out = {}
-    # iterate keys from first client's state_dict
-    for key in client_state_dicts[0].keys():
-        # accumulate weighted sum
-        acc = None
-        for sd, n in zip(client_state_dicts, client_sizes):
-            term = sd[key].float() * (n / total)
-            acc = term if acc is None else acc + term
-        out[key] = acc
-    return out
-
-# %% [markdown]
-# ### IID Split
-
-# %%
-# IID split helper for option A
-
-def split_dataset_iid(dataset, num_clients: int, seed: int = 42):
-    """
-    IID split: shuffle indices and split into K chunks.
-    Returns list of Subset datasets.
-    """
-    rng = np.random.default_rng(seed)
-    indices = np.arange(len(dataset))
-    rng.shuffle(indices)
-
-    # chunk sizes (nearly equal)
-    base = len(dataset) // num_clients
-    rem  = len(dataset) % num_clients
-    sizes = [base + (1 if i < rem else 0) for i in range(num_clients)]
-
-    subsets = []
-    start = 0
-    for sz in sizes:
-        subsets.append(Subset(dataset, indices[start:start+sz].tolist()))
-        start += sz
-    return subsets
-
-# %%
-# Run ONE FL experiment for a given K
-# Simplified run_federated_experiment, but with: IID splits, weighted FedAvg, returns test metrics (using per-label thresholds from val)
-
-def run_fedavg_client_sensitivity(
-    num_clients: int,
-    local_epochs: int,
-    config: dict,
-    train_dataset,
-    val_loader,
-    test_loader,
-    device,
-    seed: int = 42
-):
-    start_time = time.time()
-
-    # --- Split IID into K clients ---
-    client_datasets = split_dataset_iid(train_dataset, num_clients=num_clients, seed=seed)
-    client_sizes = [len(cd) for cd in client_datasets]
-    client_loaders = [
-        DataLoader(cd, batch_size=config["batch_size"], shuffle=True)
-        for cd in client_datasets
-    ]
-
-    # --- Init global model ---
-    global_model = GenerateModel(
-        model_param_path,
-        num_of_filters=config["n_filters"],
-        kernel_size=config["window_size"]
-    ).to(device)
-
-    client_model = copy.deepcopy(global_model)
-
-    # --- FL rounds ---
-    for rnd in tqdm(range(config["rounds"]), colour="blue",
-                    desc=f"FedAvg IID | K={num_clients} | E={local_epochs}"):
-        client_params = []
-        for loader in client_loaders:
-            client_model.load_state_dict(global_model.state_dict())
-
-            _, client_state, _ = client_update(
-                model=client_model,
-                train_loader=loader,
-                epochs=local_epochs,
-                lr=config["lr"],
-                device=device,
-                use_focal=config["use_focal"],
-                gamma=config["gamma"],
-                mu=config["mu"],
-                global_params=None,
-                c_global=None,
-                c_local=None,
-                algorithm="FedAvg"
-            )
-            client_params.append(client_state)
-
-        # weighted aggregation
-        new_params = FedAvg_weighted(client_params, client_sizes)
-        global_model.load_state_dict(new_params)
-
-    # --- Thresholds from val, evaluation on test ---
-    _, per_label_thr = find_best_thresholds_per_label(global_model, val_loader, device)
-    _, metrics = eval_model(global_model, device, test_loader, per_label_thr=per_label_thr)
-
-    elapsed = time.time() - start_time
-    return metrics, elapsed
-
-# %%
-# # Grid over client counts + plot metrics vs #clients
-# # ---- Sensitivity sweep (Option A: IID) ----
-
-# client_counts = range(2,11)   # adjust based on compute
-# local_epochs  = 3                  # keep constant for sensitivity
-# algo_name     = "FedAvg-IID"
-
-# fast_config = config.copy()
-# fast_config["rounds"] = 10   # <<< reduced from 100 to 10
-
-# sens_results = pd.DataFrame(columns=[
-#     "Algorithm", "Clients", "Local Epochs",
-#     "AUC Macro", "AUC Micro",
-#     "F1 Macro", "F1 Micro",
-#     "PR-AUC Macro", "PR-AUC Micro",
-#     "Time"
-# ])
-
-# for k in client_counts:
-#     print(f"\n=== Sensitivity: {algo_name} | Clients={k} | Local Epochs={local_epochs} ===")
-
-#     metrics, elapsed = run_fedavg_client_sensitivity(
-#         num_clients=k,
-#         local_epochs=local_epochs,
-#         config=fast_config,
-#         train_dataset=train_dataset,
-#         val_loader=val_loader,
-#         test_loader=test_loader,
-#         device=device,
-#         seed=42
-#     )
-
-#     sens_results.loc[len(sens_results)] = [
-#         algo_name, k, local_epochs,
-#         metrics.get("auc_macro"),
-#         metrics.get("auc_micro"),
-#         metrics.get("f1_macro"),
-#         metrics.get("f1_micro"),
-#         metrics.get("pr_auc_macro"),
-#         metrics.get("pr_auc_micro"),
-#         elapsed
-#     ]
-
-#     sens_results.to_csv("../History/client_sensitivity_fedavg_iid.csv", index=False)
-
-# print("\nSensitivity sweep complete.")
-# display(sens_results)
-
-# %%
-#  # ---- Load sensitivity results if session restarted ----
-# sens_path = "../History/client_sensitivity_fedavg_iid.csv"
-# if "sens_results" not in globals():
-#     if os.path.exists(sens_path):
-#         sens_results = pd.read_csv(sens_path)
-#         print(f"Loaded sens_results from {sens_path} ({len(sens_results)} rows).")
-#     else:
-#         raise FileNotFoundError(f"No saved sensitivity file found at: {sens_path}")
-
-# # ---- Plot key metrics vs number of clients (Mullenbach-style) ----
-
-# def plot_metric_vs_clients(df, metric_col: str, title: str):
-#     xs = df["Clients"].values
-#     ys = df[metric_col].values
-#     plt.figure()
-#     plt.plot(xs, ys, marker="o")
-#     plt.xlabel("Number of Clients")
-#     plt.ylabel(metric_col)
-#     plt.title(title)
-#     plt.grid(True)
-#     plt.show()
-
-# # AUC (micro/macro) + F1 (micro/macro)
-# plot_metric_vs_clients(sens_results, "AUC Micro", "FedAvg IID Sensitivity: AUC Micro vs #Clients")
-# plot_metric_vs_clients(sens_results, "AUC Macro", "FedAvg IID Sensitivity: AUC Macro vs #Clients")
-# plot_metric_vs_clients(sens_results, "F1 Micro",  "FedAvg IID Sensitivity: F1 Micro vs #Clients")
-# plot_metric_vs_clients(sens_results, "F1 Macro",  "FedAvg IID Sensitivity: F1 Macro vs #Clients")
-# plot_metric_vs_clients(sens_results, "PR-AUC Macro",  "FedAvg IID Sensitivity: PR-AUC Macro vs #Clients")
-# plot_metric_vs_clients(sens_results, "PR-AUC Micro",  "FedAvg IID Sensitivity: PR-AUC Micro vs #Clients")
-# plot_metric_vs_clients(sens_results, "Time",  "FedAvg IID Sensitivity: Time vs #Clients")
-
-# %%
-# # ---- Load sensitivity results if session restarted ----
-# sens_path = "../History/client_sensitivity_fedavg_iid.csv"
-# if "sens_results" not in globals():
-#     if os.path.exists(sens_path):
-#         sens_results = pd.read_csv(sens_path)
-#         print(f"Loaded sens_results from {sens_path} ({len(sens_results)} rows).")
-#     else:
-#         raise FileNotFoundError(f"No saved sensitivity file found at: {sens_path}")
-
-# # Ensure sorted
-# sens_results = sens_results.sort_values("Clients")
-
-# # Extract values
-# x = sens_results["Clients"].values
-# auc_micro = sens_results["AUC Micro"].values
-# auc_macro = sens_results["AUC Macro"].values
-# f1_micro  = sens_results["F1 Micro"].values
-# f1_macro  = sens_results["F1 Macro"].values
-# pr_micro  = sens_results["PR-AUC Micro"].values
-# pr_macro  = sens_results["PR-AUC Macro"].values
-# time_vals = sens_results["Time"].values
-
-
-# # =========================================================
-# # COLOR VERSION
-# # =========================================================
-# fig, ax1 = plt.subplots(figsize=(9, 5))
-
-# ax1.plot(x, auc_micro, marker="o", label="AUC Micro")
-# ax1.plot(x, auc_macro, marker="s", label="AUC Macro")
-# ax1.plot(x, f1_micro,  marker="^", label="F1 Micro")
-# ax1.plot(x, f1_macro,  marker="d", label="F1 Macro")
-# ax1.plot(x, pr_micro,  marker="v", label="PR-AUC Micro")
-# ax1.plot(x, pr_macro,  marker="x", label="PR-AUC Macro")
-
-# ax1.set_xlabel("Number of Clients")
-# ax1.set_ylabel("Metric Score")
-# ax1.set_title("FedAvg IID Sensitivity: Metrics & Time vs Number of Clients")
-# ax1.grid(True)
-
-# # Secondary axis for time
-# ax2 = ax1.twinx()
-# ax2.plot(x, time_vals, marker="P", linestyle="--", label="Time (s)")
-# ax2.set_ylabel("Time (seconds)")
-
-# # Combined legend
-# lines1, labels1 = ax1.get_legend_handles_labels()
-# lines2, labels2 = ax2.get_legend_handles_labels()
-# ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=9)
-
-# plt.tight_layout()
-# plt.show()
-
-
-# # =========================================================
-# # BLACK & WHITE VERSION
-# # =========================================================
-# fig, ax1 = plt.subplots(figsize=(9, 5))
-
-# ax1.plot(x, auc_micro, linestyle="-",  marker="o", color="black", label="AUC Micro")
-# ax1.plot(x, auc_macro, linestyle="--", marker="s", color="black", label="AUC Macro")
-# ax1.plot(x, f1_micro,  linestyle="-.", marker="^", color="black", label="F1 Micro")
-# ax1.plot(x, f1_macro,  linestyle=":",  marker="d", color="black", label="F1 Macro")
-# ax1.plot(x, pr_micro,  linestyle=(0,(3,1,1,1)), marker="v", color="black", label="PR-AUC Micro")
-# ax1.plot(x, pr_macro,  linestyle=(0,(1,1)),     marker="x", color="black", label="PR-AUC Macro")
-
-# ax1.set_xlabel("Number of Clients")
-# ax1.set_ylabel("Metric Score")
-# ax1.set_title("FedAvg IID Sensitivity: Metrics & Time vs Number of Clients (B/W)")
-# ax1.grid(True)
-
-# # Secondary axis
-# ax2 = ax1.twinx()
-# ax2.plot(x, time_vals, linestyle=(0,(5,5)), marker="P", color="black", label="Time (s)")
-# ax2.set_ylabel("Time (seconds)")
-
-# # Combined legend
-# lines1, labels1 = ax1.get_legend_handles_labels()
-# lines2, labels2 = ax2.get_legend_handles_labels()
-# ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=9)
-
-# plt.tight_layout()
-# plt.show()
-
-# %% [markdown]
-# ### Non-IID Split (Option B)
-# 
-# Multi-label non-IID split that simulates:
-# - size imbalance across hospitals (Dirichlet)
-# - per-hospital label-prevalence shifts (preferred labels + bias)
-# 
-# Parameters:
-# - size_alpha: smaller -> more size imbalance
-# - labels_per_client: how many "specialty" labels each client prefers
-# - bias_strength: probability of sampling examples that contain preferred labels
-
-# %%
-# Non-IID splitter for multi-label datasets
-
-def split_dataset_noniid_multilabel(
-    dataset,
-    num_clients: int,
-    seed: int = 42,
-    size_alpha: float = 0.5,          # Dirichlet parameter for client sizes
-    labels_per_client: int = 10,      # number of preferred labels per client
-    bias_strength: float = 0.85       # prob of sampling from preferred-label examples
-):
-    """
-    Splits `dataset` (TensorDataset or similar with Y in dataset.tensors[1])
-    into `num_clients` Subset objects with non-IID label prevalence and size imbalance.
-    """
-    rng = np.random.default_rng(seed)
-
-    # extract Y matrix
-    if hasattr(dataset, "tensors"):
-        Y = dataset.tensors[1].cpu()
-    else:
-        # fallback for generic dataset: collect Y
-        Y = torch.stack([dataset[i][1] for i in range(len(dataset))]).cpu()
-
-    n = len(dataset)
-    n_labels = Y.shape[1]
-
-    # --- sizes via Dirichlet ---
-    props = rng.dirichlet(alpha=np.ones(num_clients) * size_alpha)
-    sizes = (props * n).astype(int)
-    diff = n - sizes.sum()
-    for i in range(abs(diff)):
-        sizes[i % num_clients] += 1 if diff > 0 else -1
-    sizes = sizes.tolist()
-
-    # --- label -> indices map ---
-    label_to_indices = defaultdict(list)
-    for idx in range(n):
-        labs = torch.nonzero(Y[idx]).flatten().tolist()
-        for lab in labs:
-            label_to_indices[lab].append(idx)
-
-    # --- preferred labels per client ---
-    all_labels = np.arange(n_labels)
-    preferred = []
-    for _ in range(num_clients):
-        preferred.append(rng.choice(all_labels, size=min(labels_per_client, n_labels), replace=False).tolist())
-
-    # --- assignment ---
-    unassigned = set(range(n))
-    client_indices = [[] for _ in range(num_clients)]
-
-    def pick_preferred(client_id):
-        labs = preferred[client_id]
-        candidates = []
-        for lab in labs:
-            candidates.extend(label_to_indices.get(lab, []))
-        if not candidates:
-            return None
-        rng.shuffle(candidates)
-        for idx in candidates:
-            if idx in unassigned:
-                return idx
-        return None
-
-    # fill clients
-    for cid in range(num_clients):
-        target = sizes[cid]
-        while len(client_indices[cid]) < target and unassigned:
-            use_pref = rng.random() < bias_strength
-            idx = pick_preferred(cid) if use_pref else None
-
-            if idx is None:
-                # choose uniformly from remaining
-                idx = rng.choice(list(unassigned))
-
-            client_indices[cid].append(int(idx))
-            unassigned.remove(int(idx))
-
-    # distribute any leftovers
-    if unassigned:
-        leftovers = list(unassigned)
-        rng.shuffle(leftovers)
-        for i, idx in enumerate(leftovers):
-            client_indices[i % num_clients].append(int(idx))
-
-    # build subsets
-    subsets = [Subset(dataset, inds) for inds in client_indices]
-    return subsets
-
-# %%
-# Non-IID runner (same training loop as IID but using the non-IID splitter)
-
-def run_fedavg_client_sensitivity_noniid(
-    num_clients: int,
-    local_epochs: int,
-    config: dict,
-    train_dataset,
-    val_loader,
-    test_loader,
-    device,
-    seed: int = 42,
-    size_alpha: float = 0.5,
-    labels_per_client: int = 10,
-    bias_strength: float = 0.85
-):
-    start_time = time.time()
-
-    # --- Split non-IID into K clients ---
-    client_datasets = split_dataset_noniid_multilabel(
-        train_dataset,
-        num_clients=num_clients,
-        seed=seed,
-        size_alpha=size_alpha,
-        labels_per_client=labels_per_client,
-        bias_strength=bias_strength
-    )
-
-    client_sizes = [len(cd) for cd in client_datasets]
-    client_loaders = [
-        DataLoader(cd, batch_size=config["batch_size"], shuffle=True)
-        for cd in client_datasets
-    ]
-
-    # --- Init global model ---
-    global_model = GenerateModel(
-        model_param_path,
-        num_of_filters=config["n_filters"],
-        kernel_size=config["window_size"]
-    ).to(device)
-
-    client_model = copy.deepcopy(global_model)
-
-    # --- FL rounds ---
-    for rnd in tqdm(range(config["rounds"]), colour="blue",
-                    desc=f"FedAvg non-IID | K={num_clients} | E={local_epochs}"):
-        client_params = []
-        for loader in client_loaders:
-            client_model.load_state_dict(global_model.state_dict())
-
-            _, client_state, _ = client_update(
-                model=client_model,
-                train_loader=loader,
-                epochs=local_epochs,
-                lr=config["lr"],
-                device=device,
-                use_focal=config["use_focal"],
-                gamma=config["gamma"],
-                mu=config["mu"],
-                global_params=None,
-                c_global=None,
-                c_local=None,
-                algorithm="FedAvg"
-            )
-            client_params.append(client_state)
-
-        # weighted aggregation (sample-size weighted FedAvg)
-        new_params = FedAvg_weighted(client_params, client_sizes)
-        global_model.load_state_dict(new_params)
-
-    # --- Thresholds from val, evaluation on test ---
-    _, per_label_thr = find_best_thresholds_per_label(global_model, val_loader, device)
-    _, metrics = eval_model(global_model, device, test_loader, per_label_thr=per_label_thr)
-
-    elapsed = time.time() - start_time
-    return metrics, elapsed
-
-# %%
-# # Sweep non-IID sensitivity (fast debug config)
-
-# client_counts_b = [2, 3, 5, 8, 10]   # expand later if desired
-# local_epochs  = 3
-# algo_name     = "FedAvg-nonIID"
-
-# fast_config = config.copy()
-# fast_config["rounds"] = 10   # keep fast for debugging
-
-# sens_results_b = pd.DataFrame(columns=[
-#     "Algorithm", "Clients", "Local Epochs",
-#     "AUC Macro", "AUC Micro",
-#     "F1 Macro", "F1 Micro",
-#     "PR-AUC Macro", "PR-AUC Micro",
-#     "Time",
-#     "size_alpha", "labels_per_client", "bias_strength"
-# ])
-
-# # choose a moderate heterogeneity setting by default
-# # Mild: size_alpha=1.0, labels_per_client=15, bias_strength=0.7
-# # Moderate: size_alpha=0.5, labels_per_client=10, bias_strength=0.85
-# # Strong: size_alpha=0.3, labels_per_client=6, bias_strength=0.9
-# size_alpha = 0.5
-# labels_per_client = 10
-# bias_strength = 0.85
-
-# for k in client_counts_b:
-#     print(f"\n=== Sensitivity (non-IID): {algo_name} | Clients={k} | Local Epochs={local_epochs} ===")
-
-#     metrics, elapsed = run_fedavg_client_sensitivity_noniid(
-#         num_clients=k,
-#         local_epochs=local_epochs,
-#         config=fast_config,
-#         train_dataset=train_dataset,
-#         val_loader=val_loader,
-#         test_loader=test_loader,
-#         device=device,
-#         seed=42,
-#         size_alpha=size_alpha,
-#         labels_per_client=labels_per_client,
-#         bias_strength=bias_strength
-#     )
-
-#     sens_results_b.loc[len(sens_results_b)] = [
-#         algo_name, k, local_epochs,
-#         metrics.get("auc_macro"),
-#         metrics.get("auc_micro"),
-#         metrics.get("f1_macro"),
-#         metrics.get("f1_micro"),
-#         metrics.get("pr_auc_macro"),
-#         metrics.get("pr_auc_micro"),
-#         elapsed,
-#         size_alpha, labels_per_client, bias_strength
-#     ]
-
-#     sens_results_b.to_csv("../History/client_sensitivity_fedavg_noniid.csv", index=False)
-
-# print("\nSensitivity sweep (non-IID) complete.")
-# display(sens_results_b)
-
-# %%
-# # ---- Load sensitivity results if session restarted (non-IID) ----
-# sens_path_b = "../History/client_sensitivity_fedavg_noniid.csv"
-# if "sens_results_b" not in globals():
-#     if os.path.exists(sens_path_b):
-#         sens_results_b = pd.read_csv(sens_path_b)
-#         print(f"Loaded sens_results_b from {sens_path_b} ({len(sens_results_b)} rows).")
-#     else:
-#         raise FileNotFoundError(f"No saved sensitivity file found at: {sens_path_b}")
-
-# # Simple Mullenbach-style plots (single metric per figure)
-# def plot_metric_vs_clients_b(df, metric_col: str, title: str):
-#     xs = df["Clients"].values
-#     ys = df[metric_col].values
-#     plt.figure()
-#     plt.plot(xs, ys, marker="o")
-#     plt.xlabel("Number of Clients")
-#     plt.ylabel(metric_col)
-#     plt.title(title)
-#     plt.grid(True)
-#     plt.show()
-
-# plot_metric_vs_clients_b(sens_results_b, "AUC Micro", "FedAvg non-IID Sensitivity: AUC Micro vs #Clients")
-# plot_metric_vs_clients_b(sens_results_b, "AUC Macro", "FedAvg non-IID Sensitivity: AUC Macro vs #Clients")
-# plot_metric_vs_clients_b(sens_results_b, "F1 Micro",  "FedAvg non-IID Sensitivity: F1 Micro vs #Clients")
-# plot_metric_vs_clients_b(sens_results_b, "F1 Macro",  "FedAvg non-IID Sensitivity: F1 Macro vs #Clients")
-# plot_metric_vs_clients_b(sens_results_b, "PR-AUC Macro",  "FedAvg non-IID Sensitivity: PR-AUC Macro vs #Clients")
-# plot_metric_vs_clients_b(sens_results_b, "PR-AUC Micro",  "FedAvg non-IID Sensitivity: PR-AUC Micro vs #Clients")
-# plot_metric_vs_clients_b(sens_results_b, "Time",  "FedAvg non-IID Sensitivity: Time vs #Clients")
-
-# %%
-# # ---- Combined color + black & white plots for non-IID (metrics + time on secondary axis) ----
-
-# # Ensure sorted
-# sens_results_b = sens_results_b.sort_values("Clients")
-
-# x = sens_results_b["Clients"].values
-# auc_micro = sens_results_b["AUC Micro"].values
-# auc_macro = sens_results_b["AUC Macro"].values
-# f1_micro  = sens_results_b["F1 Micro"].values
-# f1_macro  = sens_results_b["F1 Macro"].values
-# pr_micro  = sens_results_b["PR-AUC Micro"].values
-# pr_macro  = sens_results_b["PR-AUC Macro"].values
-# time_vals = sens_results_b["Time"].values
-
-# # COLOR
-# fig, ax1 = plt.subplots(figsize=(9, 5))
-
-# ax1.plot(x, auc_micro, marker="o", label="AUC Micro")
-# ax1.plot(x, auc_macro, marker="s", label="AUC Macro")
-# ax1.plot(x, f1_micro,  marker="^", label="F1 Micro")
-# ax1.plot(x, f1_macro,  marker="d", label="F1 Macro")
-# ax1.plot(x, pr_micro,  marker="v", label="PR-AUC Micro")
-# ax1.plot(x, pr_macro,  marker="x", label="PR-AUC Macro")
-
-# ax1.set_xlabel("Number of Clients")
-# ax1.set_ylabel("Metric Score")
-# ax1.set_title("FedAvg non-IID Sensitivity: Metrics & Time vs Number of Clients")
-# ax1.grid(True)
-
-# ax2 = ax1.twinx()
-# ax2.plot(x, time_vals, marker="P", linestyle="--", label="Time (s)")
-# ax2.set_ylabel("Time (seconds)")
-
-# lines1, labels1 = ax1.get_legend_handles_labels()
-# lines2, labels2 = ax2.get_legend_handles_labels()
-# ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=9)
-
-# plt.tight_layout()
-# plt.show()
-
-# # BLACK & WHITE
-# fig, ax1 = plt.subplots(figsize=(9, 5))
-
-# ax1.plot(x, auc_micro, linestyle="-",  marker="o", color="black", label="AUC Micro")
-# ax1.plot(x, auc_macro, linestyle="--", marker="s", color="black", label="AUC Macro")
-# ax1.plot(x, f1_micro,  linestyle="-.", marker="^", color="black", label="F1 Micro")
-# ax1.plot(x, f1_macro,  linestyle=":",  marker="d", color="black", label="F1 Macro")
-# ax1.plot(x, pr_micro,  linestyle=(0,(3,1,1,1)), marker="v", color="black", label="PR-AUC Micro")
-# ax1.plot(x, pr_macro,  linestyle=(0,(1,1)),     marker="x", color="black", label="PR-AUC Macro")
-
-# ax1.set_xlabel("Number of Clients")
-# ax1.set_ylabel("Metric Score")
-# ax1.set_title("FedAvg non-IID Sensitivity: Metrics & Time vs Number of Clients (B/W)")
-# ax1.grid(True)
-
-# ax2 = ax1.twinx()
-# ax2.plot(x, time_vals, linestyle=(0,(5,5)), marker="P", color="black", label="Time (s)")
-# ax2.set_ylabel("Time (seconds)")
-
-# lines1, labels1 = ax1.get_legend_handles_labels()
-# lines2, labels2 = ax2.get_legend_handles_labels()
-# ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=9)
-
-# plt.tight_layout()
-# plt.show()
-
-# %% [markdown]
-# ### Targeted Sensitivity Analysis
-
-# %%
-def run_fl_sensitivity_once(
-    split_mode: str,            # "iid" or "noniid"
-    num_clients: int,
-    local_epochs: int,
-    config: dict,
-    train_dataset,
-    val_loader,
-    test_loader,
-    device,
-    seed: int = 42,
-    algo: str = "FedAvg",        # "FedAvg" or "FedProx"
-    mu: float = 0.01,            # only used for FedProx
-    # non-IID params
-    size_alpha: float = 0.5,
-    labels_per_client: int = 10,
-    bias_strength: float = 0.85
-):
-    start_time = time.time()
-
-    # --- split ---
-    if split_mode == "iid":
-        client_datasets = split_dataset_iid(train_dataset, num_clients=num_clients, seed=seed)
-    elif split_mode == "noniid":
-        client_datasets = split_dataset_noniid_multilabel(
-            train_dataset,
-            num_clients=num_clients,
-            seed=seed,
-            size_alpha=size_alpha,
-            labels_per_client=labels_per_client,
-            bias_strength=bias_strength
-        )
-    else:
-        raise ValueError("split_mode must be 'iid' or 'noniid'")
-
-    client_sizes = [len(cd) for cd in client_datasets]
-    client_loaders = [DataLoader(cd, batch_size=config["batch_size"], shuffle=True) for cd in client_datasets]
-
-    # --- init global model ---
-    global_model = GenerateModel(
-        model_param_path,
-        num_of_filters=config["n_filters"],
-        kernel_size=config["window_size"]
-    ).to(device)
-
-    client_model = copy.deepcopy(global_model)
-
-    # --- FL rounds ---
-    for rnd in tqdm(range(config["rounds"]), colour="blue",
-                    desc=f"{algo} {split_mode} | K={num_clients} | E={local_epochs}"):
-        client_params = []
-        for loader in client_loaders:
-            client_model.load_state_dict(global_model.state_dict())
-
-            _, client_state, _ = client_update(
-                model=client_model,
-                train_loader=loader,
-                epochs=local_epochs,
-                lr=config["lr"],
-                device=device,
-                use_focal=config["use_focal"],
-                gamma=config["gamma"],
-                mu=mu,
-                global_params=(global_model.state_dict() if algo == "FedProx" else None),
-                c_global=None,
-                c_local=None,
-                algorithm=algo,
-            )
-            client_params.append(client_state)
-
-        # server aggregation: sample-size weighted FedAvg (safe for IID + nonIID)
-        new_params = FedAvg_weighted(client_params, client_sizes)
-        global_model.load_state_dict(new_params)
-
-    # --- eval ---
-    _, per_label_thr = find_best_thresholds_per_label(global_model, val_loader, device)
-    _, metrics = eval_model(global_model, device, test_loader, per_label_thr=per_label_thr)
-
-    elapsed = time.time() - start_time
-    return metrics, elapsed
-
-# %%
-# =========================
-# Sensitivity Sweep (FULL)
-# =========================
-
-client_counts = [2, 3, 5, 8, 10]      # 2–20 as requested
-
-# keep fast first; later bump rounds to your real value
-sweep_config = config.copy()
-sweep_config["rounds"] = 10  # debug; set higher later
-
-# choose non-IID severity (keep fixed across all methods)
-noniid_params = dict(size_alpha=0.5, labels_per_client=10, bias_strength=0.85)
-
-# methods to compare
-METHODS = [
-    #dict(method="FedAvg",  algo="FedAvg",  mu=None,  local_epochs=3)
-    dict(method="FedAvg_E1", algo="FedAvg", mu=None, local_epochs=1),
-
-    #dict(method="FedProx_mu0.01_E3", algo="FedProx", mu=0.01, local_epochs=3)
-    #dict(method="FedProx_mu0.1_E3",  algo="FedProx", mu=0.10, local_epochs=3)
-
-    dict(method="FedProx_mu0.01_E1", algo="FedProx", mu=0.01, local_epochs=1),
-    dict(method="FedProx_mu0.1_E1",  algo="FedProx", mu=0.10, local_epochs=1),
-
-]
-
-out_path = "../History/sensitivity_all_methods.csv"
-
-all_rows = []
-for split_mode in ["iid", "noniid"]:
-    for m in METHODS:
-        for k in client_counts:
-            print(f"\n=== {split_mode.upper()} | {m['method']} | K={k} ===")
-
-            metrics, elapsed = run_fl_sensitivity_once(
-                split_mode=split_mode,
-                num_clients=k,
-                local_epochs=m["local_epochs"],
-                config=sweep_config,
-                train_dataset=train_dataset,
-                val_loader=val_loader,
-                test_loader=test_loader,
-                device=device,
-                seed=42,
-                algo=m["algo"],
-                mu=(m["mu"] if m["mu"] is not None else 0.0),
-                **(noniid_params if split_mode == "noniid" else {})
-            )
-
-            row = dict(
-                split=split_mode,
-                method=m["method"],
-                algo=m["algo"],
-                mu=m["mu"],
-                local_epochs=m["local_epochs"],
-                clients=k,
-                auc_macro=metrics.get("auc_macro"),
-                auc_micro=metrics.get("auc_micro"),
-                f1_macro=metrics.get("f1_macro"),
-                f1_micro=metrics.get("f1_micro"),
-                pr_auc_macro=metrics.get("pr_auc_macro"),
-                pr_auc_micro=metrics.get("pr_auc_micro"),
-                time_sec=elapsed,
-            )
-            if split_mode == "noniid":
-                row.update(noniid_params)
-
-            all_rows.append(row)
-
-            pd.DataFrame(all_rows).to_csv(out_path, index=False)
-
-print(f"\nDone. Saved to {out_path}")
-sens_all = pd.DataFrame(all_rows)
-display(sens_all)
-
-# %%
-# Load + table (primary metrics)
-
-out_path = "../History/sensitivity_all_methods.csv"
-sens_all = pd.read_csv(out_path)
-print("Loaded:", out_path, "rows=", len(sens_all))
-
-# Comparison table: primary metrics (Macro F1, PR-AUC Macro)
-table = sens_all[["split","method","clients","f1_macro","pr_auc_macro","time_sec"]].copy()
-display(table.head())
-
-# %%
-# Plotting
-
-# Pre-define visually distinct markers/linestyles (works for both color and B/W)
-MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">"]
-LINESTYLES = ["-", "--", "-.", ":", (0,(3,1,1,1)), (0,(5,5)), (0,(1,1))]
-
-def plot_macro_f1_all_methods(df, split_mode: str, bw: bool = False):
-    d = df[df["split"] == split_mode].copy()
-
-    # consistent order in legend (so runs are stable)
-    methods = sorted(d["method"].unique())
-
-    plt.figure(figsize=(10, 5))
-
-    # cycle marker/style pairs so each method is distinguishable
-    style_cycle = itertools.cycle([
-        (m, ls) for m in MARKERS for ls in LINESTYLES
-    ])
-
-    for method in methods:
-        g = d[d["method"] == method].sort_values("clients")
-        marker, ls = next(style_cycle)
-
-        if bw:
-            plt.plot(
-                g["clients"], g["f1_macro"],
-                color="black",
-                linestyle=ls,
-                marker=marker,
-                markersize=6,
-                linewidth=2,
-                label=method
-            )
-        else:
-            plt.plot(
-                g["clients"], g["f1_macro"],
-                linestyle=ls,
-                marker=marker,
-                markersize=6,
-                linewidth=2,
-                label=method
-            )
-
-    plt.xlabel("Number of Clients")
-    plt.ylabel("Macro F1")
-    plt.title(f"Macro F1 vs #Clients ({split_mode.upper()})")
-    plt.grid(True, alpha=0.3)
-    plt.legend(fontsize=8, ncols=2, frameon=True)
-    plt.tight_layout()
-    plt.show()
-
-# Color
-plot_macro_f1_all_methods(sens_all, "iid", bw=False)
-plot_macro_f1_all_methods(sens_all, "noniid", bw=False)
-
-# Black & White
-plot_macro_f1_all_methods(sens_all, "iid", bw=True)
-plot_macro_f1_all_methods(sens_all, "noniid", bw=True)
 
 
