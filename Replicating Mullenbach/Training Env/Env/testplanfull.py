@@ -312,14 +312,14 @@ def FedAvg(global_model: dict, client_state_dicts: list[dict]) -> dict:
     Returns:
         dict: Updated global parameter dictionary (averaged across clients).
     """
+    new_global = {}
     for key in global_model.keys():
-        # Stack corresponding parameters from all clients and take mean
         stacked = torch.stack(
-            [client_dict[key].float() for client_dict in client_state_dicts],
+            [client_dict[key].detach().cpu().float() for client_dict in client_state_dicts],
             dim=0
         )
-        global_model[key] = torch.mean(stacked, dim=0)
-    return global_model
+        new_global[key] = torch.mean(stacked, dim=0)
+    return new_global
 
 # %%
 # --- FedProx and SCAFFOLD Aggregation Methods ---
@@ -437,7 +437,8 @@ def client_update(
     global_params: dict = None,         # for FedProx / SCAFFOLD
     c_global: dict = None,              # for SCAFFOLD (parameter names only)
     c_local: dict = None,               # for SCAFFOLD (parameter names only)
-    algorithm: str = "FedAvg"           # "FedAvg", "FedProx", or "SCAFFOLD"
+    algorithm: str = "FedAvg",           # "FedAvg", "FedProx", or "SCAFFOLD"
+    momentum: float = 0.0
 ) -> tuple[float, dict, dict]:
     """
     Perform local training for a single client.
@@ -455,7 +456,7 @@ def client_update(
     n_labels = train_loader.dataset[0][1].shape[0]
     pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
     if algorithm == "SCAFFOLD":
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum)
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.99))
 
@@ -501,7 +502,7 @@ def client_update(
 
     # Safe cloned return for aggregation
     new_weights = {
-        k: v.detach().clone()
+        k: v.detach().cpu().clone()
         for k, v in model.state_dict().items()
     }
 
@@ -554,7 +555,7 @@ config = {
     "n_filters": 21,
     "window_size": 6,
     "epochs": 3,             # default (overridden per experiment)
-    "rounds": 10,            # communication rounds per experiment
+    "rounds": 100,            # communication rounds per experiment
     "use_focal": False,      
     "gamma": 2.5,            # focal loss focusing parameter
     "mu": 0.01,              # FedProx proximal term coefficient
@@ -823,7 +824,8 @@ def run_federated_experiment(algo, num_clients, local_epochs, config, train_data
                 global_params=global_params_snapshot,
                 c_global=c_global if algo == "SCAFFOLD" else None,
                 c_local=c_clients[idx] if algo == "SCAFFOLD" else None,
-                algorithm=algo
+                algorithm=algo,
+                momentum=config.get("momentum", 0.0)
             )
 
             client_params.append(client_state)
@@ -857,11 +859,193 @@ def run_federated_experiment(algo, num_clients, local_epochs, config, train_data
     return metrics, elapsed
 
 
+# %% [markdown]
+# ### FedProx and Scaffold Tuning
+
+# %%
+# === FedProx Hyperparameter Tuning (mu only) ===
+
+FEDPROX_TUNING_CSV = os.path.join(TESTPLAN_DIR, "fedprox_mu_tuning.csv")
+FEDPROX_TUNING_JSON = os.path.join(TESTPLAN_DIR, "fedprox_mu_tuning.json")
+
+fedprox_mus = [0.0, 0.0005, 0.001, 0.002, 0.005]
+
+# fixed representative setting for method-specific tuning
+tune_clients = 3
+tune_local_epochs = 2
+
+fedprox_tuning_results = pd.DataFrame(columns=[
+    "Function", "Tune Clients", "Tune Local Epochs", "Mu",
+    "AUC Macro", "AUC Micro",
+    "F1 Macro", "F1 Micro",
+    "PR-AUC Macro", "PR-AUC Micro",
+    "Time"
+])
+
+for mu in fedprox_mus:
+    print(f"\n=== FedProx Tuning | Mu={mu} | Clients={tune_clients} | Local Epochs={tune_local_epochs} ===")
+
+    trial_config = config.copy()
+    trial_config["algorithm"] = "FedProx"
+    trial_config["mu"] = mu
+    trial_config["epochs"] = tune_local_epochs
+    trial_config["rounds"] = 30
+
+    metrics, elapsed = run_federated_experiment(
+        algo="FedProx",
+        num_clients=tune_clients,
+        local_epochs=tune_local_epochs,
+        config=trial_config,
+        train_dataset=train_dataset,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        device=device
+    )
+
+    fedprox_tuning_results.loc[len(fedprox_tuning_results)] = [
+        "FedProx",
+        tune_clients,
+        tune_local_epochs,
+        mu,
+        metrics.get("auc_macro", None),
+        metrics.get("auc_micro", None),
+        metrics.get("f1_macro", None),
+        metrics.get("f1_micro", None),
+        metrics.get("pr_auc_macro", None),
+        metrics.get("pr_auc_micro", None),
+        elapsed
+    ]
+
+    fedprox_tuning_results.to_csv(FEDPROX_TUNING_CSV, index=False)
+    save_json(
+        {"rows": [to_serializable_row(r) for r in fedprox_tuning_results.to_dict(orient="records")]},
+        FEDPROX_TUNING_JSON
+    )
+
+    print(
+        f"Completed: Mu={mu} | "
+        f"F1_micro={metrics.get('f1_micro', float('nan')):.4f} | "
+        f"Time={elapsed:.2f}s"
+    )
+
+print("\n=== FedProx Tuning Complete ===")
+display(fedprox_tuning_results.sort_values("F1 Micro", ascending=False))
+
+# %%
+# === SCAFFOLD Hyperparameter Tuning (lr only; momentum fixed at 0.0) ===
+
+SCAFFOLD_TUNING_CSV = os.path.join(TESTPLAN_DIR, "scaffold_hparam_tuning.csv")
+SCAFFOLD_TUNING_JSON = os.path.join(TESTPLAN_DIR, "scaffold_hparam_tuning.json")
+
+scaffold_lrs = [1.0, 1.25, 1.5, 2.0, 3.0]
+scaffold_momentums = [0.0]
+
+# fixed representative setting for method-specific tuning
+tune_clients = 3
+tune_local_epochs = 2
+
+scaffold_tuning_results = pd.DataFrame(columns=[
+    "Function", "Tune Clients", "Tune Local Epochs", "LR", "Momentum",
+    "AUC Macro", "AUC Micro",
+    "F1 Macro", "F1 Micro",
+    "PR-AUC Macro", "PR-AUC Micro",
+    "Time", "Status"
+])
+
+for lr in scaffold_lrs:
+    for momentum in scaffold_momentums:
+        print(
+            f"\n=== SCAFFOLD Tuning | LR={lr} | Momentum={momentum} | "
+            f"Clients={tune_clients} | Local Epochs={tune_local_epochs} ==="
+        )
+
+        trial_config = config.copy()
+        trial_config["algorithm"] = "SCAFFOLD"
+        trial_config["lr"] = lr
+        trial_config["epochs"] = tune_local_epochs
+        trial_config["momentum"] = momentum
+        trial_config["rounds"] = 30
+
+        try:
+            metrics, elapsed = run_federated_experiment(
+                algo="SCAFFOLD",
+                num_clients=tune_clients,
+                local_epochs=tune_local_epochs,
+                config=trial_config,
+                train_dataset=train_dataset,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                device=device
+            )
+
+            row = {
+                "Function": "SCAFFOLD",
+                "Tune Clients": tune_clients,
+                "Tune Local Epochs": tune_local_epochs,
+                "LR": lr,
+                "Momentum": momentum,
+                "AUC Macro": metrics.get("auc_macro", None),
+                "AUC Micro": metrics.get("auc_micro", None),
+                "F1 Macro": metrics.get("f1_macro", None),
+                "F1 Micro": metrics.get("f1_micro", None),
+                "PR-AUC Macro": metrics.get("pr_auc_macro", None),
+                "PR-AUC Micro": metrics.get("pr_auc_micro", None),
+                "Time": elapsed,
+                "Status": "ok"
+            }
+
+            print(
+                f"Completed: LR={lr} | Momentum={momentum} | "
+                f"F1_micro={metrics.get('f1_micro', float('nan')):.4f} | "
+                f"Time={elapsed:.2f}s"
+            )
+
+        except Exception as e:
+            row = {
+                "Function": "SCAFFOLD",
+                "Tune Clients": tune_clients,
+                "Tune Local Epochs": tune_local_epochs,
+                "LR": lr,
+                "Momentum": momentum,
+                "AUC Macro": None,
+                "AUC Micro": None,
+                "F1 Macro": None,
+                "F1 Micro": None,
+                "PR-AUC Macro": None,
+                "PR-AUC Micro": None,
+                "Time": None,
+                "Status": f"failed: {type(e).__name__}: {e}"
+            }
+
+            print(f"FAILED: LR={lr} | Momentum={momentum} | {e}")
+
+        scaffold_tuning_results.loc[len(scaffold_tuning_results)] = row
+        scaffold_tuning_results.to_csv(SCAFFOLD_TUNING_CSV, index=False)
+        save_json(
+            {"rows": [to_serializable_row(r) for r in scaffold_tuning_results.to_dict(orient="records")]},
+            SCAFFOLD_TUNING_JSON
+        )
+
+print("\n=== SCAFFOLD Tuning Complete ===")
+display(scaffold_tuning_results.sort_values(["Status", "F1 Micro"], ascending=[True, False]))
+
+# %% [markdown]
+# ### 27 Config Run
+
 # %%
 # === Federated Experiment Grid: FedAvg, FedProx, SCAFFOLD ===
 
+BEST_FEDAVG_LR = 0.002
+
+BEST_FEDPROX_LR = 0.002
+BEST_FEDPROX_MU = 0.001
+
+BEST_SCAFFOLD_LR = 1.25
+BEST_SCAFFOLD_MOMENTUM = 0.0
+
 results = pd.DataFrame(columns=[
     "Function", "Clients", "Local Epochs",
+    "LR", "Mu", "Momentum",
     "AUC Macro", "AUC Micro",
     "F1 Macro", "F1 Micro",
     "PR-AUC Macro", "PR-AUC Micro",
@@ -876,14 +1060,32 @@ for algo in algorithms:
     for n_clients in client_counts:
         for epochs in local_epochs:
             print(f"\n=== Running {algo} | Clients={n_clients} | Local Epochs={epochs} ===")
-            config["algorithm"] = algo
-            config["epochs"] = epochs
+
+            trial_config = config.copy()
+            trial_config["algorithm"] = algo
+            trial_config["epochs"] = epochs
+
+            # method-specific tuned hyperparameters
+            if algo == "FedAvg":
+                trial_config["lr"] = BEST_FEDAVG_LR
+                trial_config["mu"] = None
+                trial_config["momentum"] = None
+
+            elif algo == "FedProx":
+                trial_config["lr"] = BEST_FEDPROX_LR
+                trial_config["mu"] = BEST_FEDPROX_MU
+                trial_config["momentum"] = None
+
+            elif algo == "SCAFFOLD":
+                trial_config["lr"] = BEST_SCAFFOLD_LR
+                trial_config["mu"] = None
+                trial_config["momentum"] = BEST_SCAFFOLD_MOMENTUM
 
             metrics, elapsed = run_federated_experiment(
                 algo=algo,
                 num_clients=n_clients,
                 local_epochs=epochs,
-                config=config.copy(),
+                config=trial_config,
                 train_dataset=train_dataset,
                 val_loader=val_loader,
                 test_loader=test_loader,
@@ -891,7 +1093,12 @@ for algo in algorithms:
             )
 
             results.loc[len(results)] = [
-                algo, n_clients, epochs,
+                algo,
+                n_clients,
+                epochs,
+                trial_config.get("lr", None),
+                trial_config.get("mu", None),
+                trial_config.get("momentum", None),
                 metrics.get("auc_macro", None),
                 metrics.get("auc_micro", None),
                 metrics.get("f1_macro", None),
@@ -901,17 +1108,21 @@ for algo in algorithms:
                 elapsed
             ]
 
-            # Save after each run to preserve progress
             results.to_csv(GRID_RESULTS_CSV, index=False)
             save_json(
                 {"rows": [to_serializable_row(r) for r in results.to_dict(orient="records")]},
                 GRID_RESULTS_JSON
             )
-            print(f"Completed: {algo} | Clients={n_clients} | Epochs={epochs}\n")
+
+            print(
+                f"Completed: {algo} | Clients={n_clients} | Epochs={epochs} | "
+                f"LR={trial_config.get('lr', None)} | "
+                f"Mu={trial_config.get('mu', None)} | "
+                f"Momentum={trial_config.get('momentum', None)}\n"
+            )
 
 print("\nAll 27 configurations complete!")
-print(results)
-
+display(results)
 
 # %% [markdown]
 # ## Central Model
