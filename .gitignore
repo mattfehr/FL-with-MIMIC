@@ -14,6 +14,7 @@ venv/
 *.pt
 *.csv
 *.json
+*.png
 
 # Project Specific Results
 Replicating Mullenbach/AWS/S3_Bucket/results/
