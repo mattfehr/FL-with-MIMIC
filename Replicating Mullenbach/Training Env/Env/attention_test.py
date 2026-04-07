@@ -38,6 +38,8 @@ from itertools import combinations
 import os
 import math
 from collections import Counter
+import csv
+import json
 
 import matplotlib.pyplot as plt
 from IPython.display import HTML, display
@@ -46,6 +48,78 @@ torch.manual_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
+
+# %%
+# === Result Saving / Loading Utils ===
+
+def save_dict_rows_to_csv(rows: list[dict], filepath: str) -> None:
+    """
+    Save a list of dictionaries to a CSV file.
+    Handles rows with non-identical keys by building the union of keys in order seen.
+    """
+    if not rows:
+        print(f"[save_dict_rows_to_csv] No rows to save for {filepath}")
+        return
+
+    fieldnames = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
+
+    with open(filepath, mode="w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Saved CSV: {filepath}")
+
+
+def to_serializable(obj):
+    """
+    Recursively convert objects into JSON-serializable Python types.
+    """
+    if isinstance(obj, dict):
+        return {k: to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [to_serializable(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return [to_serializable(v) for v in obj]
+    elif isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, torch.Tensor):
+        return obj.item() if obj.numel() == 1 else obj.detach().cpu().tolist()
+    else:
+        return obj
+
+
+def to_serializable_row(row: dict) -> dict:
+    """
+    Convert one row dictionary into JSON-safe Python scalars/lists.
+    """
+    return {k: to_serializable(v) for k, v in row.items()}
+
+
+def save_json(data: dict, filepath: str) -> None:
+    """
+    Save a Python object/dictionary to JSON after converting unsupported types.
+    """
+    with open(filepath, mode="w") as f:
+        json.dump(to_serializable(data), fp=f, indent=2)
+
+    print(f"Saved JSON: {filepath}")
+
+
+def load_json(filepath: str) -> dict:
+    """
+    Load JSON data from a file.
+    """
+    with open(filepath, mode="r") as f:
+        return json.load(f)
 
 # %%
 # Load label metadata
@@ -187,10 +261,10 @@ print("Vocab size:", len(idx_to_token), "| PAD_INDEX:", PAD_INDEX)
 # Load Models + Datasets
 
 MODEL_PATHS = {
-    "Centralized": "../History/models/central_best_attention.pt",
-    "FedAvg":      "../History/models/fedavg_c2e3_best_attention.pt",
-    "FedProx":     "../History/models/fedprox_c2e3_best_attention.pt",
-    "SCAFFOLD":    "../History/models/scaffold_c2e3_best_attention.pt",
+    "Centralized": "../History/models/central_e300_best_attention_fixed.pt",
+    "FedAvg":      "../History/models/fedavg_c2e3_best_attention_fixed.pt",
+    "FedProx":     "../History/models/fedprox_c2e3_mu0001_best_attention_fixed.pt",
+    "SCAFFOLD":    "../History/models/scaffold_c4e3_lr125_m0_best_attention_fixed.pt",
 }
 
 def load_model(path: str) -> nn.Module:
@@ -218,6 +292,136 @@ Y_test = torch.load(os.path.join("..", "Data", "Y_test.pt"))
 test_dataset = TensorDataset(X_test, Y_test)
 print("Test samples:", len(test_dataset))
 
+
+# %%
+# === Attention Results Directory Setup ===
+
+ATTN_RESULTS_DIR = os.path.join("..", "History", "attention_results")
+os.makedirs(ATTN_RESULTS_DIR, exist_ok=True)
+
+# Main section folders
+Q1_DIR = os.path.join(ATTN_RESULTS_DIR, "q1_token_agreement")
+Q2_DIR = os.path.join(ATTN_RESULTS_DIR, "q2_divergent_rationales")
+Q3_DIR = os.path.join(ATTN_RESULTS_DIR, "q3_label_frequency")
+Q4_DIR = os.path.join(ATTN_RESULTS_DIR, "q4_closest_to_centralized")
+Q5_DIR = os.path.join(ATTN_RESULTS_DIR, "q5_high_agreement_mislabeling")
+PHRASE_DIR = os.path.join(ATTN_RESULTS_DIR, "phrase_level_attention")
+
+for d in [Q1_DIR, Q2_DIR, Q3_DIR, Q4_DIR, Q5_DIR, PHRASE_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+# -------------------------
+# Q1: token-level agreement
+# -------------------------
+Q1_RESULTS_CSV = os.path.join(Q1_DIR, "q1_label_pair_results.csv")
+Q1_RESULTS_JSON = os.path.join(Q1_DIR, "q1_label_pair_results.json")
+
+Q1_PAIR_SUMMARY_CSV = os.path.join(Q1_DIR, "q1_pair_summary.csv")
+Q1_PAIR_SUMMARY_JSON = os.path.join(Q1_DIR, "q1_pair_summary.json")
+
+Q1_CENTRAL_ONLY_CSV = os.path.join(Q1_DIR, "q1_centralized_vs_federated.csv")
+
+Q1_WEIGHTED_COSINE_PLOT = os.path.join(Q1_DIR, "q1_weighted_cosine_centralized_vs_federated.png")
+Q1_WEIGHTED_JACCARD_PLOT = os.path.join(Q1_DIR, "q1_weighted_jaccard_centralized_vs_federated.png")
+
+# -------------------------
+# Q2: divergent rationales
+# -------------------------
+Q2_STATS_CSV = os.path.join(Q2_DIR, "q2_label_coverage_stats.csv")
+Q2_STATS_JSON = os.path.join(Q2_DIR, "q2_label_coverage_stats.json")
+
+Q2_CASES_CSV = os.path.join(Q2_DIR, "q2_divergent_cases.csv")
+Q2_CASES_JSON = os.path.join(Q2_DIR, "q2_divergent_cases.json")
+
+Q2_TOP_CASES_CSV = os.path.join(Q2_DIR, "q2_top_divergent_cases_overall.csv")
+
+# -------------------------
+# Q3: label frequency
+# -------------------------
+Q3_FREQ_CSV = os.path.join(Q3_DIR, "q3_label_frequencies.csv")
+Q3_FREQ_JSON = os.path.join(Q3_DIR, "q3_label_frequencies.json")
+
+Q3_MERGED_CSV = os.path.join(Q3_DIR, "q3_frequency_vs_agreement_all_pairs.csv")
+Q3_CENTRAL_ONLY_CSV = os.path.join(Q3_DIR, "q3_frequency_vs_agreement_centralized_vs_federated.csv")
+
+Q3_CORR_CSV = os.path.join(Q3_DIR, "q3_spearman_correlations.csv")
+Q3_CORR_JSON = os.path.join(Q3_DIR, "q3_spearman_correlations.json")
+
+Q3_BINS_CSV = os.path.join(Q3_DIR, "q3_binned_trends.csv")
+Q3_BINS_JSON = os.path.join(Q3_DIR, "q3_binned_trends.json")
+
+Q3_BINNED_COSINE_PLOT = os.path.join(Q3_DIR, "q3_binned_cosine_all_pairs.png")
+Q3_BINNED_JACCARD_PLOT = os.path.join(Q3_DIR, "q3_binned_jaccard_all_pairs.png")
+
+# -------------------------
+# Q4: closest to centralized
+# -------------------------
+Q4_RANK_CSV = os.path.join(Q4_DIR, "q4_method_ranking.csv")
+Q4_RANK_JSON = os.path.join(Q4_DIR, "q4_method_ranking.json")
+
+Q4_WIN_RATES_CSV = os.path.join(Q4_DIR, "q4_per_label_win_rates.csv")
+Q4_WIN_RATES_JSON = os.path.join(Q4_DIR, "q4_per_label_win_rates.json")
+
+Q4_WINNER_DIFF_LABELS_CSV = os.path.join(Q4_DIR, "q4_labels_where_cosine_and_jaccard_winners_differ.csv")
+
+Q4_BOOTSTRAP_CI_CSV = os.path.join(Q4_DIR, "q4_bootstrap_confidence_intervals.csv")
+Q4_BOOTSTRAP_CI_JSON = os.path.join(Q4_DIR, "q4_bootstrap_confidence_intervals.json")
+
+Q4_FREQ_BINS_CSV = os.path.join(Q4_DIR, "q4_frequency_bin_breakdown.csv")
+Q4_FREQ_BINS_JSON = os.path.join(Q4_DIR, "q4_frequency_bin_breakdown.json")
+
+Q4_COSINE_BAR_PLOT = os.path.join(Q4_DIR, "q4_weighted_cosine_ranked.png")
+Q4_JACCARD_BAR_PLOT = os.path.join(Q4_DIR, "q4_weighted_jaccard_ranked.png")
+Q4_FREQ_BIN_COSINE_PLOT = os.path.join(Q4_DIR, "q4_frequency_bin_cosine.png")
+Q4_FREQ_BIN_JACCARD_PLOT = os.path.join(Q4_DIR, "q4_frequency_bin_jaccard.png")
+
+# -----------------------------------------
+# Q5: high agreement + mislabeling analysis
+# -----------------------------------------
+Q5_ALL_AGREE_POS_CSV = os.path.join(Q5_DIR, "q5_all_pairs_agree_positive_rows.csv")
+Q5_ALL_AGREE_POS_JSON = os.path.join(Q5_DIR, "q5_all_pairs_agree_positive_rows.json")
+
+Q5_SUMMARY_CSV = os.path.join(Q5_DIR, "q5_agreement_mislabeling_summary.csv")
+Q5_SUMMARY_JSON = os.path.join(Q5_DIR, "q5_agreement_mislabeling_summary.json")
+
+Q5_COS_BINS_CSV = os.path.join(Q5_DIR, "q5_fp_rate_by_cos_quantile.csv")
+Q5_JAC_BINS_CSV = os.path.join(Q5_DIR, "q5_fp_rate_by_jaccard_quantile.csv")
+Q5_AVG_BINS_CSV = os.path.join(Q5_DIR, "q5_fp_rate_by_avg_agreement_quantile.csv")
+Q5_MIN_BINS_CSV = os.path.join(Q5_DIR, "q5_fp_rate_by_min_agreement_quantile.csv")
+
+Q5_COS_FP_PLOT = os.path.join(Q5_DIR, "q5_fp_rate_vs_cos_quantiles.png")
+Q5_JAC_FP_PLOT = os.path.join(Q5_DIR, "q5_fp_rate_vs_jaccard_quantiles.png")
+Q5_AVG_FP_PLOT = os.path.join(Q5_DIR, "q5_fp_rate_vs_avg_agreement_quantiles.png")
+Q5_MIN_FP_PLOT = os.path.join(Q5_DIR, "q5_fp_rate_vs_min_agreement_quantiles.png")
+
+# -------------------------
+# Phrase-level attention
+# -------------------------
+PHRASE_COVERAGE_CSV = os.path.join(PHRASE_DIR, "phrase_similarity_coverage.csv")
+PHRASE_COVERAGE_JSON = os.path.join(PHRASE_DIR, "phrase_similarity_coverage.json")
+
+PHRASE_SAMPLE_LEVEL_CSV = os.path.join(PHRASE_DIR, "phrase_similarity_sample_level.csv")
+PHRASE_SAMPLE_LEVEL_JSON = os.path.join(PHRASE_DIR, "phrase_similarity_sample_level.json")
+
+PHRASE_SUMMARY_BY_LABEL_CSV = os.path.join(PHRASE_DIR, "phrase_similarity_summary_by_label.csv")
+PHRASE_SUMMARY_BY_LABEL_JSON = os.path.join(PHRASE_DIR, "phrase_similarity_summary_by_label.json")
+
+PHRASE_OVERALL_SUMMARY_CSV = os.path.join(PHRASE_DIR, "phrase_similarity_overall_summary.csv")
+
+PHRASE_LOWEST_LABELS_CSV = os.path.join(PHRASE_DIR, "phrase_lowest_similarity_labels.csv")
+PHRASE_HIGHEST_LABELS_CSV = os.path.join(PHRASE_DIR, "phrase_highest_similarity_labels.csv")
+
+print("Attention results directories ready:")
+for name, path in {
+    "ATTN_RESULTS_DIR": ATTN_RESULTS_DIR,
+    "Q1_DIR": Q1_DIR,
+    "Q2_DIR": Q2_DIR,
+    "Q3_DIR": Q3_DIR,
+    "Q4_DIR": Q4_DIR,
+    "Q5_DIR": Q5_DIR,
+    "PHRASE_DIR": PHRASE_DIR,
+}.items():
+    print(f"  {name}: {path}")
 
 # %% [markdown]
 # ## Helper Functions
@@ -618,267 +822,525 @@ def plot_attention_heatmap(
 # 
 
 # %%
-# Test 1: Threshold vectors are valid per model
+# # Test 1: Threshold vectors are valid per model
 
-TEST_LABELS = [3, 7]
+# TEST_LABELS = [3, 7]
 
-print("=== Threshold sanity check ===")
-for mname in models.keys():
-    thr = per_label_thr_by_model[mname]
-    print(f"\n{mname}: shape={tuple(thr.shape)}  min={thr.min():.2f}  max={thr.max():.2f}")
-    for lbl in TEST_LABELS:
-        print(f"  label {lbl}: thr={thr[lbl].item():.2f}")
+# print("=== Threshold sanity check ===")
+# for mname in models.keys():
+#     thr = per_label_thr_by_model[mname]
+#     print(f"\n{mname}: shape={tuple(thr.shape)}  min={thr.min():.2f}  max={thr.max():.2f}")
+#     for lbl in TEST_LABELS:
+#         print(f"  label {lbl}: thr={thr[lbl].item():.2f}")
 
-    # quick assertion-style checks
-    assert thr.ndim == 1, "threshold vector should be 1D"
-    assert (thr >= 0.0).all() and (thr <= 1.0).all(), "thresholds should be in [0,1]"
-
-
-# %%
-# Test 2: Attention shapes + sum-to-1 checks (softmax)
-
-print("=== Attention shape + sum-to-1 sanity check ===")
-
-# pick one arbitrary test sample
-ds_idx = 0
-x, y = test_dataset[ds_idx]
-Xb = x.unsqueeze(0)
-
-for lbl in TEST_LABELS:
-    print(f"\nSample={ds_idx} | label={lbl}")
-    for mname, model in models.items():
-        logits_lbl, attn_lbl = get_label_logits_and_attn(model, Xb, lbl)
-        att = attn_lbl[0]  # (L,)
-
-        s = float(att.sum().item())
-        mx = float(att.max().item())
-        print(f"  {mname:11s} attn_shape={tuple(att.shape)} sum={s:.6f} max={mx:.6f}")
-
-        # should be very close to 1.0 due to softmax
-        assert abs(s - 1.0) < 1e-3, f"{mname} attention does not sum to ~1 (got {s})"
+#     # quick assertion-style checks
+#     assert thr.ndim == 1, "threshold vector should be 1D"
+#     assert (thr >= 0.0).all() and (thr <= 1.0).all(), "thresholds should be in [0,1]"
 
 
 # %%
-# Test 3: valid_positions trimming behaves (PAD + conv edges)
+# # Test 2: Attention shapes + sum-to-1 checks (softmax)
 
-print("=== valid_positions sanity check ===")
+# print("=== Attention shape + sum-to-1 sanity check ===")
 
-# pick a sample likely to have PADs (random-ish)
-ds_idx = 123
-x, y = test_dataset[ds_idx]
-nonpad_len = get_nonpad_len(x, PAD_INDEX)
+# # pick one arbitrary test sample
+# ds_idx = 0
+# x, y = test_dataset[ds_idx]
+# Xb = x.unsqueeze(0)
 
-valid_no_trim = get_valid_positions(x, PAD_INDEX, window_size=None)
-valid_trim = get_valid_positions(x, PAD_INDEX, window_size=config["window_size"])
+# for lbl in TEST_LABELS:
+#     print(f"\nSample={ds_idx} | label={lbl}")
+#     for mname, model in models.items():
+#         logits_lbl, attn_lbl = get_label_logits_and_attn(model, Xb, lbl)
+#         att = attn_lbl[0]  # (L,)
 
-print(f"Sample={ds_idx}")
-print("  seq_len:", x.numel())
-print("  nonpad_len:", nonpad_len)
-print("  valid_no_trim:", (valid_no_trim.min() if len(valid_no_trim) else None), "to", (valid_no_trim.max() if len(valid_no_trim) else None), "len=", len(valid_no_trim))
-print("  valid_trim   :", (valid_trim.min() if len(valid_trim) else None), "to", (valid_trim.max() if len(valid_trim) else None), "len=", len(valid_trim))
+#         s = float(att.sum().item())
+#         mx = float(att.max().item())
+#         print(f"  {mname:11s} attn_shape={tuple(att.shape)} sum={s:.6f} max={mx:.6f}")
 
-# should be subset
-assert len(valid_trim) <= len(valid_no_trim)
-if len(valid_trim) > 0:
-    assert valid_trim[0] >= valid_no_trim[0]
-    assert valid_trim[-1] <= valid_no_trim[-1]
+#         # should be very close to 1.0 due to softmax
+#         assert abs(s - 1.0) < 1e-3, f"{mname} attention does not sum to ~1 (got {s})"
 
 
 # %%
-# Test 4: cosine/Jaccard self-similarity = 1, and symmetry
+# # Test 3: valid_positions trimming behaves (PAD + conv edges)
 
-print("=== Similarity metric sanity check ===")
+# print("=== valid_positions sanity check ===")
 
-ds_idx = 0
-x, y = test_dataset[ds_idx]
-Xb = x.unsqueeze(0)
-valid_pos = get_valid_positions(x, PAD_INDEX, window_size=config["window_size"])
-TOP_K_TEST = 15
+# # pick a sample likely to have PADs (random-ish)
+# ds_idx = 123
+# x, y = test_dataset[ds_idx]
+# nonpad_len = get_nonpad_len(x, PAD_INDEX)
 
-for lbl in TEST_LABELS:
-    # pick one model as baseline
-    mname = "Centralized"
-    _, att = get_label_logits_and_attn(models[mname], Xb, lbl)
-    att = att[0]
+# valid_no_trim = get_valid_positions(x, PAD_INDEX, window_size=None)
+# valid_trim = get_valid_positions(x, PAD_INDEX, window_size=config["window_size"])
 
-    cos_self = cosine_sim_on_valid(att, att, valid_pos)
-    jac_self = jaccard(topk_positions(att, valid_pos, TOP_K_TEST), topk_positions(att, valid_pos, TOP_K_TEST))
+# print(f"Sample={ds_idx}")
+# print("  seq_len:", x.numel())
+# print("  nonpad_len:", nonpad_len)
+# print("  valid_no_trim:", (valid_no_trim.min() if len(valid_no_trim) else None), "to", (valid_no_trim.max() if len(valid_no_trim) else None), "len=", len(valid_no_trim))
+# print("  valid_trim   :", (valid_trim.min() if len(valid_trim) else None), "to", (valid_trim.max() if len(valid_trim) else None), "len=", len(valid_trim))
 
-    print(f"\nlabel={lbl} self-sim: cos={cos_self:.6f}  jac={jac_self:.6f}")
-    assert abs(cos_self - 1.0) < 1e-6
-    assert abs(jac_self - 1.0) < 1e-9
-
-    # symmetry check on a pair
-    a, b = "Centralized", "FedAvg"
-    _, att_a = get_label_logits_and_attn(models[a], Xb, lbl)
-    _, att_b = get_label_logits_and_attn(models[b], Xb, lbl)
-    att_a, att_b = att_a[0], att_b[0]
-
-    cos_ab = cosine_sim_on_valid(att_a, att_b, valid_pos)
-    cos_ba = cosine_sim_on_valid(att_b, att_a, valid_pos)
-
-    jac_ab = jaccard(topk_positions(att_a, valid_pos, TOP_K_TEST), topk_positions(att_b, valid_pos, TOP_K_TEST))
-    jac_ba = jaccard(topk_positions(att_b, valid_pos, TOP_K_TEST), topk_positions(att_a, valid_pos, TOP_K_TEST))
-
-    print(f"  symmetry: cos_ab={cos_ab:.6f} cos_ba={cos_ba:.6f} | jac_ab={jac_ab:.6f} jac_ba={jac_ba:.6f}")
-    assert abs(cos_ab - cos_ba) < 1e-9
-    assert abs(jac_ab - jac_ba) < 1e-12
+# # should be subset
+# assert len(valid_trim) <= len(valid_no_trim)
+# if len(valid_trim) > 0:
+#     assert valid_trim[0] >= valid_no_trim[0]
+#     assert valid_trim[-1] <= valid_no_trim[-1]
 
 
 # %%
-# Test 5: agree-positive mask actually filters (find examples)
+# # Test 4: cosine/Jaccard self-similarity = 1, and symmetry
 
-print("=== agree_positive_mask sanity check (find actual kept samples) ===")
+# print("=== Similarity metric sanity check ===")
 
-pair = ("Centralized", "FedAvg")
-max_to_find = 5
+# ds_idx = 0
+# x, y = test_dataset[ds_idx]
+# Xb = x.unsqueeze(0)
+# valid_pos = get_valid_positions(x, PAD_INDEX, window_size=config["window_size"])
+# TOP_K_TEST = 15
 
-for lbl in TEST_LABELS:
-    found = []
-    for ds_idx in range(len(test_dataset)):
-        x, y = test_dataset[ds_idx]
-        Xb = x.unsqueeze(0)
-        if bool(agree_positive_mask(pair[0], pair[1], Xb, lbl).item()):
-            found.append(ds_idx)
-        if len(found) >= max_to_find:
-            break
+# for lbl in TEST_LABELS:
+#     # pick one model as baseline
+#     mname = "Centralized"
+#     _, att = get_label_logits_and_attn(models[mname], Xb, lbl)
+#     att = att[0]
 
-    print(f"\nlabel={lbl} | pair={pair[0]} vs {pair[1]} | found agree-positive samples:", found)
+#     cos_self = cosine_sim_on_valid(att, att, valid_pos)
+#     jac_self = jaccard(topk_positions(att, valid_pos, TOP_K_TEST), topk_positions(att, valid_pos, TOP_K_TEST))
 
-    # It’s possible a label is super rare; don’t hard-assert >0,
-    # but if found, show prediction metadata for the first one.
-    if found:
-        ds0 = found[0]
-        for m in pair:
-            show_attention(m, lbl, ds0, top_k=15, trim_context=True)
+#     print(f"\nlabel={lbl} self-sim: cos={cos_self:.6f}  jac={jac_self:.6f}")
+#     assert abs(cos_self - 1.0) < 1e-6
+#     assert abs(jac_self - 1.0) < 1e-9
+
+#     # symmetry check on a pair
+#     a, b = "Centralized", "FedAvg"
+#     _, att_a = get_label_logits_and_attn(models[a], Xb, lbl)
+#     _, att_b = get_label_logits_and_attn(models[b], Xb, lbl)
+#     att_a, att_b = att_a[0], att_b[0]
+
+#     cos_ab = cosine_sim_on_valid(att_a, att_b, valid_pos)
+#     cos_ba = cosine_sim_on_valid(att_b, att_a, valid_pos)
+
+#     jac_ab = jaccard(topk_positions(att_a, valid_pos, TOP_K_TEST), topk_positions(att_b, valid_pos, TOP_K_TEST))
+#     jac_ba = jaccard(topk_positions(att_b, valid_pos, TOP_K_TEST), topk_positions(att_a, valid_pos, TOP_K_TEST))
+
+#     print(f"  symmetry: cos_ab={cos_ab:.6f} cos_ba={cos_ba:.6f} | jac_ab={jac_ab:.6f} jac_ba={jac_ba:.6f}")
+#     assert abs(cos_ab - cos_ba) < 1e-9
+#     assert abs(jac_ab - jac_ba) < 1e-12
 
 
 # %%
-# Test 6: “old notebook parity” check for labels 3 and 7
+# # Test 5: agree-positive mask actually filters (find examples)
 
-print("=== Parity check: per-sample similarity matrices (labels 3 and 7) ===")
+# print("=== agree_positive_mask sanity check (find actual kept samples) ===")
+
+# pair = ("Centralized", "FedAvg")
+# max_to_find = 5
+
+# for lbl in TEST_LABELS:
+#     found = []
+#     for ds_idx in range(len(test_dataset)):
+#         x, y = test_dataset[ds_idx]
+#         Xb = x.unsqueeze(0)
+#         if bool(agree_positive_mask(pair[0], pair[1], Xb, lbl).item()):
+#             found.append(ds_idx)
+#         if len(found) >= max_to_find:
+#             break
+
+#     print(f"\nlabel={lbl} | pair={pair[0]} vs {pair[1]} | found agree-positive samples:", found)
+
+#     # It’s possible a label is super rare; don’t hard-assert >0,
+#     # but if found, show prediction metadata for the first one.
+#     if found:
+#         ds0 = found[0]
+#         for m in pair:
+#             show_attention(m, lbl, ds0, top_k=15, trim_context=True)
+
+
+# %%
+# # Test 6: “old notebook parity” check for labels 3 and 7
+
+# print("=== Parity check: per-sample similarity matrices (labels 3 and 7) ===")
+
+# MODEL_NAMES = list(models.keys())
+# TOP_K = 15
+# TRIM = True
+
+# # pick one sample index per label where GT=1 (like your old notebook)
+# def find_first_gt_positive(label_idx: int, max_scan: int = 5000) -> Optional[int]:
+#     for i in range(min(max_scan, len(test_dataset))):
+#         _, y = test_dataset[i]
+#         if int(y[label_idx].item()) == 1:
+#             return i
+#     return None
+
+# for lbl in TEST_LABELS:
+#     ds_idx = find_first_gt_positive(lbl)
+#     print(f"\nLabel={lbl} | first GT-positive sample={ds_idx}")
+#     if ds_idx is None:
+#         print("  (none found in scan range)")
+#         continue
+
+#     x, y = test_dataset[ds_idx]
+#     Xb = x.unsqueeze(0)
+#     window_size = config["window_size"] if TRIM else None
+#     valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+
+#     # collect attention vectors
+#     att_by_model = {}
+#     for mname in MODEL_NAMES:
+#         _, att = get_label_logits_and_attn(models[mname], Xb, lbl)
+#         att_by_model[mname] = att[0]
+
+#     # cosine matrix
+#     cosM = np.zeros((len(MODEL_NAMES), len(MODEL_NAMES)))
+#     jacM = np.zeros((len(MODEL_NAMES), len(MODEL_NAMES)))
+
+#     for i, a in enumerate(MODEL_NAMES):
+#         for j, b in enumerate(MODEL_NAMES):
+#             cosM[i, j] = cosine_sim_on_valid(att_by_model[a], att_by_model[b], valid_pos)
+#             jacM[i, j] = jaccard(topk_positions(att_by_model[a], valid_pos, TOP_K),
+#                                  topk_positions(att_by_model[b], valid_pos, TOP_K))
+
+#     display(pd.DataFrame(cosM, index=MODEL_NAMES, columns=MODEL_NAMES))
+#     display(pd.DataFrame(jacM, index=MODEL_NAMES, columns=MODEL_NAMES))
+
+#     # show predictions for context
+#     for mname in MODEL_NAMES:
+#         logits, probs, pred = predict_label_for_samples(mname, Xb, lbl)
+#         thr = per_label_thr_by_model[mname][lbl].item()
+#         print(f"  {mname:11s} prob={probs[0].item():.4f} thr={thr:.2f} pred={bool(pred[0].item())} GT={int(y[lbl].item())}")
+
+
+# %%
+# # Test 7: attention heatmap sanity check (agree-positive samples) — shows BOTH modes
+
+# print("=== attention heatmap sanity check (position + token_zoom) ===")
+
+# pair = ("Centralized", "FedAvg")
+# max_to_find = 2
+
+# # position-mode controls
+# POS_MAX_TOKENS = None     # None shows full valid range; set e.g. 500 if too wide/heavy
+
+# # token-zoom controls
+# ZOOM_START = 0
+# ZOOM_WIDTH = 60
+# ZOOM_TICK_EVERY = 5
+
+# for lbl in TEST_LABELS:
+#     found = []
+
+#     # find agree-positive samples
+#     for ds_idx in range(len(test_dataset)):
+#         x, y = test_dataset[ds_idx]
+#         Xb = x.unsqueeze(0)
+
+#         if bool(agree_positive_mask(pair[0], pair[1], Xb, lbl).item()):
+#             found.append(ds_idx)
+
+#         if len(found) >= max_to_find:
+#             break
+
+#     print(f"\nlabel={lbl} | pair={pair[0]} vs {pair[1]} | found agree-positive samples:", found)
+
+#     if not found:
+#         print("  (no agree-positive samples found; skipping heatmaps)")
+#         continue
+
+#     for ds_idx in found:
+#         print("\n----------------------------------")
+#         print(f"Heatmap test | label={lbl} | sample={ds_idx}")
+
+#         # Print prediction metadata first (important context)
+#         for m in pair:
+#             x0, _ = test_dataset[ds_idx]
+#             logits, probs, pred = predict_label_for_samples(m, x0.unsqueeze(0), lbl)
+#             thr = per_label_thr_by_model[m][lbl].item()
+#             print(f"  {m:11s} | prob={probs[0].item():.4f} | thr={thr:.2f} | pred={bool(pred[0].item())}")
+
+#         # 1) Old-style: by token position (matches original notebook vibe)
+#         print("  -> Plot: mode='position'")
+#         plot_attention_heatmap(
+#             sample_idx=ds_idx,
+#             label_idx=lbl,
+#             model_names=list(pair),
+#             trim_context=True,
+#             mode="position",
+#             max_tokens=POS_MAX_TOKENS
+#         )
+
+#         # 2) Zoomed: token-labeled window (readable)
+#         print("  -> Plot: mode='token_zoom'")
+#         plot_attention_heatmap(
+#             sample_idx=ds_idx,
+#             label_idx=lbl,
+#             model_names=list(pair),
+#             trim_context=True,
+#             mode="token_zoom",
+#             start=ZOOM_START,
+#             max_tokens=ZOOM_WIDTH,      # width of zoom window
+#             tick_every=ZOOM_TICK_EVERY
+#         )
+
+
+# %% [markdown]
+# ## Precompute Test-Set Outputs for Fast Analysis
+#  
+# Many of the analysis sections below (especially Q1, Q2, Q5/Q2H, and Phrase-level)
+# repeatedly query the same models on the same test samples.
+#  
+# To avoid redundant forward passes, we precompute each model's outputs on the full
+# test set once and cache:
+# - logits
+# - attention
+# - probabilities
+# - binary predictions using each model's per-label thresholds
+#  
+# Downstream sections should use these cached tensors instead of calling the model again
+# inside large triple loops.
+
+# %%
+# === Precompute model outputs on the full test set ===
+
+@torch.no_grad()
+def precompute_test_outputs(
+    models: Dict[str, nn.Module],
+    data_loader: DataLoader,
+    per_label_thr_by_model: Dict[str, torch.Tensor],
+    device: torch.device,
+):
+    """
+    Precompute full-test outputs for each model.
+
+    Returns a dict:
+        cache[model_name] = {
+            "logits": (N, C) CPU tensor,
+            "attn":   (N, C, L) CPU tensor,
+            "probs":  (N, C) CPU tensor,
+            "preds":  (N, C) CPU bool tensor,
+        }
+    """
+    cache = {}
+
+    for model_name, model in models.items():
+        model.eval()
+        all_logits = []
+        all_attn = []
+
+        for Xb, _ in tqdm(data_loader, desc=f"Precompute {model_name}"):
+            Xb = Xb.to(device)
+            logits, attn = model(Xb)
+
+            all_logits.append(logits.detach().cpu())
+            all_attn.append(attn.detach().cpu())
+
+        logits_all = torch.cat(all_logits, dim=0)   # (N, C)
+        attn_all = torch.cat(all_attn, dim=0)       # (N, C, L)
+        probs_all = torch.sigmoid(logits_all)       # (N, C)
+
+        thr = per_label_thr_by_model[model_name].cpu().unsqueeze(0)   # (1, C)
+        preds_all = probs_all >= thr                                   # (N, C), bool
+
+        cache[model_name] = {
+            "logits": logits_all,
+            "attn": attn_all,
+            "probs": probs_all,
+            "preds": preds_all,
+        }
+
+        print(
+            f"{model_name:11s} | "
+            f"logits={tuple(logits_all.shape)} | "
+            f"attn={tuple(attn_all.shape)} | "
+            f"preds={tuple(preds_all.shape)}"
+        )
+
+    return cache
+
+
+PRECOMP = precompute_test_outputs(
+    models=models,
+    data_loader=test_loader,
+    per_label_thr_by_model=per_label_thr_by_model,
+    device=device,
+)
+
+print("\nPrecompute complete.")
+print("Cached models:", list(PRECOMP.keys()))
+
+# %%
+# === Convenience aliases ===
+
+LOGITS_ALL = {m: PRECOMP[m]["logits"] for m in PRECOMP}
+ATTN_ALL   = {m: PRECOMP[m]["attn"]   for m in PRECOMP}
+PROBS_ALL  = {m: PRECOMP[m]["probs"]  for m in PRECOMP}
+PREDS_ALL  = {m: PRECOMP[m]["preds"]  for m in PRECOMP}
+
+N_TEST = next(iter(LOGITS_ALL.values())).shape[0]
+N_LABELS = next(iter(LOGITS_ALL.values())).shape[1]
+
+print(f"N_TEST={N_TEST}, N_LABELS={N_LABELS}")
+
+# %%
+# === Cached helper functions ===
+
+def get_cached_logits_and_attn(
+    model_name: str,
+    sample_idx: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      logits: (C,) CPU
+      attn  : (C, L) CPU
+    """
+    return LOGITS_ALL[model_name][sample_idx], ATTN_ALL[model_name][sample_idx]
+
+
+def get_cached_label_logits_and_attn(
+    model_name: str,
+    sample_idx: int,
+    label_idx: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      logits_label: scalar CPU tensor
+      attn_label  : (L,) CPU tensor
+    """
+    logits = LOGITS_ALL[model_name][sample_idx, label_idx]
+    attn = ATTN_ALL[model_name][sample_idx, label_idx]
+    return logits, attn
+
+
+def predict_label_for_sample_cached(
+    model_name: str,
+    sample_idx: int,
+    label_idx: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Cached replacement for per-sample prediction lookup.
+
+    Returns:
+      logits: scalar CPU tensor
+      probs : scalar CPU tensor
+      pred  : scalar CPU bool tensor
+    """
+    logits = LOGITS_ALL[model_name][sample_idx, label_idx]
+    probs = PROBS_ALL[model_name][sample_idx, label_idx]
+    pred = PREDS_ALL[model_name][sample_idx, label_idx]
+    return logits, probs, pred
+
+
+def agree_positive_mask_cached(
+    model_a: str,
+    model_b: str,
+    label_idx: int,
+) -> torch.Tensor:
+    """
+    Returns boolean mask (N_TEST,) where BOTH models predict label positive.
+    """
+    return PREDS_ALL[model_a][:, label_idx] & PREDS_ALL[model_b][:, label_idx]
+
+
+def agree_prediction_mask_cached(
+    model_a: str,
+    model_b: str,
+    label_idx: int,
+) -> torch.Tensor:
+    """
+    Returns boolean mask (N_TEST,) where BOTH models have the same binary prediction.
+    """
+    return PREDS_ALL[model_a][:, label_idx] == PREDS_ALL[model_b][:, label_idx]
+
+
+def get_attn_vector_cached(
+    model_name: str,
+    sample_idx: int,
+    label_idx: int,
+) -> torch.Tensor:
+    """
+    Returns attention vector (L,) on CPU.
+    """
+    return ATTN_ALL[model_name][sample_idx, label_idx]
+
+# %%
+# === Optional: precompute pairwise agreement masks once ===
 
 MODEL_NAMES = list(models.keys())
-TOP_K = 15
-TRIM = True
+MODEL_PAIRS = [(a, b) for i, a in enumerate(MODEL_NAMES) for b in MODEL_NAMES[i+1:]]
 
-# pick one sample index per label where GT=1 (like your old notebook)
-def find_first_gt_positive(label_idx: int, max_scan: int = 5000) -> Optional[int]:
-    for i in range(min(max_scan, len(test_dataset))):
-        _, y = test_dataset[i]
-        if int(y[label_idx].item()) == 1:
-            return i
-    return None
+AGREE_POS_MASKS = {}
+AGREE_PRED_MASKS = {}
 
-for lbl in TEST_LABELS:
-    ds_idx = find_first_gt_positive(lbl)
-    print(f"\nLabel={lbl} | first GT-positive sample={ds_idx}")
-    if ds_idx is None:
-        print("  (none found in scan range)")
-        continue
+for a, b in MODEL_PAIRS:
+    AGREE_POS_MASKS[(a, b)] = {}
+    AGREE_PRED_MASKS[(a, b)] = {}
 
-    x, y = test_dataset[ds_idx]
-    Xb = x.unsqueeze(0)
-    window_size = config["window_size"] if TRIM else None
-    valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+    for lbl in range(N_LABELS):
+        AGREE_POS_MASKS[(a, b)][lbl] = agree_positive_mask_cached(a, b, lbl)
+        AGREE_PRED_MASKS[(a, b)][lbl] = agree_prediction_mask_cached(a, b, lbl)
 
-    # collect attention vectors
-    att_by_model = {}
-    for mname in MODEL_NAMES:
-        _, att = get_label_logits_and_attn(models[mname], Xb, lbl)
-        att_by_model[mname] = att[0]
-
-    # cosine matrix
-    cosM = np.zeros((len(MODEL_NAMES), len(MODEL_NAMES)))
-    jacM = np.zeros((len(MODEL_NAMES), len(MODEL_NAMES)))
-
-    for i, a in enumerate(MODEL_NAMES):
-        for j, b in enumerate(MODEL_NAMES):
-            cosM[i, j] = cosine_sim_on_valid(att_by_model[a], att_by_model[b], valid_pos)
-            jacM[i, j] = jaccard(topk_positions(att_by_model[a], valid_pos, TOP_K),
-                                 topk_positions(att_by_model[b], valid_pos, TOP_K))
-
-    display(pd.DataFrame(cosM, index=MODEL_NAMES, columns=MODEL_NAMES))
-    display(pd.DataFrame(jacM, index=MODEL_NAMES, columns=MODEL_NAMES))
-
-    # show predictions for context
-    for mname in MODEL_NAMES:
-        logits, probs, pred = predict_label_for_samples(mname, Xb, lbl)
-        thr = per_label_thr_by_model[mname][lbl].item()
-        print(f"  {mname:11s} prob={probs[0].item():.4f} thr={thr:.2f} pred={bool(pred[0].item())} GT={int(y[lbl].item())}")
-
+print("Precomputed pairwise agreement masks.")
+print("Pairs:", MODEL_PAIRS)
 
 # %%
-# Test 7: attention heatmap sanity check (agree-positive samples) — shows BOTH modes
+# === Helper to get candidate indices quickly from cached masks ===
 
-print("=== attention heatmap sanity check (position + token_zoom) ===")
+def get_agree_indices_cached(
+    model_a: str,
+    model_b: str,
+    label_idx: int,
+    mode: str = "agree_positive",
+) -> List[int]:
+    """
+    Returns dataset indices satisfying a cached pairwise condition.
+    """
+    if mode == "agree_positive":
+        mask = AGREE_POS_MASKS[(model_a, model_b)][label_idx]
+    elif mode == "agree_prediction":
+        mask = AGREE_PRED_MASKS[(model_a, model_b)][label_idx]
+    else:
+        raise ValueError("mode must be 'agree_positive' or 'agree_prediction'")
 
-pair = ("Centralized", "FedAvg")
-max_to_find = 2
+    return torch.nonzero(mask, as_tuple=False).squeeze(1).tolist()
 
-# position-mode controls
-POS_MAX_TOKENS = None     # None shows full valid range; set e.g. 500 if too wide/heavy
+# %% [markdown]
+# ### Note on cached analysis
+#  
+# From this point onward, large-scale analysis sections should use the cached tensors:
+# - `LOGITS_ALL`
+# - `ATTN_ALL`
+# - `PROBS_ALL`
+# - `PREDS_ALL`
+# - `AGREE_POS_MASKS`
+# - `AGREE_PRED_MASKS`
+#  
+# This avoids repeated model inference inside label × sample × pair loops.
 
-# token-zoom controls
-ZOOM_START = 0
-ZOOM_WIDTH = 60
-ZOOM_TICK_EVERY = 5
+# %%
+# === Sanity check for cache correctness ===
 
-for lbl in TEST_LABELS:
-    found = []
+print("=== Precompute cache sanity check ===")
 
-    # find agree-positive samples
-    for ds_idx in range(len(test_dataset)):
-        x, y = test_dataset[ds_idx]
-        Xb = x.unsqueeze(0)
+test_model = "Centralized"
+test_sample = 0
+test_label = 3
 
-        if bool(agree_positive_mask(pair[0], pair[1], Xb, lbl).item()):
-            found.append(ds_idx)
+# cached
+logit_c, attn_c = get_cached_label_logits_and_attn(test_model, test_sample, test_label)
+prob_c = PROBS_ALL[test_model][test_sample, test_label]
+pred_c = PREDS_ALL[test_model][test_sample, test_label]
 
-        if len(found) >= max_to_find:
-            break
+print(f"Model={test_model} | sample={test_sample} | label={test_label}")
+print(f"  cached logit={float(logit_c):.6f}")
+print(f"  cached prob ={float(prob_c):.6f}")
+print(f"  cached pred ={bool(pred_c)}")
+print(f"  attn shape  ={tuple(attn_c.shape)} | sum={float(attn_c.sum()):.6f}")
 
-    print(f"\nlabel={lbl} | pair={pair[0]} vs {pair[1]} | found agree-positive samples:", found)
+assert abs(float(attn_c.sum()) - 1.0) < 1e-3, "Cached attention should sum to ~1."
+assert LOGITS_ALL[test_model].shape[0] == len(test_dataset), "Cached rows should match test dataset size."
 
-    if not found:
-        print("  (no agree-positive samples found; skipping heatmaps)")
-        continue
-
-    for ds_idx in found:
-        print("\n----------------------------------")
-        print(f"Heatmap test | label={lbl} | sample={ds_idx}")
-
-        # Print prediction metadata first (important context)
-        for m in pair:
-            x0, _ = test_dataset[ds_idx]
-            logits, probs, pred = predict_label_for_samples(m, x0.unsqueeze(0), lbl)
-            thr = per_label_thr_by_model[m][lbl].item()
-            print(f"  {m:11s} | prob={probs[0].item():.4f} | thr={thr:.2f} | pred={bool(pred[0].item())}")
-
-        # 1) Old-style: by token position (matches original notebook vibe)
-        print("  -> Plot: mode='position'")
-        plot_attention_heatmap(
-            sample_idx=ds_idx,
-            label_idx=lbl,
-            model_names=list(pair),
-            trim_context=True,
-            mode="position",
-            max_tokens=POS_MAX_TOKENS
-        )
-
-        # 2) Zoomed: token-labeled window (readable)
-        print("  -> Plot: mode='token_zoom'")
-        plot_attention_heatmap(
-            sample_idx=ds_idx,
-            label_idx=lbl,
-            model_names=list(pair),
-            trim_context=True,
-            mode="token_zoom",
-            start=ZOOM_START,
-            max_tokens=ZOOM_WIDTH,      # width of zoom window
-            tick_every=ZOOM_TICK_EVERY
-        )
-
+print("Cache sanity check passed.")
 
 # %% [markdown]
 # ## Questions
@@ -906,7 +1368,6 @@ for lbl in TEST_LABELS:
 # 
 # Always check `n_kept`:
 # - If `n_kept` is small for a label/pair, treat that label result as noisy.
-# 
 
 # %%
 # Q1 CONFIG
@@ -929,7 +1390,6 @@ Q1_PAIRS = [(a, b) for i, a in enumerate(MODEL_NAMES) for b in MODEL_NAMES[i+1:]
 print("Q1_LABELS:", (Q1_LABELS[:10], "...") if len(Q1_LABELS) > 10 else Q1_LABELS)
 print("Q1_PAIRS:", Q1_PAIRS)
 
-
 # %%
 def get_candidate_indices_for_label(label_idx: int) -> List[int]:
     """
@@ -940,52 +1400,50 @@ def get_candidate_indices_for_label(label_idx: int) -> List[int]:
         return idxs[:Q1_MAX_SAMPLES_PER_LABEL] if Q1_MAX_SAMPLES_PER_LABEL else idxs
 
     if Q1_CANDIDATE_POOL == "gt_positive":
-        idxs = []
-        for i in range(len(test_dataset)):
-            _, y = test_dataset[i]
-            if int(y[label_idx].item()) == 1:
-                idxs.append(i)
-                if Q1_MAX_SAMPLES_PER_LABEL and len(idxs) >= Q1_MAX_SAMPLES_PER_LABEL:
-                    break
-        return idxs
+        idxs = torch.nonzero(Y_test[:, label_idx] == 1, as_tuple=False).squeeze(1).tolist()
+        return idxs[:Q1_MAX_SAMPLES_PER_LABEL] if Q1_MAX_SAMPLES_PER_LABEL else idxs
 
     raise ValueError(f"Unknown Q1_CANDIDATE_POOL={Q1_CANDIDATE_POOL}")
 
 
-def q1_pair_mask(model_a: str, model_b: str, Xb: torch.Tensor, label_idx: int) -> torch.Tensor:
+def q1_pair_mask_cached_for_label(model_a: str, model_b: str, label_idx: int) -> torch.Tensor:
+    """
+    Returns cached pairwise mask over the full test set for this label.
+    """
     if Q1_PAIR_MODE == "agree_positive":
-        return agree_positive_mask(model_a, model_b, Xb, label_idx)
+        return AGREE_POS_MASKS[(model_a, model_b)][label_idx]
     elif Q1_PAIR_MODE == "agree_prediction":
-        return agree_prediction_mask(model_a, model_b, Xb, label_idx)
+        return AGREE_PRED_MASKS[(model_a, model_b)][label_idx]
     else:
         raise ValueError(f"Unknown Q1_PAIR_MODE={Q1_PAIR_MODE}")
 
-
 # %%
-# Q1 RUN
+# Q1 RUN (cached)
 
 q1_rows = []
 
 label_iter = tqdm(Q1_LABELS, desc="Q1 labels") if Q1_PROGRESS else Q1_LABELS
 for label_idx in label_iter:
     cand_idxs = get_candidate_indices_for_label(label_idx)
+    cand_idx_set = set(cand_idxs)
 
     for a, b in Q1_PAIRS:
         cos_vals: List[float] = []
         jac_vals: List[float] = []
         kept = 0
-
-        # extra bookkeeping for context (optional but helpful)
         kept_gt_pos = 0
         kept_gt_neg = 0
 
-        for ds_idx in cand_idxs:
-            x, y = test_dataset[ds_idx]
-            Xb = x.unsqueeze(0)
+        # cached pairwise mask over all test samples
+        pair_mask_full = q1_pair_mask_cached_for_label(a, b, label_idx)
 
-            mask = q1_pair_mask(a, b, Xb, label_idx)
-            if not bool(mask.item()):
-                continue
+        # restrict to candidate pool
+        kept_idxs = torch.nonzero(pair_mask_full, as_tuple=False).squeeze(1).tolist()
+        if Q1_CANDIDATE_POOL != "all_test" or Q1_MAX_SAMPLES_PER_LABEL is not None:
+            kept_idxs = [i for i in kept_idxs if i in cand_idx_set]
+
+        for ds_idx in kept_idxs:
+            x, y = test_dataset[ds_idx]
 
             kept += 1
             if int(y[label_idx].item()) == 1:
@@ -996,14 +1454,12 @@ for label_idx in label_iter:
             window_size = config["window_size"] if Q1_TRIM_CONTEXT else None
             valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
 
-            # fetch attention vectors
-            _, att_a = get_label_logits_and_attn(models[a], Xb, label_idx)
-            _, att_b = get_label_logits_and_attn(models[b], Xb, label_idx)
-            att_a_1d = att_a[0]
-            att_b_1d = att_b[0]
+            # cached attention vectors
+            att_a_1d = ATTN_ALL[a][ds_idx, label_idx]
+            att_b_1d = ATTN_ALL[b][ds_idx, label_idx]
 
-            # metrics
             cos_vals.append(cosine_sim_on_valid(att_a_1d, att_b_1d, valid_pos))
+
             top_a = topk_positions(att_a_1d, valid_pos, Q1_TOP_K)
             top_b = topk_positions(att_b_1d, valid_pos, Q1_TOP_K)
             jac_vals.append(jaccard(top_a, top_b))
@@ -1031,18 +1487,15 @@ q1_df = pd.DataFrame(q1_rows)
 print("Done. Rows:", len(q1_df))
 display(q1_df.head())
 
-
 # %%
 # Q1: View coverage + agreement per label (sorted)
 
-# Sort by coverage first (so you can see which labels/pairs have enough agree-positive samples - more evidence)
 q1_sorted = q1_df.sort_values(["n_kept", "jac_mean"], ascending=[False, False])
 display(q1_sorted.head(30))
 
 # If you want to only see central-vs-fed comparisons:
-central_vs = q1_df[q1_df["pair"].str.contains("Centralized")]
+central_vs = q1_df[q1_df["pair"].str.contains("Centralized")].copy()
 display(central_vs.sort_values(["n_kept", "jac_mean"], ascending=[False, False]).head(30))
-
 
 # %%
 # Q1: Aggregate summary per pair across labels (weighted by coverage)
@@ -1071,9 +1524,34 @@ for pair, sub in q1_df.groupby("pair"):
         "jac_median_unweighted": float(np.nanmedian(sub["jac_median"].to_numpy(dtype=float))),
     })
 
-q1_pair_summary = pd.DataFrame(pair_summaries).sort_values(["jac_mean_weighted", "cos_mean_weighted"], ascending=False)
+q1_pair_summary = pd.DataFrame(pair_summaries).sort_values(
+    ["jac_mean_weighted", "cos_mean_weighted"], ascending=False
+)
 display(q1_pair_summary)
 
+# %%
+# Q1: Save tabular results
+
+q1_df.to_csv(Q1_RESULTS_CSV, index=False)
+save_json(
+    {"rows": [to_serializable_row(r) for r in q1_df.to_dict(orient="records")]},
+    Q1_RESULTS_JSON
+)
+
+q1_pair_summary.to_csv(Q1_PAIR_SUMMARY_CSV, index=False)
+save_json(
+    {"rows": [to_serializable_row(r) for r in q1_pair_summary.to_dict(orient="records")]},
+    Q1_PAIR_SUMMARY_JSON
+)
+
+central_vs.to_csv(Q1_CENTRAL_ONLY_CSV, index=False)
+
+print("Saved Q1 results:")
+print(" ", Q1_RESULTS_CSV)
+print(" ", Q1_RESULTS_JSON)
+print(" ", Q1_PAIR_SUMMARY_CSV)
+print(" ", Q1_PAIR_SUMMARY_JSON)
+print(" ", Q1_CENTRAL_ONLY_CSV)
 
 # %%
 # Q1: Bar plots for Centralized vs Federated models
@@ -1099,6 +1577,7 @@ else:
         plt.text(i, v, f"{v:.3f}", ha="center", va="bottom")
 
     plt.tight_layout()
+    plt.savefig(Q1_WEIGHTED_COSINE_PLOT, dpi=300, bbox_inches="tight")
     plt.show()
 
     # --- Weighted Jaccard ---
@@ -1115,8 +1594,12 @@ else:
         plt.text(i, v, f"{v:.3f}", ha="center", va="bottom")
 
     plt.tight_layout()
+    plt.savefig(Q1_WEIGHTED_JACCARD_PLOT, dpi=300, bbox_inches="tight")
     plt.show()
 
+    print("Saved Q1 plots:")
+    print(" ", Q1_WEIGHTED_COSINE_PLOT)
+    print(" ", Q1_WEIGHTED_JACCARD_PLOT)
 
 # %% [markdown]
 # ### 2. Are there cases where models make the same prediction but rely on different tokens?
@@ -1874,9 +2357,9 @@ else:
 
 
 # %% [markdown]
-# ### Finding if high agreement has more similar heatmaps and relating agreement to mislabeling
+# ### 5. Finding if high agreement has more similar heatmaps and relating agreement to mislabeling
 # 
-# Q2H: Highest-agreement samples (agree-positive) + Agreement ↔ Mislabeling (GT) analysis
+# Highest-agreement samples (agree-positive) + Agreement ↔ Mislabeling (GT) analysis
 # This section mirrors Q2, but:
 # 1) Collects **ALL agree-positive rows** (no top-N-per-label) for unbiased agreement↔mislabeling analysis.
 # 2) Also provides a **highest-agreement sample picker** for qualitative heatmap inspection per pair.
@@ -2267,7 +2750,7 @@ if "agg_analysis" in globals() and agg_analysis["by_bin"]:
 
 
 # %% [markdown]
-# ### Phrase Level Attention Inspection
+# ## Phrase Level Attention Inspection
 
 # %%
 # Phrase / window extraction helpers with merging
