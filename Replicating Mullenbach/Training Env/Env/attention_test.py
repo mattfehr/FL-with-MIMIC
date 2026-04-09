@@ -2240,36 +2240,50 @@ print(" ", Q3_BINNED_JACCARD_PLOT)
 
 # %%
 # Q4: Extract Centralized-vs-Fed rows from Q1 and rank methods
+# NOTE: Q4 uses q1_df/q1_pair_summary already computed from cached Q1 outputs.
 
 FED_METHODS = ["FedAvg", "FedProx", "SCAFFOLD"]
 CENTRAL = "Centralized"
 
-# 1) Method-level summary (from q1_pair_summary if available)
 if "q1_pair_summary" not in globals():
     raise RuntimeError("q1_pair_summary not found. Run Q1 aggregation cell first.")
 
 q4_summary = q1_pair_summary[q1_pair_summary["pair"].str.contains(CENTRAL)].copy()
 display(q4_summary)
 
-# 2) Parse out the federated method name from "Centralized vs X"
 def extract_fed_method(pair_str: str) -> str:
-    # handles "Centralized vs FedAvg" etc.
     parts = pair_str.split(" vs ")
     return parts[1].strip() if len(parts) == 2 else pair_str
 
 q4_summary["fed_method"] = q4_summary["pair"].apply(extract_fed_method)
-
-# Keep only expected fed methods
 q4_summary = q4_summary[q4_summary["fed_method"].isin(FED_METHODS)].copy()
 
-# Rank by weighted metrics
-q4_rank = q4_summary.sort_values(["jac_mean_weighted", "cos_mean_weighted"], ascending=False)[
-    ["fed_method", "labels_covered", "total_kept", "cos_mean_weighted", "jac_mean_weighted",
-     "cos_median_unweighted", "jac_median_unweighted"]
-].reset_index(drop=True)
+q4_rank = q4_summary.sort_values(
+    ["jac_mean_weighted", "cos_mean_weighted"], ascending=False
+)[[
+    "fed_method",
+    "labels_covered",
+    "total_kept",
+    "cos_mean_weighted",
+    "jac_mean_weighted",
+    "cos_median_unweighted",
+    "jac_median_unweighted",
+]].reset_index(drop=True)
 
 display(q4_rank)
 
+# %%
+# Q4: Save method ranking tables
+
+q4_rank.to_csv(Q4_RANK_CSV, index=False)
+save_json(
+    {"rows": [to_serializable_row(r) for r in q4_rank.to_dict(orient="records")]},
+    Q4_RANK_JSON
+)
+
+print("Saved Q4 ranking table:")
+print(" ", Q4_RANK_CSV)
+print(" ", Q4_RANK_JSON)
 
 # %%
 # Q4: Bar plots (ranked) for Centralized vs Fed methods
@@ -2277,33 +2291,43 @@ display(q4_rank)
 if len(q4_rank) == 0:
     print("No Centralized-vs-Fed rows found. Check pair naming in q1_pair_summary.")
 else:
-    # cosine
+    # --- Cosine Plot ---
     plt.figure()
-    plt.bar(q4_rank["fed_method"], q4_rank["cos_mean_weighted"])
+    ax1 = plt.gca()
+    bars1 = ax1.bar(q4_rank["fed_method"], q4_rank["cos_mean_weighted"])
+    ax1.bar_label(bars1, padding=3, fmt='%.3f') # Displays value with 3 decimal places
+    
     plt.title("Q4: Closeness to Centralized (Weighted Cosine)")
     plt.ylabel("Weighted cosine similarity")
     plt.tight_layout()
+    plt.savefig(Q4_COSINE_BAR_PLOT, dpi=300, bbox_inches="tight")
     plt.show()
 
-    # jaccard
+    # --- Jaccard Plot ---
     plt.figure()
-    plt.bar(q4_rank["fed_method"], q4_rank["jac_mean_weighted"])
+    ax2 = plt.gca()
+    bars2 = ax2.bar(q4_rank["fed_method"], q4_rank["jac_mean_weighted"])
+    ax2.bar_label(bars2, padding=3, fmt='%.3f')
+    
     plt.title(f"Q4: Closeness to Centralized (Weighted Jaccard@{int(q1_df['top_k'].iloc[0])})")
     plt.ylabel("Weighted Jaccard")
     plt.tight_layout()
+    plt.savefig(Q4_JACCARD_BAR_PLOT, dpi=300, bbox_inches="tight")
     plt.show()
 
+    print("Saved Q4 bar plots:")
+    print("  ", Q4_COSINE_BAR_PLOT)
+    print("  ", Q4_JACCARD_BAR_PLOT)
 
 # %%
 # Q4: Per-label "win rate" among Fed methods (which is closest to Centralized on each label?)
 
-# Build a label×method table of Centralized-vs-method agreement
 q4_label = q1_df[q1_df["pair"].str.contains(CENTRAL)].copy()
 q4_label["fed_method"] = q4_label["pair"].apply(extract_fed_method)
 q4_label = q4_label[q4_label["fed_method"].isin(FED_METHODS)].copy()
 
-# Optional: only consider labels where all three methods have enough coverage
 Q4_MIN_KEPT_PER_LABEL = 30
+
 pivot_cos = q4_label.pivot_table(index="label", columns="fed_method", values="cos_mean")
 pivot_jac = q4_label.pivot_table(index="label", columns="fed_method", values="jac_mean")
 pivot_kept = q4_label.pivot_table(index="label", columns="fed_method", values="n_kept")
@@ -2317,7 +2341,6 @@ pivot_jac_f = pivot_jac.loc[valid_labels]
 
 print("Labels where ALL 3 methods have n_kept >= threshold:", len(valid_labels), "/ 50")
 
-# Winner per label
 cos_winner = pivot_cos_f.idxmax(axis=1)
 jac_winner = pivot_jac_f.idxmax(axis=1)
 
@@ -2328,32 +2351,52 @@ win_df = pd.DataFrame({
 
 display(win_df)
 
-# Also show some "disagreement labels" where cosine and jaccard winners differ
 diff_winner_labels = cos_winner.index[cos_winner != jac_winner]
-print("Labels where cosine-winner != jaccard-winner:", len(diff_winner_labels))
-display(pd.DataFrame({
+q4_winner_diff_df = pd.DataFrame({
     "label": diff_winner_labels,
     "cos_winner": cos_winner.loc[diff_winner_labels].values,
     "jac_winner": jac_winner.loc[diff_winner_labels].values,
-}).head(15))
+})
 
+print("Labels where cosine-winner != jaccard-winner:", len(diff_winner_labels))
+display(q4_winner_diff_df.head(15))
+
+# %%
+# Q4: Save win-rate outputs
+
+win_df_reset = win_df.reset_index().rename(columns={"index": "fed_method"})
+win_df_reset.to_csv(Q4_WIN_RATES_CSV, index=False)
+save_json(
+    {"rows": [to_serializable_row(r) for r in win_df_reset.to_dict(orient="records")]},
+    Q4_WIN_RATES_JSON
+)
+
+q4_winner_diff_df.to_csv(Q4_WINNER_DIFF_LABELS_CSV, index=False)
+
+print("Saved Q4 win-rate outputs:")
+print(" ", Q4_WIN_RATES_CSV)
+print(" ", Q4_WIN_RATES_JSON)
+print(" ", Q4_WINNER_DIFF_LABELS_CSV)
 
 # %%
 # Q4: Bootstrap confidence intervals over labels (weighted by n_kept)
 
 rng = np.random.default_rng(42)
 
-def bootstrap_weighted_mean(sub_df: pd.DataFrame, value_col: str, weight_col: str, n_boot: int = 2000) -> tuple[float,float,float]:
+def bootstrap_weighted_mean(
+    sub_df: pd.DataFrame,
+    value_col: str,
+    weight_col: str,
+    n_boot: int = 2000
+) -> tuple[float, float, float]:
     """
     Bootstrap over labels: resample labels with replacement, and compute weighted mean within each sample.
     """
-    # one row per label
     d = sub_df[["label", value_col, weight_col]].dropna().copy()
     labels = d["label"].to_numpy()
     vals = d[value_col].to_numpy(dtype=float)
-    wts  = d[weight_col].to_numpy(dtype=float)
+    wts = d[weight_col].to_numpy(dtype=float)
 
-    # map label -> (val, wt)
     by_label = {}
     for lbl, v, w in zip(labels, vals, wts):
         by_label[int(lbl)] = (float(v), float(w))
@@ -2381,39 +2424,63 @@ def bootstrap_weighted_mean(sub_df: pd.DataFrame, value_col: str, weight_col: st
 q4_ci_rows = []
 for m in FED_METHODS:
     sub = q4_label[q4_label["fed_method"] == m].copy()
-    # use n_kept as weights
     cos_c, cos_lo, cos_hi = bootstrap_weighted_mean(sub, "cos_mean", "n_kept", n_boot=2000)
     jac_c, jac_lo, jac_hi = bootstrap_weighted_mean(sub, "jac_mean", "n_kept", n_boot=2000)
     q4_ci_rows.append({
         "fed_method": m,
         "cos_mean_weighted_boot": cos_c,
-        "cos_95ci": (cos_lo, cos_hi),
+        "cos_95ci_low": cos_lo,
+        "cos_95ci_high": cos_hi,
         "jac_mean_weighted_boot": jac_c,
-        "jac_95ci": (jac_lo, jac_hi),
+        "jac_95ci_low": jac_lo,
+        "jac_95ci_high": jac_hi,
     })
 
-q4_ci = pd.DataFrame(q4_ci_rows).sort_values(["jac_mean_weighted_boot","cos_mean_weighted_boot"], ascending=False)
+q4_ci = pd.DataFrame(q4_ci_rows).sort_values(
+    ["jac_mean_weighted_boot", "cos_mean_weighted_boot"], ascending=False
+).reset_index(drop=True)
+
 display(q4_ci)
 
+# %%
+# Q4: Save bootstrap CI table
+
+q4_ci.to_csv(Q4_BOOTSTRAP_CI_CSV, index=False)
+save_json(
+    {"rows": [to_serializable_row(r) for r in q4_ci.to_dict(orient="records")]},
+    Q4_BOOTSTRAP_CI_JSON
+)
+
+print("Saved Q4 bootstrap CI table:")
+print(" ", Q4_BOOTSTRAP_CI_CSV)
+print(" ", Q4_BOOTSTRAP_CI_JSON)
 
 # %%
 # Q4 (optional): Breakdown by label frequency bins (uses freq_df from Q3)
 
 if "freq_df" not in globals():
     print("freq_df not found (run Q3 frequency cell first) — skipping frequency-bin breakdown.")
+    q4_bins = pd.DataFrame()
 else:
     Q4_FREQ_COL = "train_pos"
     bins = 5
 
-    tmp = q4_label.merge(freq_df[["label", Q4_FREQ_COL]], on="label", how="left").rename(columns={Q4_FREQ_COL: "label_freq"})
-    # bin labels globally by frequency
-    tmp_labels = tmp[["label","label_freq"]].drop_duplicates().copy()
-    tmp_labels["bin"] = pd.qcut(tmp_labels["label_freq"].rank(method="first"), q=bins, labels=False)
-    tmp = tmp.merge(tmp_labels[["label","bin"]], on="label", how="left")
+    tmp = q4_label.merge(
+        freq_df[["label", Q4_FREQ_COL]],
+        on="label",
+        how="left"
+    ).rename(columns={Q4_FREQ_COL: "label_freq"})
 
-    # weighted means within each (method, bin)
+    tmp_labels = tmp[["label", "label_freq"]].drop_duplicates().copy()
+    tmp_labels["bin"] = pd.qcut(
+        tmp_labels["label_freq"].rank(method="first"),
+        q=bins,
+        labels=False
+    )
+    tmp = tmp.merge(tmp_labels[["label", "bin"]], on="label", how="left")
+
     out = []
-    for (m, b), sub in tmp.groupby(["fed_method","bin"]):
+    for (m, b), sub in tmp.groupby(["fed_method", "bin"]):
         w = sub["n_kept"].to_numpy(dtype=float)
         out.append({
             "fed_method": m,
@@ -2424,10 +2491,31 @@ else:
             "jac_wmean": weighted_mean(sub["jac_mean"].to_numpy(dtype=float), w),
         })
 
-    q4_bins = pd.DataFrame(out).sort_values(["bin","fed_method"])
+    q4_bins = pd.DataFrame(out).sort_values(["bin", "fed_method"]).reset_index(drop=True)
     display(q4_bins)
 
-    # plot trends
+# %%
+# Q4: Save frequency-bin breakdown
+
+if len(q4_bins) > 0:
+    q4_bins.to_csv(Q4_FREQ_BINS_CSV, index=False)
+    save_json(
+        {"rows": [to_serializable_row(r) for r in q4_bins.to_dict(orient="records")]},
+        Q4_FREQ_BINS_JSON
+    )
+
+    print("Saved Q4 frequency-bin breakdown:")
+    print(" ", Q4_FREQ_BINS_CSV)
+    print(" ", Q4_FREQ_BINS_JSON)
+else:
+    print("No Q4 frequency-bin table saved.")
+
+# %%
+# Q4: Frequency-bin plots
+
+if len(q4_bins) == 0:
+    print("q4_bins is empty — skipping frequency-bin plots.")
+else:
     plt.figure()
     for m, sub in q4_bins.groupby("fed_method"):
         plt.plot(sub["bin"], sub["cos_wmean"], marker="o", label=m)
@@ -2436,6 +2524,7 @@ else:
     plt.ylabel("Weighted cosine")
     plt.legend()
     plt.tight_layout()
+    plt.savefig(Q4_FREQ_BIN_COSINE_PLOT, dpi=300, bbox_inches="tight")
     plt.show()
 
     plt.figure()
@@ -2446,8 +2535,12 @@ else:
     plt.ylabel("Weighted Jaccard")
     plt.legend()
     plt.tight_layout()
+    plt.savefig(Q4_FREQ_BIN_JACCARD_PLOT, dpi=300, bbox_inches="tight")
     plt.show()
 
+    print("Saved Q4 frequency-bin plots:")
+    print(" ", Q4_FREQ_BIN_COSINE_PLOT)
+    print(" ", Q4_FREQ_BIN_JACCARD_PLOT)
 
 # %% [markdown]
 # ### 5. Finding if high agreement has more similar heatmaps and relating agreement to mislabeling
