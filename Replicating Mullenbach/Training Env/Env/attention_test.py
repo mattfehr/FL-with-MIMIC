@@ -263,7 +263,7 @@ print("Vocab size:", len(idx_to_token), "| PAD_INDEX:", PAD_INDEX)
 MODEL_PATHS = {
     "Centralized": "../History/models/central_e300_best_attention_fixed.pt",
     "FedAvg":      "../History/models/fedavg_c2e3_best_attention_fixed.pt",
-    "FedProx":     "../History/models/fedprox_c2e3_mu0001_best_attention_fixed.pt",
+    "FedProx":     "../History/models/fedprox_c3e3_mu0001_best_attention_fixed.pt",
     "SCAFFOLD":    "../History/models/scaffold_c4e3_lr125_m0_best_attention_fixed.pt",
 }
 
@@ -1616,7 +1616,7 @@ else:
 # %%
 # Q2 CONFIG
 
-Q2_LABELS = list(range(50))        # or start with [3, 7, 20]
+Q2_LABELS = list(range(50))         # or start with [3, 7, 20]
 Q2_PAIR = ("Centralized", "FedAvg") # change to ("Centralized","FedProx"), ("Centralized","SCAFFOLD"), etc.
 
 Q2_TOP_K = 15
@@ -1629,9 +1629,8 @@ Q2_MIN_KEPT_REQUIRED = 30           # skip labels with low coverage (avoid noisy
 print("Q2_LABELS:", (Q2_LABELS[:10], "...") if len(Q2_LABELS) > 10 else Q2_LABELS)
 print("Q2_PAIR:", Q2_PAIR)
 
-
 # %%
-# Helper: candidates for Q2 (reuse Q1 style but independent knobs)
+# Helper: candidates for Q2 (cached-friendly)
 
 def q2_candidate_indices_for_label(label_idx: int) -> List[int]:
     if Q2_CANDIDATE_POOL == "all_test":
@@ -1639,22 +1638,14 @@ def q2_candidate_indices_for_label(label_idx: int) -> List[int]:
         return idxs[:Q2_MAX_SCAN_PER_LABEL] if Q2_MAX_SCAN_PER_LABEL else idxs
 
     if Q2_CANDIDATE_POOL == "gt_positive":
-        idxs = []
-        for i in range(len(test_dataset)):
-            _, y = test_dataset[i]
-            if int(y[label_idx].item()) == 1:
-                idxs.append(i)
-                if Q2_MAX_SCAN_PER_LABEL and len(idxs) >= Q2_MAX_SCAN_PER_LABEL:
-                    break
-        return idxs
+        idxs = torch.nonzero(Y_test[:, label_idx] == 1, as_tuple=False).squeeze(1).tolist()
+        return idxs[:Q2_MAX_SCAN_PER_LABEL] if Q2_MAX_SCAN_PER_LABEL else idxs
 
     raise ValueError(f"Unknown Q2_CANDIDATE_POOL={Q2_CANDIDATE_POOL}")
 
-
 # %%
-# Q2: Compute per-sample divergence for a given label + pair (returns a dataframe)
+# Q2: Compute per-sample divergence for a given label + pair using cached outputs
 
-@torch.no_grad()
 def q2_find_divergent_samples_for_label(
     label_idx: int,
     model_a: str,
@@ -1664,24 +1655,24 @@ def q2_find_divergent_samples_for_label(
     candidate_indices: List[int],
 ) -> pd.DataFrame:
     rows = []
-    kept = 0
 
-    for ds_idx in candidate_indices:
+    candidate_set = set(candidate_indices)
+    kept_idxs = torch.nonzero(
+        AGREE_POS_MASKS[(model_a, model_b)][label_idx],
+        as_tuple=False
+    ).squeeze(1).tolist()
+
+    if Q2_CANDIDATE_POOL != "all_test" or Q2_MAX_SCAN_PER_LABEL is not None:
+        kept_idxs = [i for i in kept_idxs if i in candidate_set]
+
+    for ds_idx in kept_idxs:
         x, y = test_dataset[ds_idx]
-        Xb = x.unsqueeze(0)
 
-        # agree-positive filter (same prediction == positive)
-        if not bool(agree_positive_mask(model_a, model_b, Xb, label_idx).item()):
-            continue
-
-        kept += 1
         window_size = config["window_size"] if trim_context else None
         valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
 
-        # attention vectors
-        _, att_a = get_label_logits_and_attn(models[model_a], Xb, label_idx)
-        _, att_b = get_label_logits_and_attn(models[model_b], Xb, label_idx)
-        att_a_1d, att_b_1d = att_a[0], att_b[0]
+        att_a_1d = ATTN_ALL[model_a][ds_idx, label_idx]
+        att_b_1d = ATTN_ALL[model_b][ds_idx, label_idx]
 
         cos = cosine_sim_on_valid(att_a_1d, att_b_1d, valid_pos)
         jac = jaccard(
@@ -1689,9 +1680,8 @@ def q2_find_divergent_samples_for_label(
             topk_positions(att_b_1d, valid_pos, top_k),
         )
 
-        # also store prediction context
-        logit_a, prob_a, pred_a = predict_label_for_samples(model_a, Xb, label_idx)
-        logit_b, prob_b, pred_b = predict_label_for_samples(model_b, Xb, label_idx)
+        prob_a = float(PROBS_ALL[model_a][ds_idx, label_idx].item())
+        prob_b = float(PROBS_ALL[model_b][ds_idx, label_idx].item())
         thr_a = float(per_label_thr_by_model[model_a][label_idx].item())
         thr_b = float(per_label_thr_by_model[model_b][label_idx].item())
 
@@ -1702,78 +1692,99 @@ def q2_find_divergent_samples_for_label(
             "gt": int(y[label_idx].item()),
             "cos": float(cos),
             "jac": float(jac),
-            "prob_a": float(prob_a[0].item()),
+            "prob_a": prob_a,
             "thr_a": thr_a,
-            "prob_b": float(prob_b[0].item()),
+            "prob_b": prob_b,
             "thr_b": thr_b,
             "valid_len": int(len(valid_pos)),
         })
 
     df = pd.DataFrame(rows)
-    # Sort most divergent first: low cosine then low jaccard
     if len(df) > 0:
         df = df.sort_values(["cos", "jac"], ascending=[True, True]).reset_index(drop=True)
 
-    # attach coverage info (how many agree-positive were found)
-    df.attrs["n_kept"] = kept
+    df.attrs["n_kept"] = len(kept_idxs)
     df.attrs["n_scanned"] = len(candidate_indices)
     return df
 
+# %%
+# Q2 RUN: collect top divergent examples per label (single chosen pair)
+
+model_a, model_b = Q2_PAIR
+
+q2_all = []
+q2_label_stats = []
+
+for label_idx in tqdm(Q2_LABELS, desc="Q2 labels"):
+    cand_idxs = q2_candidate_indices_for_label(label_idx)
+
+    df = q2_find_divergent_samples_for_label(
+        label_idx=label_idx,
+        model_a=model_a,
+        model_b=model_b,
+        top_k=Q2_TOP_K,
+        trim_context=Q2_TRIM_CONTEXT,
+        candidate_indices=cand_idxs,
+    )
+
+    n_kept = df.attrs.get("n_kept", 0)
+    q2_label_stats.append({
+        "label": label_idx,
+        "pair": f"{model_a} vs {model_b}",
+        "n_scanned": df.attrs.get("n_scanned", len(cand_idxs)),
+        "n_agree_pos": n_kept,
+        "n_returned": int(min(Q2_KEEP_TOP_N_PER_LABEL, len(df))),
+        "cos_min": float(df["cos"].min()) if len(df) else np.nan,
+        "jac_min": float(df["jac"].min()) if len(df) else np.nan,
+    })
+
+    if n_kept < Q2_MIN_KEPT_REQUIRED:
+        continue
+
+    q2_all.append(df.head(Q2_KEEP_TOP_N_PER_LABEL))
+
+q2_label_stats_df = pd.DataFrame(q2_label_stats).sort_values("n_agree_pos", ascending=False)
+display(q2_label_stats_df.head(20))
+
+q2_cases_df = pd.concat(q2_all, ignore_index=True) if len(q2_all) else pd.DataFrame()
+print("Total Q2 cases collected:", len(q2_cases_df))
+display(q2_cases_df.head(20))
 
 # %%
-# # Q2 RUN: collect top divergent examples per label
+# Q2: Find the most divergent cases overall (across labels)
 
-# model_a, model_b = Q2_PAIR
-
-# q2_all = []
-# q2_label_stats = []
-
-# for label_idx in tqdm(Q2_LABELS, desc="Q2 labels"):
-#     cand_idxs = q2_candidate_indices_for_label(label_idx)
-
-#     df = q2_find_divergent_samples_for_label(
-#         label_idx=label_idx,
-#         model_a=model_a,
-#         model_b=model_b,
-#         top_k=Q2_TOP_K,
-#         trim_context=Q2_TRIM_CONTEXT,
-#         candidate_indices=cand_idxs,
-#     )
-
-#     n_kept = df.attrs.get("n_kept", 0)
-#     q2_label_stats.append({
-#         "label": label_idx,
-#         "n_scanned": df.attrs.get("n_scanned", len(cand_idxs)),
-#         "n_agree_pos": n_kept,
-#         "n_returned": int(min(Q2_KEEP_TOP_N_PER_LABEL, len(df))),
-#         "cos_min": float(df["cos"].min()) if len(df) else np.nan,
-#         "jac_min": float(df["jac"].min()) if len(df) else np.nan,
-#     })
-
-#     # skip low-coverage labels (avoid misleading "divergent" samples from tiny n)
-#     if n_kept < Q2_MIN_KEPT_REQUIRED:
-#         continue
-
-#     q2_all.append(df.head(Q2_KEEP_TOP_N_PER_LABEL))
-
-# q2_label_stats_df = pd.DataFrame(q2_label_stats).sort_values("n_agree_pos", ascending=False)
-# display(q2_label_stats_df.head(20))
-
-# # Each row is label x sample x model pair and the max is 250 because there are 50 labels and the config keep_top_n_per_label is 5
-# q2_cases_df = pd.concat(q2_all, ignore_index=True) if len(q2_all) else pd.DataFrame()
-# print("Total Q2 cases collected:", len(q2_cases_df))
-# display(q2_cases_df.head(20))
-
+if len(q2_cases_df) == 0:
+    print("No Q2 cases found (check Q2_MIN_KEPT_REQUIRED / pair / candidate pool).")
+    q2_most_divergent = pd.DataFrame()
+else:
+    q2_most_divergent = q2_cases_df.sort_values(["cos", "jac"], ascending=[True, True]).head(30).reset_index(drop=True)
+    display(q2_most_divergent)
 
 # %%
-# # Q2: Find the MOST divergent cases overall (across labels)
+# Q2: Save single-pair results
 
-# if len(q2_cases_df) == 0:
-#     print("No Q2 cases found (check Q2_MIN_KEPT_REQUIRED / pair / candidate pool).")
-# else:
-#     q2_most_divergent = q2_cases_df.sort_values(["cos", "jac"], ascending=[True, True]).head(30)
-#     display(q2_most_divergent)
+q2_label_stats_df.to_csv(Q2_STATS_CSV, index=False)
+save_json(
+    {"rows": [to_serializable_row(r) for r in q2_label_stats_df.to_dict(orient="records")]},
+    Q2_STATS_JSON
+)
 
+q2_cases_df.to_csv(Q2_CASES_CSV, index=False)
+save_json(
+    {"rows": [to_serializable_row(r) for r in q2_cases_df.to_dict(orient="records")]},
+    Q2_CASES_JSON
+)
+
+if len(q2_most_divergent) > 0:
+    q2_most_divergent.to_csv(Q2_TOP_CASES_CSV, index=False)
+
+print("Saved Q2 single-pair results:")
+print(" ", Q2_STATS_CSV)
+print(" ", Q2_STATS_JSON)
+print(" ", Q2_CASES_CSV)
+print(" ", Q2_CASES_JSON)
+if len(q2_most_divergent) > 0:
+    print(" ", Q2_TOP_CASES_CSV)
 
 # %%
 # Q2: Qualitative inspection helper (side-by-side attention + metadata)
@@ -1802,11 +1813,10 @@ def q2_inspect_case(
     print(f"  valid_len={int(row.get('valid_len', -1))}")
     print("==============================")
 
-    # Token-level attention + top-k tokens
+    # qualitative helpers can stay as-is
     show_attention(a, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
     show_attention(b, label_idx, ds_idx, top_k=top_k, trim_context=trim_context)
 
-    # Global position heatmap
     if do_position_heatmap:
         plot_attention_heatmap(
             sample_idx=ds_idx,
@@ -1817,10 +1827,8 @@ def q2_inspect_case(
             max_tokens=None,
         )
 
-
-
 # %%
-# Q2: Run for ALL pairs and produce top-divergent tables per pair (plus qualitative inspection)
+# Q2: Run for all pairs and produce top-divergent tables per pair (cached)
 
 MODEL_NAMES = list(models.keys())
 
@@ -1898,16 +1906,13 @@ def pick_3_examples(top_overall: pd.DataFrame) -> list[pd.Series]:
 
     picks = []
 
-    # 1) extreme
     r0 = top_overall.iloc[0]
     picks.append(r0)
 
-    # 2) representative
     rep_idx = min(Q2_EXAMPLE_IDXS[1], len(top_overall) - 1)
     r1 = top_overall.iloc[rep_idx]
     picks.append(r1)
 
-    # 3) different label
     used = {int(r0["label"]), int(r1["label"])}
     r2 = None
     for _, row in top_overall.iterrows():
@@ -1947,7 +1952,6 @@ for a, b in Q2_PAIRS:
     print(f"Most divergent cases overall (top {Q2_TOP_OVERALL_N}):")
     display(top_overall)
 
-    # --- qualitative: 3 examples per pair ---
     if Q2_SHOW_QUAL and len(top_overall) > 0:
         examples = pick_3_examples(top_overall)
         for ex_row in examples:
@@ -1958,6 +1962,50 @@ for a, b in Q2_PAIRS:
                 do_position_heatmap=True
             )
 
+# %%
+# Q2: Save all-pairs results into the same folder (combined files)
+
+q2_all_stats_df = pd.concat(
+    [v["stats"] for v in q2_pair_results.values() if v["stats"] is not None and len(v["stats"]) > 0],
+    ignore_index=True
+) if len(q2_pair_results) > 0 else pd.DataFrame()
+
+q2_all_cases_df = pd.concat(
+    [v["cases"] for v in q2_pair_results.values() if v["cases"] is not None and len(v["cases"]) > 0],
+    ignore_index=True
+) if len(q2_pair_results) > 0 else pd.DataFrame()
+
+q2_all_top_df = pd.concat(
+    [v["top_overall"] for v in q2_pair_results.values() if v["top_overall"] is not None and len(v["top_overall"]) > 0],
+    ignore_index=True
+) if len(q2_pair_results) > 0 else pd.DataFrame()
+
+if len(q2_all_stats_df) > 0:
+    q2_all_stats_df.to_csv(Q2_STATS_CSV, index=False)
+    save_json(
+        {"rows": [to_serializable_row(r) for r in q2_all_stats_df.to_dict(orient="records")]},
+        Q2_STATS_JSON
+    )
+
+if len(q2_all_cases_df) > 0:
+    q2_all_cases_df.to_csv(Q2_CASES_CSV, index=False)
+    save_json(
+        {"rows": [to_serializable_row(r) for r in q2_all_cases_df.to_dict(orient="records")]},
+        Q2_CASES_JSON
+    )
+
+if len(q2_all_top_df) > 0:
+    q2_all_top_df.to_csv(Q2_TOP_CASES_CSV, index=False)
+
+print("Saved Q2 all-pairs results:")
+if len(q2_all_stats_df) > 0:
+    print(" ", Q2_STATS_CSV)
+    print(" ", Q2_STATS_JSON)
+if len(q2_all_cases_df) > 0:
+    print(" ", Q2_CASES_CSV)
+    print(" ", Q2_CASES_JSON)
+if len(q2_all_top_df) > 0:
+    print(" ", Q2_TOP_CASES_CSV)
 
 # %% [markdown]
 # ### 3. How does attention agreement change across label frequency?
