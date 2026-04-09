@@ -2038,17 +2038,30 @@ test_counts,  n_test  = label_counts_from_loader(test_loader,  n_labels=50)
 freq_df = pd.DataFrame({
     "label": np.arange(50),
     "train_pos": train_counts,
-    "train_prev": train_counts / max(1, n_train),   #fraction of training sample where label is positive
+    "train_prev": train_counts / max(1, n_train),
     "test_pos": test_counts,
     "test_prev": test_counts / max(1, n_test),
-}).sort_values("train_pos", ascending=False)
+}).sort_values("train_pos", ascending=False).reset_index(drop=True)
 
 display(freq_df.head(10))
 display(freq_df.tail(10))
 
+# %%
+# Q3: Save label-frequency table
+
+freq_df.to_csv(Q3_FREQ_CSV, index=False)
+save_json(
+    {"rows": [to_serializable_row(r) for r in freq_df.to_dict(orient="records")]},
+    Q3_FREQ_JSON
+)
+
+print("Saved Q3 frequency table:")
+print(" ", Q3_FREQ_CSV)
+print(" ", Q3_FREQ_JSON)
 
 # %%
 # Q3: merge frequency into Q1 label×pair results (ALL pairs)
+# NOTE: Q3 uses q1_df, which was already computed from cached Q1 outputs.
 
 Q3_FREQ_COL = "train_pos"     # choose: "train_pos", "train_prev", "test_pos", "test_prev"
 Q3_MIN_KEPT = 30              # drop label×pair rows with too few agree-positive samples
@@ -2063,14 +2076,12 @@ q3_df_filt = q3_df[q3_df["n_kept"] >= Q3_MIN_KEPT].copy()
 print("Q3 rows (all pairs):", len(q3_df), " | after n_kept filter:", len(q3_df_filt))
 display(q3_df_filt.head())
 
-
 # %%
 # Q3: focus view — Centralized vs Fed* only (recommended for reporting)
 
 q3_central = q3_df_filt[q3_df_filt["pair"].str.contains("Centralized")].copy()
 print("Centralized-vs-* rows:", len(q3_central))
 display(q3_central.head())
-
 
 # %%
 # Q3: Spearman correlation per pair (ALL pairs)
@@ -2096,10 +2107,22 @@ for pair, sub in q3_df_filt.groupby("pair"):
 
 q3_corr_df = pd.DataFrame(q3_corr_rows).sort_values(
     ["spearman_freq_vs_jac", "spearman_freq_vs_cos"], ascending=False
-)
+).reset_index(drop=True)
 
 display(q3_corr_df)
 
+# %%
+# Q3: Save correlation table
+
+q3_corr_df.to_csv(Q3_CORR_CSV, index=False)
+save_json(
+    {"rows": [to_serializable_row(r) for r in q3_corr_df.to_dict(orient="records")]},
+    Q3_CORR_JSON
+)
+
+print("Saved Q3 correlation table:")
+print(" ", Q3_CORR_CSV)
+print(" ", Q3_CORR_JSON)
 
 # %%
 # Q3: Scatter plots per pair (ALL pairs)
@@ -2125,7 +2148,6 @@ for pair, sub in q3_plot.groupby("pair"):
     plt.tight_layout()
     plt.show()
 
-
 # %%
 # Q3: Binned trends (rare → frequent) per pair (ALL pairs)
 
@@ -2134,11 +2156,14 @@ Q3_NUM_BINS = 5  # quintiles
 def binned_trend_all_pairs(df: pd.DataFrame, num_bins: int = 5) -> pd.DataFrame:
     out = []
     for pair, sub in df.groupby("pair"):
-        # one row per label for this pair (already label×pair, but keep safe)
         tmp = sub[["label", "label_freq", "cos_mean", "jac_mean"]].drop_duplicates("label").copy()
 
-        # bin labels by frequency rank within this pair
-        tmp["bin"] = pd.qcut(tmp["label_freq"].rank(method="first"), q=num_bins, labels=False)
+        # rank-based qcut is more stable when label frequencies tie
+        tmp["bin"] = pd.qcut(
+            tmp["label_freq"].rank(method="first"),
+            q=num_bins,
+            labels=False
+        )
 
         g = tmp.groupby("bin").agg(
             labels_in_bin=("label", "count"),
@@ -2156,7 +2181,22 @@ def binned_trend_all_pairs(df: pd.DataFrame, num_bins: int = 5) -> pd.DataFrame:
 q3_bins = binned_trend_all_pairs(q3_df_filt, num_bins=Q3_NUM_BINS)
 display(q3_bins.sort_values(["pair", "bin"]))
 
-# Plot binned curves: one figure per metric, lines per pair
+# %%
+# Q3: Save binned trend table
+
+q3_bins.to_csv(Q3_BINS_CSV, index=False)
+save_json(
+    {"rows": [to_serializable_row(r) for r in q3_bins.to_dict(orient="records")]},
+    Q3_BINS_JSON
+)
+
+print("Saved Q3 binned trends:")
+print(" ", Q3_BINS_CSV)
+print(" ", Q3_BINS_JSON)
+
+# %%
+# Q3: Binned trend plots (saved)
+
 plt.figure()
 for pair, sub in q3_bins.groupby("pair"):
     plt.plot(sub["bin"], sub["cos_mean"], marker="o", label=pair)
@@ -2165,6 +2205,7 @@ plt.xlabel("Frequency bin (0=rarest)")
 plt.ylabel("Mean cosine")
 plt.legend()
 plt.tight_layout()
+plt.savefig(Q3_BINNED_COSINE_PLOT, dpi=300, bbox_inches="tight")
 plt.show()
 
 plt.figure()
@@ -2175,8 +2216,12 @@ plt.xlabel("Frequency bin (0=rarest)")
 plt.ylabel("Mean Jaccard")
 plt.legend()
 plt.tight_layout()
+plt.savefig(Q3_BINNED_JACCARD_PLOT, dpi=300, bbox_inches="tight")
 plt.show()
 
+print("Saved Q3 plots:")
+print(" ", Q3_BINNED_COSINE_PLOT)
+print(" ", Q3_BINNED_JACCARD_PLOT)
 
 # %% [markdown]
 # ### 4. Which federated methods behave closest to centralized training in terms of attention structure?
