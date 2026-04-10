@@ -2549,64 +2549,54 @@ else:
 # This section mirrors Q2, but:
 # 1) Collects **ALL agree-positive rows** (no top-N-per-label) for unbiased agreement↔mislabeling analysis.
 # 2) Also provides a **highest-agreement sample picker** for qualitative heatmap inspection per pair.
-# 
 
 # %%
-# Q2H CONFIG
+# Q5 CONFIG
 
 MODEL_NAMES = list(models.keys())
 
-Q2H_PAIRS = [
+Q5_PAIRS = [
     (a, b)
     for i, a in enumerate(MODEL_NAMES)
     for b in MODEL_NAMES[i+1:]
 ]
 
-Q2H_LABELS = list(range(50))
-Q2H_TOP_K = 15
-Q2H_TRIM_CONTEXT = True
-Q2H_CANDIDATE_POOL = "all_test"   # "all_test" or "gt_positive"
-Q2H_MAX_SCAN_PER_LABEL = None     # speed knob
+Q5_LABELS = list(range(50))
+Q5_TOP_K = 15
+Q5_TRIM_CONTEXT = True
+Q5_CANDIDATE_POOL = "all_test"   # "all_test" or "gt_positive"
+Q5_MAX_SCAN_PER_LABEL = None     # speed knob
 
 # qualitative inspection knobs
-Q2H_TOP_OVERALL_N = 30            # show/keep top-N highest agreement cases overall per pair
-Q2H_SHOW_QUAL = True
-Q2H_N_QUAL_PER_PAIR = 3
+Q5_TOP_OVERALL_N = 30
+Q5_SHOW_QUAL = True
+Q5_N_QUAL_PER_PAIR = 3
 
 # analysis knobs
-Q2H_BINS = 10                     # number of quantile bins for agreement vs mislabeling
+Q5_BINS = 10
 
-print("Q2H_LABELS:", (Q2H_LABELS[:10], "...") if len(Q2H_LABELS) > 10 else Q2H_LABELS)
-print("Q2H_PAIRS:", Q2H_PAIRS)
-print("Q2H_CANDIDATE_POOL:", Q2H_CANDIDATE_POOL)
-
+print("Q5_LABELS:", (Q5_LABELS[:10], "...") if len(Q5_LABELS) > 10 else Q5_LABELS)
+print("Q5_PAIRS:", Q5_PAIRS)
+print("Q5_CANDIDATE_POOL:", Q5_CANDIDATE_POOL)
 
 # %%
-# Helper: candidates (same logic as Q2 but using Q2H knobs)
+# Helper: candidates (cached-friendly)
 
-def q2h_candidate_indices_for_label(label_idx: int) -> List[int]:
-    if Q2H_CANDIDATE_POOL == "all_test":
+def q5_candidate_indices_for_label(label_idx: int) -> List[int]:
+    if Q5_CANDIDATE_POOL == "all_test":
         idxs = list(range(len(test_dataset)))
-        return idxs[:Q2H_MAX_SCAN_PER_LABEL] if Q2H_MAX_SCAN_PER_LABEL else idxs
+        return idxs[:Q5_MAX_SCAN_PER_LABEL] if Q5_MAX_SCAN_PER_LABEL else idxs
 
-    if Q2H_CANDIDATE_POOL == "gt_positive":
-        idxs = []
-        for i in range(len(test_dataset)):
-            _, y = test_dataset[i]
-            if int(y[label_idx].item()) == 1:
-                idxs.append(i)
-                if Q2H_MAX_SCAN_PER_LABEL and len(idxs) >= Q2H_MAX_SCAN_PER_LABEL:
-                    break
-        return idxs
+    if Q5_CANDIDATE_POOL == "gt_positive":
+        idxs = torch.nonzero(Y_test[:, label_idx] == 1, as_tuple=False).squeeze(1).tolist()
+        return idxs[:Q5_MAX_SCAN_PER_LABEL] if Q5_MAX_SCAN_PER_LABEL else idxs
 
-    raise ValueError(f"Unknown Q2H_CANDIDATE_POOL={Q2H_CANDIDATE_POOL}")
-
+    raise ValueError(f"Unknown Q5_CANDIDATE_POOL={Q5_CANDIDATE_POOL}")
 
 # %%
-# Q2H: Collect ALL agree-positive rows for a given label + pair (NO per-label top-N)
+# Q5: Collect ALL agree-positive rows for a given label + pair using cached outputs
 
-@torch.no_grad()
-def q2h_collect_agree_pos_rows_for_label(
+def q5_collect_agree_pos_rows_for_label(
     label_idx: int,
     model_a: str,
     model_b: str,
@@ -2615,25 +2605,24 @@ def q2h_collect_agree_pos_rows_for_label(
     candidate_indices: List[int],
 ) -> pd.DataFrame:
     rows = []
-    kept = 0
 
-    for ds_idx in candidate_indices:
+    candidate_set = set(candidate_indices)
+    kept_idxs = torch.nonzero(
+        AGREE_POS_MASKS[(model_a, model_b)][label_idx],
+        as_tuple=False
+    ).squeeze(1).tolist()
+
+    if Q5_CANDIDATE_POOL != "all_test" or Q5_MAX_SCAN_PER_LABEL is not None:
+        kept_idxs = [i for i in kept_idxs if i in candidate_set]
+
+    for ds_idx in kept_idxs:
         x, y = test_dataset[ds_idx]
-        Xb = x.unsqueeze(0)
-
-        # agree-positive filter (same prediction == positive)
-        if not bool(agree_positive_mask(model_a, model_b, Xb, label_idx).item()):
-            continue
-
-        kept += 1
 
         window_size = config["window_size"] if trim_context else None
         valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
 
-        # attention vectors
-        _, att_a = get_label_logits_and_attn(models[model_a], Xb, label_idx)
-        _, att_b = get_label_logits_and_attn(models[model_b], Xb, label_idx)
-        att_a_1d, att_b_1d = att_a[0], att_b[0]
+        att_a_1d = ATTN_ALL[model_a][ds_idx, label_idx]
+        att_b_1d = ATTN_ALL[model_b][ds_idx, label_idx]
 
         cos = cosine_sim_on_valid(att_a_1d, att_b_1d, valid_pos)
         jac = jaccard(
@@ -2641,9 +2630,8 @@ def q2h_collect_agree_pos_rows_for_label(
             topk_positions(att_b_1d, valid_pos, top_k),
         )
 
-        # prediction context
-        logit_a, prob_a, pred_a = predict_label_for_samples(model_a, Xb, label_idx)
-        logit_b, prob_b, pred_b = predict_label_for_samples(model_b, Xb, label_idx)
+        prob_a = float(PROBS_ALL[model_a][ds_idx, label_idx].item())
+        prob_b = float(PROBS_ALL[model_b][ds_idx, label_idx].item())
         thr_a = float(per_label_thr_by_model[model_a][label_idx].item())
         thr_b = float(per_label_thr_by_model[model_b][label_idx].item())
 
@@ -2656,41 +2644,40 @@ def q2h_collect_agree_pos_rows_for_label(
             "cos": float(cos),
             "jac": float(jac),
 
-            "prob_a": float(prob_a[0].item()),
+            "prob_a": prob_a,
             "thr_a": thr_a,
-            "margin_a": float(prob_a[0].item()) - thr_a,
+            "margin_a": prob_a - thr_a,
 
-            "prob_b": float(prob_b[0].item()),
+            "prob_b": prob_b,
             "thr_b": thr_b,
-            "margin_b": float(prob_b[0].item()) - thr_b,
+            "margin_b": prob_b - thr_b,
 
             "valid_len": int(len(valid_pos)),
         })
 
     df = pd.DataFrame(rows)
-    df.attrs["n_kept"] = kept
+    df.attrs["n_kept"] = len(kept_idxs)
     df.attrs["n_scanned"] = len(candidate_indices)
     return df
 
-
 # %%
-# Q2H: Run for a single pair -> returns:
+# Q5: Run for a single pair -> returns:
 #   1) label_stats_df (coverage)
 #   2) agree_pos_df   (ALL agree-positive rows across labels, unbiased)
 
-def q2h_run_for_pair_collect_all(model_a: str, model_b: str):
+def q5_run_for_pair_collect_all(model_a: str, model_b: str):
     all_rows = []
     label_stats = []
 
-    for label_idx in tqdm(Q2H_LABELS, desc=f"Q2H collect ({model_a} vs {model_b})"):
-        cand_idxs = q2h_candidate_indices_for_label(label_idx)
+    for label_idx in tqdm(Q5_LABELS, desc=f"Q5 collect ({model_a} vs {model_b})"):
+        cand_idxs = q5_candidate_indices_for_label(label_idx)
 
-        df = q2h_collect_agree_pos_rows_for_label(
+        df = q5_collect_agree_pos_rows_for_label(
             label_idx=label_idx,
             model_a=model_a,
             model_b=model_b,
-            top_k=Q2H_TOP_K,
-            trim_context=Q2H_TRIM_CONTEXT,
+            top_k=Q5_TOP_K,
+            trim_context=Q5_TRIM_CONTEXT,
             candidate_indices=cand_idxs,
         )
 
@@ -2715,19 +2702,17 @@ def q2h_run_for_pair_collect_all(model_a: str, model_b: str):
 
     agree_pos_df = pd.concat(all_rows, ignore_index=True) if len(all_rows) else pd.DataFrame()
 
-    # derived columns for analysis
     if len(agree_pos_df) > 0:
-        agree_pos_df["is_fp"] = (agree_pos_df["gt"] == 0).astype(int)  # since agree-positive => GT=0 means shared FP
+        agree_pos_df["is_fp"] = (agree_pos_df["gt"] == 0).astype(int)
         agree_pos_df["agreement_avg"] = (agree_pos_df["cos"] + agree_pos_df["jac"]) / 2.0
         agree_pos_df["agreement_min"] = agree_pos_df[["cos", "jac"]].min(axis=1)
 
     return label_stats_df, agree_pos_df
 
-
 # %%
-# Q2H: Pick examples from highest-agreement table for qualitative inspection
+# Q5: Pick examples from highest-agreement table for qualitative inspection
 
-def q2h_pick_examples_high_agree(df_top: pd.DataFrame, n: int = 3) -> list[pd.Series]:
+def q5_pick_examples_high_agree(df_top: pd.DataFrame, n: int = 3) -> list[pd.Series]:
     """
     Picks:
       1) highest agreement (rank 0)
@@ -2737,8 +2722,7 @@ def q2h_pick_examples_high_agree(df_top: pd.DataFrame, n: int = 3) -> list[pd.Se
     if df_top is None or len(df_top) == 0:
         return []
 
-    picks = []
-    picks.append(df_top.iloc[0])
+    picks = [df_top.iloc[0]]
 
     mid_idx = min(10, len(df_top) - 1)
     if mid_idx != 0 and len(picks) < n:
@@ -2753,21 +2737,15 @@ def q2h_pick_examples_high_agree(df_top: pd.DataFrame, n: int = 3) -> list[pd.Se
 
     return picks[:n]
 
-
 # %%
-# Q2H: Agreement ↔ mislabeling analysis (per pair)
-# - Works on ALL agree-positive rows (unbiased).
-# - Produces:
-#   * overall FP rate
-#   * FP rate by agreement quantile bins for cos, jac, and combined scores
+# Q5: Agreement ↔ mislabeling analysis (per pair)
 
-def q2h_agreement_vs_mislabeling(agree_pos_df: pd.DataFrame, n_bins: int = 10) -> dict:
+def q5_agreement_vs_mislabeling(agree_pos_df: pd.DataFrame, n_bins: int = 10) -> dict:
     if agree_pos_df is None or len(agree_pos_df) == 0:
         return {"summary": None, "by_bin": {}}
 
     out = {}
 
-    # overall summary
     summary = {
         "n_rows": int(len(agree_pos_df)),
         "fp_rate": float(agree_pos_df["is_fp"].mean()),
@@ -2784,7 +2762,6 @@ def q2h_agreement_vs_mislabeling(agree_pos_df: pd.DataFrame, n_bins: int = 10) -
     def _bin_stats(col: str) -> pd.DataFrame:
         df = agree_pos_df.copy()
 
-        # qcut can fail if too many duplicate values; handle with rank-based fallback
         try:
             df["bin"] = pd.qcut(df[col], q=n_bins, duplicates="drop")
         except ValueError:
@@ -2800,8 +2777,6 @@ def q2h_agreement_vs_mislabeling(agree_pos_df: pd.DataFrame, n_bins: int = 10) -
             gt_pos_rate=("gt", "mean"),
         ).reset_index()
 
-        # add bin endpoints for readability
-        # (bin is an interval in most cases)
         return g.sort_values("bin")
 
     for col in ["cos", "jac", "agreement_avg", "agreement_min"]:
@@ -2810,18 +2785,17 @@ def q2h_agreement_vs_mislabeling(agree_pos_df: pd.DataFrame, n_bins: int = 10) -
     out["by_bin"] = by_bin
     return out
 
-
 # %%
-# Q2H: Run ALL pairs
+# Q5: Run ALL pairs
 # For each pair:
 #   1) collect ALL agree-positive rows (agree_pos_df)
 #   2) show high-agreement examples (top overall) for inspection
 #   3) run agreement↔mislabeling analysis tables
 
-q2h_pair_results = {}  # (a,b) -> dict
+q5_pair_results = {}
 
-for a, b in Q2H_PAIRS:
-    label_stats_df, agree_pos_df = q2h_run_for_pair_collect_all(a, b)
+for a, b in Q5_PAIRS:
+    label_stats_df, agree_pos_df = q5_run_for_pair_collect_all(a, b)
 
     print("\n==============================")
     print(f"PAIR: {a} vs {b}")
@@ -2830,7 +2804,7 @@ for a, b in Q2H_PAIRS:
 
     if agree_pos_df is None or len(agree_pos_df) == 0:
         print("No agree-positive rows found for this pair.")
-        q2h_pair_results[(a, b)] = {
+        q5_pair_results[(a, b)] = {
             "label_stats": label_stats_df,
             "agree_pos": agree_pos_df,
             "top_high_agree": pd.DataFrame(),
@@ -2838,18 +2812,16 @@ for a, b in Q2H_PAIRS:
         }
         continue
 
-    # Highest-agreement rows overall (global, across labels)
     top_high_agree = (
         agree_pos_df.sort_values(["cos", "jac"], ascending=[False, False])
-                    .head(Q2H_TOP_OVERALL_N)
+                    .head(Q5_TOP_OVERALL_N)
                     .reset_index(drop=True)
     )
 
-    print(f"Highest-agreement cases overall (top {Q2H_TOP_OVERALL_N}):")
+    print(f"Highest-agreement cases overall (top {Q5_TOP_OVERALL_N}):")
     display(top_high_agree)
 
-    # Agreement vs mislabeling analysis (unbiased)
-    analysis = q2h_agreement_vs_mislabeling(agree_pos_df, n_bins=Q2H_BINS)
+    analysis = q5_agreement_vs_mislabeling(agree_pos_df, n_bins=Q5_BINS)
 
     print("Agreement↔mislabeling summary:")
     display(analysis["summary"])
@@ -2866,30 +2838,28 @@ for a, b in Q2H_PAIRS:
     print("FP rate by MIN agreement quantiles ( min(cos,jac) ):")
     display(analysis["by_bin"]["agreement_min"])
 
-    # Qualitative inspection: inspect a few high-agreement examples
-    if Q2H_SHOW_QUAL and len(top_high_agree) > 0:
-        examples = q2h_pick_examples_high_agree(top_high_agree, n=Q2H_N_QUAL_PER_PAIR)
+    if Q5_SHOW_QUAL and len(top_high_agree) > 0:
+        examples = q5_pick_examples_high_agree(top_high_agree, n=Q5_N_QUAL_PER_PAIR)
         for ex_row in examples:
             q2_inspect_case(
                 ex_row,
-                top_k=Q2H_TOP_K,
-                trim_context=Q2H_TRIM_CONTEXT,
+                top_k=Q5_TOP_K,
+                trim_context=Q5_TRIM_CONTEXT,
                 do_position_heatmap=True
             )
 
-    q2h_pair_results[(a, b)] = {
+    q5_pair_results[(a, b)] = {
         "label_stats": label_stats_df,
         "agree_pos": agree_pos_df,
         "top_high_agree": top_high_agree,
         "analysis": analysis,
     }
 
-
 # %%
-# Combine all pairs' agree-positive rows into one big df (tagged by pair)
+# Q5: Combine all pairs' agree-positive rows into one big df (tagged by pair)
 
 all_pairs_agree_pos = []
-for (a, b), d in q2h_pair_results.items():
+for (a, b), d in q5_pair_results.items():
     df = d.get("agree_pos", None)
     if df is not None and len(df) > 0:
         all_pairs_agree_pos.append(df)
@@ -2899,7 +2869,7 @@ print("Total agree-positive rows across all pairs:", len(all_pairs_agree_pos_df)
 display(all_pairs_agree_pos_df.head(10))
 
 if len(all_pairs_agree_pos_df) > 0:
-    agg_analysis = q2h_agreement_vs_mislabeling(all_pairs_agree_pos_df, n_bins=Q2H_BINS)
+    agg_analysis = q5_agreement_vs_mislabeling(all_pairs_agree_pos_df, n_bins=Q5_BINS)
     print("AGGREGATE summary (all pairs):")
     display(agg_analysis["summary"])
 
@@ -2908,14 +2878,53 @@ if len(all_pairs_agree_pos_df) > 0:
 
     print("AGGREGATE FP rate by JACCARD agreement quantiles:")
     display(agg_analysis["by_bin"]["jac"])
-
+else:
+    agg_analysis = {"summary": None, "by_bin": {}}
 
 # %%
-def plot_fp_rate_by_bin(bin_df: pd.DataFrame, title: str):
+# Q5: Save aggregate outputs
+
+if len(all_pairs_agree_pos_df) > 0:
+    all_pairs_agree_pos_df.to_csv(Q5_ALL_AGREE_POS_CSV, index=False)
+    save_json(
+        {"rows": [to_serializable_row(r) for r in all_pairs_agree_pos_df.to_dict(orient="records")]},
+        Q5_ALL_AGREE_POS_JSON
+    )
+
+    if agg_analysis["summary"] is not None:
+        agg_analysis["summary"].to_csv(Q5_SUMMARY_CSV, index=False)
+        save_json(
+            {"rows": [to_serializable_row(r) for r in agg_analysis["summary"].to_dict(orient="records")]},
+            Q5_SUMMARY_JSON
+        )
+
+    if "cos" in agg_analysis["by_bin"]:
+        agg_analysis["by_bin"]["cos"].to_csv(Q5_COS_BINS_CSV, index=False)
+    if "jac" in agg_analysis["by_bin"]:
+        agg_analysis["by_bin"]["jac"].to_csv(Q5_JAC_BINS_CSV, index=False)
+    if "agreement_avg" in agg_analysis["by_bin"]:
+        agg_analysis["by_bin"]["agreement_avg"].to_csv(Q5_AVG_BINS_CSV, index=False)
+    if "agreement_min" in agg_analysis["by_bin"]:
+        agg_analysis["by_bin"]["agreement_min"].to_csv(Q5_MIN_BINS_CSV, index=False)
+
+    print("Saved Q5 outputs:")
+    print(" ", Q5_ALL_AGREE_POS_CSV)
+    print(" ", Q5_ALL_AGREE_POS_JSON)
+    print(" ", Q5_SUMMARY_CSV)
+    print(" ", Q5_SUMMARY_JSON)
+    print(" ", Q5_COS_BINS_CSV)
+    print(" ", Q5_JAC_BINS_CSV)
+    print(" ", Q5_AVG_BINS_CSV)
+    print(" ", Q5_MIN_BINS_CSV)
+else:
+    print("No Q5 outputs saved because all_pairs_agree_pos_df is empty.")
+
+# %%
+def plot_fp_rate_by_bin(bin_df: pd.DataFrame, title: str, save_path: str):
     if bin_df is None or len(bin_df) == 0:
         print("No data to plot.")
         return
-    # Use bin order on x; matplotlib can handle categorical via range
+
     x = list(range(len(bin_df)))
     y = bin_df["fp_rate"].values
 
@@ -2925,15 +2934,41 @@ def plot_fp_rate_by_bin(bin_df: pd.DataFrame, title: str):
     plt.ylabel("False Positive Rate (GT=0 among agree-positive)")
     plt.title(title)
     plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.show()
 
-# Example: plot aggregate if present
-if "agg_analysis" in globals() and agg_analysis["by_bin"]:
-    plot_fp_rate_by_bin(agg_analysis["by_bin"]["cos"], "Aggregate: FP rate vs COS agreement quantiles")
-    plot_fp_rate_by_bin(agg_analysis["by_bin"]["jac"], "Aggregate: FP rate vs JACCARD agreement quantiles")
-    plot_fp_rate_by_bin(agg_analysis["by_bin"]["agreement_avg"], "Aggregate: FP rate vs AVG agreement quantiles")
-    plot_fp_rate_by_bin(agg_analysis["by_bin"]["agreement_min"], "Aggregate: FP rate vs MIN agreement quantiles")
+# %%
+# Q5: Plot aggregate FP-rate curves if present
 
+if agg_analysis["by_bin"]:
+    plot_fp_rate_by_bin(
+        agg_analysis["by_bin"]["cos"],
+        "Aggregate: FP rate vs COS agreement quantiles",
+        Q5_COS_FP_PLOT
+    )
+    plot_fp_rate_by_bin(
+        agg_analysis["by_bin"]["jac"],
+        "Aggregate: FP rate vs JACCARD agreement quantiles",
+        Q5_JAC_FP_PLOT
+    )
+    plot_fp_rate_by_bin(
+        agg_analysis["by_bin"]["agreement_avg"],
+        "Aggregate: FP rate vs AVG agreement quantiles",
+        Q5_AVG_FP_PLOT
+    )
+    plot_fp_rate_by_bin(
+        agg_analysis["by_bin"]["agreement_min"],
+        "Aggregate: FP rate vs MIN agreement quantiles",
+        Q5_MIN_FP_PLOT
+    )
+
+    print("Saved Q5 plots:")
+    print(" ", Q5_COS_FP_PLOT)
+    print(" ", Q5_JAC_FP_PLOT)
+    print(" ", Q5_AVG_FP_PLOT)
+    print(" ", Q5_MIN_FP_PLOT)
+else:
+    print("No aggregate Q5 plots produced.")
 
 # %% [markdown]
 # ## Phrase Level Attention Inspection
@@ -3227,163 +3262,163 @@ def top_attention_phrases_NMS(
 
 
 # %%
-# # NMS threshold sweep: find a good iou / overlap threshold for phrase extraction
+# NMS threshold sweep: find a good iou / overlap threshold for phrase extraction
 
-# # -- helper: overlap ratio defined as intersection / min(len(A), len(B))
-# def span_overlap_ratio_minlen(a, b):
-#     s1, e1 = a
-#     s2, e2 = b
-#     inter = max(0, min(e1, e2) - max(s1, s2))
-#     if inter <= 0:
-#         return 0.0
-#     minlen = min(e1 - s1, e2 - s2)
-#     return float(inter) / float(minlen) if minlen > 0 else 0.0
+# -- helper: overlap ratio defined as intersection / min(len(A), len(B))
+def span_overlap_ratio_minlen(a, b):
+    s1, e1 = a
+    s2, e2 = b
+    inter = max(0, min(e1, e2) - max(s1, s2))
+    if inter <= 0:
+        return 0.0
+    minlen = min(e1 - s1, e2 - s2)
+    return float(inter) / float(minlen) if minlen > 0 else 0.0
 
-# # -- helper: pairwise IoU summary for a list of spans
-# def pairwise_overlap_stats(spans, metric="iou"):
-#     # spans: list of tuples (s,e,score,...)
-#     if len(spans) < 2:
-#         return {"mean_pairwise": 0.0, "max_pairwise": 0.0}
-#     vals = []
-#     for i, j in combinations(range(len(spans)), 2):
-#         a = (spans[i][0], spans[i][1])
-#         b = (spans[j][0], spans[j][1])
-#         if metric == "iou":
-#             vals.append(span_iou(a, b))
-#         elif metric == "minlen":
-#             vals.append(span_overlap_ratio_minlen(a, b))
-#         else:
-#             raise ValueError("metric must be 'iou' or 'minlen'")
-#     return {"mean_pairwise": float(np.mean(vals)), "max_pairwise": float(np.max(vals))}
+# -- helper: pairwise IoU summary for a list of spans
+def pairwise_overlap_stats(spans, metric="iou"):
+    # spans: list of tuples (s,e,score,...)
+    if len(spans) < 2:
+        return {"mean_pairwise": 0.0, "max_pairwise": 0.0}
+    vals = []
+    for i, j in combinations(range(len(spans)), 2):
+        a = (spans[i][0], spans[i][1])
+        b = (spans[j][0], spans[j][1])
+        if metric == "iou":
+            vals.append(span_iou(a, b))
+        elif metric == "minlen":
+            vals.append(span_overlap_ratio_minlen(a, b))
+        else:
+            raise ValueError("metric must be 'iou' or 'minlen'")
+    return {"mean_pairwise": float(np.mean(vals)), "max_pairwise": float(np.max(vals))}
 
-# # -- sweep function
-# @torch.no_grad()
-# def sweep_nms_thresholds(
-#     sample_size=300,
-#     label_sample=None,              # list of label indices to evaluate (None -> random labels per sample)
-#     model_names=("Centralized","FedAvg","FedProx","SCAFFOLD"),
-#     thresholds=(0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5),
-#     top_k=5,
-#     phrase_window=12,
-#     trim_context=True,
-#     nms_grab_multiplier=5,
-#     overlap_metric="iou",           # "iou" or "minlen"
-#     random_seed=42,
-# ):
-#     """
-#     Sweep NMS thresholds and return a DataFrame of aggregated statistics.
+# -- sweep function
+@torch.no_grad()
+def sweep_nms_thresholds(
+    sample_size=300,
+    label_sample=None,              # list of label indices to evaluate (None -> random labels per sample)
+    model_names=("Centralized","FedAvg","FedProx","SCAFFOLD"),
+    thresholds=(0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5),
+    top_k=5,
+    phrase_window=12,
+    trim_context=True,
+    nms_grab_multiplier=5,
+    overlap_metric="iou",           # "iou" or "minlen"
+    random_seed=42,
+):
+    """
+    Sweep NMS thresholds and return a DataFrame of aggregated statistics.
 
-#     Returns:
-#       df: pandas.DataFrame with rows (threshold, model) and columns:
-#          mean_num_spans, std_num_spans, mean_mean_pairwise, mean_max_pairwise
-#     """
-#     rng = np.random.RandomState(random_seed)
+    Returns:
+      df: pandas.DataFrame with rows (threshold, model) and columns:
+         mean_num_spans, std_num_spans, mean_mean_pairwise, mean_max_pairwise
+    """
+    rng = np.random.RandomState(random_seed)
 
-#     # select sample indices (avoid too-large runs)
-#     all_indices = list(range(len(test_dataset)))
-#     if sample_size >= len(all_indices):
-#         sample_indices = all_indices
-#     else:
-#         sample_indices = rng.choice(all_indices, size=sample_size, replace=False).tolist()
+    # select sample indices (avoid too-large runs)
+    all_indices = list(range(len(test_dataset)))
+    if sample_size >= len(all_indices):
+        sample_indices = all_indices
+    else:
+        sample_indices = rng.choice(all_indices, size=sample_size, replace=False).tolist()
 
-#     # if label_sample is None, we will randomly pick one *positive* label per sample if possible,
-#     # otherwise we will evaluate all labels (or a fixed set). To keep runtime reasonable, we'll
-#     # sample one label per sample unless label_sample is provided as a list.
-#     # Here we choose a random label index in range(num_labels) as a default fallback.
-#     num_labels = test_dataset[0][1].shape[0]  # assumes (x,y) and y is vector
-#     if label_sample is None:
-#         pick_label_per_sample = True
-#     else:
-#         pick_label_per_sample = False
-#         label_sample = list(label_sample)
+    # if label_sample is None, we will randomly pick one *positive* label per sample if possible,
+    # otherwise we will evaluate all labels (or a fixed set). To keep runtime reasonable, we'll
+    # sample one label per sample unless label_sample is provided as a list.
+    # Here we choose a random label index in range(num_labels) as a default fallback.
+    num_labels = test_dataset[0][1].shape[0]  # assumes (x,y) and y is vector
+    if label_sample is None:
+        pick_label_per_sample = True
+    else:
+        pick_label_per_sample = False
+        label_sample = list(label_sample)
 
-#     rows = []
+    rows = []
 
-#     for t in tqdm(thresholds, desc="thresholds"):
-#         stats_by_model = {m: {"nspans": [], "mean_pairwise": [], "max_pairwise": []} for m in model_names}
+    for t in tqdm(thresholds, desc="thresholds"):
+        stats_by_model = {m: {"nspans": [], "mean_pairwise": [], "max_pairwise": []} for m in model_names}
 
-#         for ds_idx in sample_indices:
-#             x, y = test_dataset[ds_idx]
-#             tokens = decode_sequence(x)
-#             window_size = config["window_size"] if trim_context else None
-#             valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
+        for ds_idx in sample_indices:
+            x, y = test_dataset[ds_idx]
+            tokens = decode_sequence(x)
+            window_size = config["window_size"] if trim_context else None
+            valid_pos = get_valid_positions(x, PAD_INDEX, window_size)
 
-#             # choose which labels to test: either provided list or one random label per sample
-#             if pick_label_per_sample:
-#                 lbl = rng.randint(0, num_labels)
-#                 labels_to_check = [lbl]
-#             else:
-#                 labels_to_check = label_sample
+            # choose which labels to test: either provided list or one random label per sample
+            if pick_label_per_sample:
+                lbl = rng.randint(0, num_labels)
+                labels_to_check = [lbl]
+            else:
+                labels_to_check = label_sample
 
-#             for lbl in labels_to_check:
-#                 for m in model_names:
-#                     # get attention vector
-#                     logits_lbl, attn_lbl = get_label_logits_and_attn(models[m], x.unsqueeze(0), lbl)
-#                     attn_vec = attn_lbl[0]
+            for lbl in labels_to_check:
+                for m in model_names:
+                    # get attention vector
+                    logits_lbl, attn_lbl = get_label_logits_and_attn(models[m], x.unsqueeze(0), lbl)
+                    attn_vec = attn_lbl[0]
 
-#                     spans = top_attention_phrases_NMS(
-#                         tokens=tokens,
-#                         attn_1d=attn_vec,
-#                         valid_pos=valid_pos,
-#                         top_k=top_k,
-#                         window_size=phrase_window,
-#                         centered=True,
-#                         skip_pad=True,
-#                         return_attn=True,
-#                         use_nms=True,
-#                         nms_iou_thresh=float(t),
-#                         nms_grab_multiplier=nms_grab_multiplier,
-#                     )
+                    spans = top_attention_phrases_NMS(
+                        tokens=tokens,
+                        attn_1d=attn_vec,
+                        valid_pos=valid_pos,
+                        top_k=top_k,
+                        window_size=phrase_window,
+                        centered=True,
+                        skip_pad=True,
+                        return_attn=True,
+                        use_nms=True,
+                        nms_iou_thresh=float(t),
+                        nms_grab_multiplier=nms_grab_multiplier,
+                    )
 
-#                     # record counts
-#                     stats_by_model[m]["nspans"].append(len(spans))
+                    # record counts
+                    stats_by_model[m]["nspans"].append(len(spans))
 
-#                     # pairwise overlap stats
-#                     pair_stats = pairwise_overlap_stats(spans, metric=("iou" if overlap_metric=="iou" else "minlen"))
-#                     stats_by_model[m]["mean_pairwise"].append(pair_stats["mean_pairwise"])
-#                     stats_by_model[m]["max_pairwise"].append(pair_stats["max_pairwise"])
+                    # pairwise overlap stats
+                    pair_stats = pairwise_overlap_stats(spans, metric=("iou" if overlap_metric=="iou" else "minlen"))
+                    stats_by_model[m]["mean_pairwise"].append(pair_stats["mean_pairwise"])
+                    stats_by_model[m]["max_pairwise"].append(pair_stats["max_pairwise"])
 
-#         # aggregate per model
-#         for m in model_names:
-#             arr_n = np.array(stats_by_model[m]["nspans"])
-#             arr_mp = np.array(stats_by_model[m]["mean_pairwise"])
-#             arr_xp = np.array(stats_by_model[m]["max_pairwise"])
-#             rows.append({
-#                 "threshold": float(t),
-#                 "model": m,
-#                 "mean_num_spans": float(np.mean(arr_n)) if arr_n.size else 0.0,
-#                 "std_num_spans": float(np.std(arr_n)) if arr_n.size else 0.0,
-#                 "mean_mean_pairwise": float(np.mean(arr_mp)) if arr_mp.size else 0.0,
-#                 "mean_max_pairwise": float(np.mean(arr_xp)) if arr_xp.size else 0.0,
-#                 "sample_size": len(sample_indices),
-#                 "top_k": top_k,
-#                 "phrase_window": phrase_window,
-#                 "overlap_metric": overlap_metric,
-#             })
+        # aggregate per model
+        for m in model_names:
+            arr_n = np.array(stats_by_model[m]["nspans"])
+            arr_mp = np.array(stats_by_model[m]["mean_pairwise"])
+            arr_xp = np.array(stats_by_model[m]["max_pairwise"])
+            rows.append({
+                "threshold": float(t),
+                "model": m,
+                "mean_num_spans": float(np.mean(arr_n)) if arr_n.size else 0.0,
+                "std_num_spans": float(np.std(arr_n)) if arr_n.size else 0.0,
+                "mean_mean_pairwise": float(np.mean(arr_mp)) if arr_mp.size else 0.0,
+                "mean_max_pairwise": float(np.mean(arr_xp)) if arr_xp.size else 0.0,
+                "sample_size": len(sample_indices),
+                "top_k": top_k,
+                "phrase_window": phrase_window,
+                "overlap_metric": overlap_metric,
+            })
 
-#     df = pd.DataFrame(rows)
-#     return df
+    df = pd.DataFrame(rows)
+    return df
 
-# # %%
-# # Example usage (quick, medium, or longer runs)
-# # - For a quick exploratory run, sample_size=200 and phrase_window=12 is reasonable.
-# # - Increase sample_size for more stable estimates.
-# df_results = sweep_nms_thresholds(
-#     sample_size=250,
-#     thresholds=(0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
-#     top_k=5,
-#     phrase_window=12,
-#     nms_grab_multiplier=6,
-#     overlap_metric="minlen",   # or "minlen"
-# )
+# %%
+# Example usage (quick, medium, or longer runs)
+# - For a quick exploratory run, sample_size=200 and phrase_window=12 is reasonable.
+# - Increase sample_size for more stable estimates.
+df_results = sweep_nms_thresholds(
+    sample_size=250,
+    thresholds=(0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
+    top_k=5,
+    phrase_window=12,
+    nms_grab_multiplier=6,
+    overlap_metric="minlen",   # or "minlen"
+)
 
-# # Show results pivoted
-# display(df_results.pivot_table(index="threshold", columns="model",
-#                                values=["mean_num_spans","mean_max_pairwise"]).round(4))
+# Show results pivoted
+display(df_results.pivot_table(index="threshold", columns="model",
+                               values=["mean_num_spans","mean_max_pairwise"]).round(4))
 
-# # Save CSV for later inspection
-# # df_results.to_csv("nms_threshold_sweep_results.csv", index=False)
-# # print("Saved results to nms_threshold_sweep_results.csv")
+# Save CSV for later inspection
+# df_results.to_csv("nms_threshold_sweep_results.csv", index=False)
+# print("Saved results to nms_threshold_sweep_results.csv")
 
 
 # %%
