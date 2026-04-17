@@ -51,11 +51,13 @@ from evaluation import all_metrics
 
 import math
 import json
+import csv
 import os
 import copy
 import pandas as pd    # NEW – to store experiment results
 import time             # NEW – to track runtime for each config
 import itertools
+from typing import Optional
 
 # Optional: to ensure reproducibility
 torch.manual_seed(42)
@@ -66,13 +68,45 @@ print(f"Using device: {device}")
 
 
 # %%
-# Base output directory for this notebook
-KD_HISTORY_DIR = os.path.join("..", "History", "KD")
+# Output directory structure for KD notebook
 
-# Create directory if it doesn't exist
+KD_HISTORY_DIR = os.path.join("..", "History", "KD")
 os.makedirs(KD_HISTORY_DIR, exist_ok=True)
 
-print(f"Saving KD results to: {KD_HISTORY_DIR}")
+def ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+KD_DIRS = {
+    "baseline_fl_sensitivity": ensure_dir(os.path.join(KD_HISTORY_DIR, "baseline_fl_sensitivity")),
+    "kd_method_sensitivity": ensure_dir(os.path.join(KD_HISTORY_DIR, "kd_method_sensitivity")),
+    "opt3_phase1_tuning": ensure_dir(os.path.join(KD_HISTORY_DIR, "opt3_phase1_tuning")),
+    "opt3_phase2_tuning": ensure_dir(os.path.join(KD_HISTORY_DIR, "opt3_phase2_tuning")),
+    "final_opt3_sweeps": ensure_dir(os.path.join(KD_HISTORY_DIR, "final_opt3_sweeps")),
+}
+
+# %%
+# Result file paths
+
+BASELINE_SENS_CSV  = os.path.join(KD_DIRS["baseline_fl_sensitivity"], "baseline_sensitivity_results.csv")
+BASELINE_SENS_JSON = os.path.join(KD_DIRS["baseline_fl_sensitivity"], "baseline_sensitivity_results.json")
+
+KD_SWEEP_CSV  = os.path.join(KD_DIRS["kd_method_sensitivity"], "kd_client_sweep_results_r10_e1.csv")
+KD_SWEEP_JSON = os.path.join(KD_DIRS["kd_method_sensitivity"], "kd_client_sweep_results_r10_e1.json")
+
+PHASE1_CSV  = os.path.join(KD_DIRS["opt3_phase1_tuning"], "opt3_phase1_tuning_r10_e1.csv")
+PHASE1_JSON = os.path.join(KD_DIRS["opt3_phase1_tuning"], "opt3_phase1_tuning_r10_e1.json")
+
+PHASE2_CSV  = os.path.join(KD_DIRS["opt3_phase2_tuning"], "opt3_phase2_serverdistill_tuning_r10_e1.csv")
+PHASE2_JSON = os.path.join(KD_DIRS["opt3_phase2_tuning"], "opt3_phase2_serverdistill_tuning_r10_e1.json")
+
+FINAL_NONIID_CSV  = os.path.join(KD_DIRS["final_opt3_sweeps"], "final_opt3_noniid_sweep_r100_e3.csv")
+FINAL_NONIID_JSON = os.path.join(KD_DIRS["final_opt3_sweeps"], "final_opt3_noniid_sweep_r100_e3.json")
+
+FINAL_IID_CSV  = os.path.join(KD_DIRS["final_opt3_sweeps"], "final_opt3_iid_sweep_r100_e3.csv")
+FINAL_IID_JSON = os.path.join(KD_DIRS["final_opt3_sweeps"], "final_opt3_iid_sweep_r100_e3.json")
+
+FINAL_COMBINED_CSV = os.path.join(KD_DIRS["final_opt3_sweeps"], "final_opt3_combined_sweep_r100_e3.csv")
 
 # %% [markdown]
 # ## Data Loading and JSON Utilities
@@ -133,6 +167,44 @@ def load_json(filepath: str) -> dict:
     """
     with open(filepath, mode="r") as f:
         return json.load(f)
+
+# %%
+def save_dict_rows_to_csv(rows: list[dict], filepath: str) -> None:
+    """
+    Save a list of dictionaries to a CSV file.
+    """
+    if not rows:
+        print(f"[save_dict_rows_to_csv] No rows to save for {filepath}")
+        return
+
+    fieldnames = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
+
+    with open(filepath, mode="w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Saved CSV: {filepath}")
+
+def to_serializable_row(row: dict) -> dict:
+    """
+    Convert metric values to plain Python scalars when possible.
+    """
+    cleaned = {}
+    for k, v in row.items():
+        if isinstance(v, (np.floating, np.integer)):
+            cleaned[k] = v.item()
+        elif isinstance(v, torch.Tensor):
+            cleaned[k] = v.item() if v.numel() == 1 else v.detach().cpu().tolist()
+        else:
+            cleaned[k] = v
+    return cleaned
 
 # %% [markdown]
 # ## Model Definition — ConvAttnPool
@@ -269,27 +341,19 @@ def GenerateModel(table_path: str, num_of_filters: int = 15, kernel_size: int = 
 # 
 
 # %%
-# FedAvg - working with parameter dictionary rather than deepcopy
-
 def FedAvg(global_model: dict, client_state_dicts: list[dict]) -> dict:
     """
     Perform Federated Averaging (FedAvg) on parameter dictionaries.
-
-    Args:
-        global_model (dict): Global model parameter dictionary (in-place update).
-        client_state_dicts (list[dict]): List of parameter dictionaries from clients.
-
-    Returns:
-        dict: Updated global parameter dictionary (averaged across clients).
+    Returns a NEW averaged parameter dictionary.
     """
+    new_global = {}
     for key in global_model.keys():
-        # Stack corresponding parameters from all clients and take mean
         stacked = torch.stack(
-            [client_dict[key].float() for client_dict in client_state_dicts],
+            [client_dict[key].detach().cpu().float() for client_dict in client_state_dicts],
             dim=0
         )
-        global_model[key] = torch.mean(stacked, dim=0)
-    return global_model
+        new_global[key] = torch.mean(stacked, dim=0)
+    return new_global
 
 # %%
 # --- FedProx and SCAFFOLD Aggregation Methods ---
@@ -304,56 +368,47 @@ def FedProx(global_model_dict, client_state_dicts, mu=0.01):
         client_state_dicts (list[dict]): List of client parameter dicts.
         mu (float): Proximal term weight (applied during local updates).
     """
-    # FedProx uses FedAvg-style aggregation; proximal term affects client training only.
     return FedAvg(global_model_dict, client_state_dicts)
 
 
-def Scaffold(global_model_dict, client_state_dicts, c_global, c_clients, lr, num_clients):
+def Scaffold(global_model_dict, client_state_dicts, c_global, c_clients_old, c_clients_new):
     """
-    SCAFFOLD server update rule:
-        w_{t+1} = w_t + (1/K) * Σ [Δw_k - lr * (c_k - c)]
+    SCAFFOLD server update.
+
+    Model update:
+        same aggregation as FedAvg over corrected local client models
+
+    Global control variate update:
+        c <- c + average(c_i_new - c_i_old)
 
     Args:
-        global_model_dict: current global weights (dict of tensors)
-        client_state_dicts: list of client state_dicts after local updates
-        c_global: global control variate dict
-        c_clients: list of local control variate dicts
-        lr: learning rate
-        num_clients: number of clients participating this round
+        global_model_dict (dict): Current global model state_dict.
+        client_state_dicts (list[dict]): Client model state_dicts after local training.
+        c_global (dict): Global control variate dict, keyed by parameter name.
+        c_clients_old (list[dict]): Client control variates before this round.
+        c_clients_new (list[dict]): Client control variates after this round.
 
     Returns:
-        Updated (global_model_dict, c_global, c_clients)
+        tuple[dict, dict]:
+            - new global model state_dict
+            - new global control variate dict
     """
-    new_global = copy.deepcopy(global_model_dict)
+    # Global model update is just FedAvg of the corrected local models
+    new_global = FedAvg(global_model_dict, client_state_dicts)
 
-    # Average model deltas with control variate correction
-    for key in global_model_dict.keys():
-        # Δw_k = w_k - w_global
-        deltas = torch.stack(
-            [client_state_dicts[k][key] - global_model_dict[key] for k in range(num_clients)],
-            dim=0
-        )
-        mean_delta = torch.mean(deltas, dim=0)
+    # Global control variate update
+    new_c_global = {}
+    num_clients = len(c_clients_new)
 
-        # correction term from c_k - c
-        correction = torch.stack(
-            [c_clients[k][key] - c_global[key] for k in range(num_clients)],
+    for name in c_global.keys():
+        delta_c = torch.stack(
+            [c_clients_new[k][name] - c_clients_old[k][name] for k in range(num_clients)],
             dim=0
         ).mean(dim=0)
 
-        # apply update
-        new_global[key] = global_model_dict[key] + mean_delta - lr * correction
+        new_c_global[name] = c_global[name] + delta_c
 
-    # update global control variate
-    for key in c_global.keys():
-        delta_cs = torch.stack(
-            [c_clients[k][key] - c_global[key] for k in range(num_clients)],
-            dim=0
-        )
-        c_global[key] = c_global[key] + (1 / num_clients) * delta_cs.mean(dim=0)
-
-    return new_global, c_global, c_clients
-
+    return new_global, new_c_global
 
 # %% [markdown]
 # ### Client Update Routine
@@ -414,21 +469,30 @@ def client_update(
     gamma: float = 2.5,
     mu: float = 0.01,                   # FedProx proximal coefficient
     global_params: dict = None,         # for FedProx / SCAFFOLD
-    c_global: dict = None,              # for SCAFFOLD
-    c_local: dict = None,               # for SCAFFOLD
-    algorithm: str = "FedAvg"           # which algorithm is being used
+    c_global: dict = None,              # for SCAFFOLD (parameter names only)
+    c_local: dict = None,               # for SCAFFOLD (parameter names only)
+    algorithm: str = "FedAvg",           # "FedAvg", "FedProx", or "SCAFFOLD"
+    momentum: float = 0.0
 ) -> tuple[float, dict, dict]:
     """
     Perform local training for a single client.
     Supports FedAvg, FedProx, and SCAFFOLD.
-    Returns (final_loss, updated_model_state, updated_c_local)
+
+    Returns:
+        tuple:
+            - final loss
+            - cloned model state_dict after local training
+            - updated local control variate dict (or original c_local / None)
     """
     model.to(device)
     model.train()
 
     n_labels = train_loader.dataset[0][1].shape[0]
     pos_weight = compute_pos_weight(train_loader, n_labels).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.99))
+    if algorithm == "SCAFFOLD":
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.99))
 
     if use_focal:
         alpha = torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device)
@@ -436,34 +500,68 @@ def client_update(
     else:
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # --- Training loop ---
+    last_loss = None
+
+    # Count optimizer steps for SCAFFOLD local control update
+    step_count = 0
+
     for _ in range(epochs):
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
             preds, _ = model(X_batch)
             loss = loss_fn(preds, y_batch)
 
             # --- FedProx proximal term ---
             if algorithm == "FedProx" and global_params is not None:
                 prox_term = 0.0
-                for w, w_global in zip(model.parameters(), global_params.values()):
-                    prox_term += (w - w_global.to(device)).norm(2) ** 2
-                loss += (mu / 2) * prox_term
+                for name, w in model.named_parameters():
+                    w_global = global_params[name].to(device)
+                    prox_term += (w - w_global).norm(2) ** 2
+                loss += (mu / 2.0) * prox_term
 
             optimizer.zero_grad()
             loss.backward()
 
-            # --- SCAFFOLD correction ---
+            # --- SCAFFOLD gradient correction ---
             if algorithm == "SCAFFOLD" and c_global is not None and c_local is not None:
                 with torch.no_grad():
-                    for w, cg, cl in zip(model.parameters(), c_global.values(), c_local.values()):
+                    for name, w in model.named_parameters():
                         if w.grad is not None:
-                            w.grad -= (cg.to(device) - cl.to(device))
+                            w.grad += c_global[name].to(device) - c_local[name].to(device)
 
             optimizer.step()
+            step_count += 1
+            last_loss = loss.item()
 
-    return loss.item(), model.state_dict(), c_local
+    # Safe cloned return for aggregation
+    new_weights = {
+        k: v.detach().cpu().clone()
+        for k, v in model.state_dict().items()
+    }
 
+    # --- SCAFFOLD local control variate update ---
+    new_c_local = c_local
+    if algorithm == "SCAFFOLD" and c_global is not None and c_local is not None:
+        if global_params is None:
+            raise ValueError("global_params must be provided for SCAFFOLD")
+
+        if step_count == 0:
+            raise ValueError("SCAFFOLD step_count is zero; train_loader appears empty")
+
+        new_c_local = {}
+        with torch.no_grad():
+            for name in c_global.keys():
+                w_global = global_params[name].to(device)
+                w_local = new_weights[name].to(device)
+                c_g = c_global[name].to(device)
+                c_l = c_local[name].to(device)
+
+                # c_i_new = c_i_old - c + (w_global - w_local) / (K * lr)
+                updated_c = c_l - c_g + (w_global - w_local) / (step_count * lr)
+                new_c_local[name] = updated_c.detach().cpu().clone()
+
+    return last_loss, new_weights, new_c_local
 
 # %% [markdown]
 # ## Federated Training — Full Experiment Pipeline
@@ -682,38 +780,42 @@ def eval_model(
 
 
 # %% [markdown]
-# ## Client Number Sensitivity Analysis
+# ## Baseline Client Number Sensitivity Analysis
 # 
-# Goal: test how FL performance changes as the number of simulated clients increases.
+# Goal: test how baseline FL performance changes as the number of simulated clients increases.
 # 
-# **Option A (implemented now): IID split**
-# - Randomly split the same training dataset into K approximately equal partitions.
+# Methods included:
+# - FedAvg
+# - FedProx
+# - SCAFFOLD
 # 
-# **Option B (later): non-IID split**
-# - Split data to mimic hospital heterogeneity (label prevalence shifts, size imbalance, etc.).
+# We evaluate each method under:
+# - IID splits
+# - non-IID splits
 # 
-# We keep everything else fixed (model, optimizer, rounds, local epochs) so the only change is
-# the number of clients and the resulting partitioning.
+# We keep everything else fixed (model, optimizer family, rounds, local epochs) so the main changes are:
+# - number of clients
+# - split regime
+# - federated optimization method
 
 # %%
-# do weighted by partition size instead of mean by clients (important for different sizes like part b)
+# Optional alternative aggregation: sample-size-weighted FedAvg.
+# Kept for ablations / future comparison, but not used in the main baseline experiments.
 
 def FedAvg_weighted(client_state_dicts: list[dict], client_sizes: list[int]) -> dict:
     """
-    Weighted FedAvg by client dataset size. Returns a NEW state_dict (does not mutate inputs).
-    client_state_dicts: list of state_dicts (as produced by model.state_dict())
-    client_sizes: list of ints (number of samples per client)
+    Weighted FedAvg by client dataset size. Returns a NEW state_dict.
     """
     total = float(sum(client_sizes))
     out = {}
-    # iterate keys from first client's state_dict
+
     for key in client_state_dicts[0].keys():
-        # accumulate weighted sum
         acc = None
         for sd, n in zip(client_state_dicts, client_sizes):
-            term = sd[key].float() * (n / total)
+            term = sd[key].detach().cpu().float() * (n / total)
             acc = term if acc is None else acc + term
         out[key] = acc
+
     return out
 
 # %% [markdown]
@@ -764,11 +866,14 @@ def split_dataset_noniid_multilabel(
     seed: int = 42,
     size_alpha: float = 0.5,          # Dirichlet parameter for client sizes
     labels_per_client: int = 10,      # number of preferred labels per client
-    bias_strength: float = 0.85       # prob of sampling from preferred-label examples
+    bias_strength: float = 0.85,      # prob of sampling from preferred-label examples
+    min_size_per_client: int = 100     # enforce non-empty / non-tiny clients (100 since for iid ~320 samples/client)
 ):
     """
     Splits `dataset` (TensorDataset or similar with Y in dataset.tensors[1])
     into `num_clients` Subset objects with non-IID label prevalence and size imbalance.
+
+    Adds a minimum client size constraint so the split remains harsh but usable.
     """
     rng = np.random.default_rng(seed)
 
@@ -776,19 +881,27 @@ def split_dataset_noniid_multilabel(
     if hasattr(dataset, "tensors"):
         Y = dataset.tensors[1].cpu()
     else:
-        # fallback for generic dataset: collect Y
         Y = torch.stack([dataset[i][1] for i in range(len(dataset))]).cpu()
 
     n = len(dataset)
     n_labels = Y.shape[1]
 
-    # --- sizes via Dirichlet ---
+    if min_size_per_client * num_clients > n:
+        raise ValueError(
+            f"min_size_per_client * num_clients = {min_size_per_client * num_clients} "
+            f"exceeds dataset size {n}"
+        )
+
+    # --- sizes via Dirichlet, then enforce minimum size ---
+    remaining_n = n - (min_size_per_client * num_clients)
     props = rng.dirichlet(alpha=np.ones(num_clients) * size_alpha)
-    sizes = (props * n).astype(int)
-    diff = n - sizes.sum()
+    extra_sizes = (props * remaining_n).astype(int)
+
+    diff = remaining_n - extra_sizes.sum()
     for i in range(abs(diff)):
-        sizes[i % num_clients] += 1 if diff > 0 else -1
-    sizes = sizes.tolist()
+        extra_sizes[i % num_clients] += 1 if diff > 0 else -1
+
+    sizes = (extra_sizes + min_size_per_client).tolist()
 
     # --- label -> indices map ---
     label_to_indices = defaultdict(list)
@@ -801,7 +914,13 @@ def split_dataset_noniid_multilabel(
     all_labels = np.arange(n_labels)
     preferred = []
     for _ in range(num_clients):
-        preferred.append(rng.choice(all_labels, size=min(labels_per_client, n_labels), replace=False).tolist())
+        preferred.append(
+            rng.choice(
+                all_labels,
+                size=min(labels_per_client, n_labels),
+                replace=False
+            ).tolist()
+        )
 
     # --- assignment ---
     unassigned = set(range(n))
@@ -820,7 +939,7 @@ def split_dataset_noniid_multilabel(
                 return idx
         return None
 
-    # fill clients
+    # fill clients to their target sizes
     for cid in range(num_clients):
         target = sizes[cid]
         while len(client_indices[cid]) < target and unassigned:
@@ -828,11 +947,11 @@ def split_dataset_noniid_multilabel(
             idx = pick_preferred(cid) if use_pref else None
 
             if idx is None:
-                # choose uniformly from remaining
                 idx = rng.choice(list(unassigned))
 
-            client_indices[cid].append(int(idx))
-            unassigned.remove(int(idx))
+            idx = int(idx)
+            client_indices[cid].append(idx)
+            unassigned.remove(idx)
 
     # distribute any leftovers
     if unassigned:
@@ -841,7 +960,6 @@ def split_dataset_noniid_multilabel(
         for i, idx in enumerate(leftovers):
             client_indices[i % num_clients].append(int(idx))
 
-    # build subsets
     subsets = [Subset(dataset, inds) for inds in client_indices]
     return subsets
 
@@ -850,7 +968,7 @@ def split_dataset_noniid_multilabel(
 
 # %%
 def run_fl_sensitivity_once(
-    split_mode: str,            # "iid" or "noniid"
+    split_mode: str,
     num_clients: int,
     local_epochs: int,
     config: dict,
@@ -859,18 +977,31 @@ def run_fl_sensitivity_once(
     test_loader,
     device,
     seed: int = 42,
-    algo: str = "FedAvg",        # "FedAvg" or "FedProx"
-    mu: float = 0.01,            # only used for FedProx
-    # non-IID params
+    algo: str = "FedAvg",
+    mu: float = 0.001,
+    momentum: float = 0.0,
     size_alpha: float = 0.5,
     labels_per_client: int = 10,
-    bias_strength: float = 0.85
+    bias_strength: float = 0.85,
+    min_size_per_client: int = 100
 ):
+    """
+    Run one baseline FL sensitivity experiment for FedAvg, FedProx, or SCAFFOLD.
+
+    Returns:
+        tuple:
+            - metrics dict evaluated on test set using per-label thresholds from validation
+            - elapsed time in seconds
+    """
     start_time = time.time()
 
     # --- split ---
     if split_mode == "iid":
-        client_datasets = split_dataset_iid(train_dataset, num_clients=num_clients, seed=seed)
+        client_datasets = split_dataset_iid(
+            train_dataset,
+            num_clients=num_clients,
+            seed=seed
+        )
     elif split_mode == "noniid":
         client_datasets = split_dataset_noniid_multilabel(
             train_dataset,
@@ -878,13 +1009,17 @@ def run_fl_sensitivity_once(
             seed=seed,
             size_alpha=size_alpha,
             labels_per_client=labels_per_client,
-            bias_strength=bias_strength
+            bias_strength=bias_strength,
+            min_size_per_client=min_size_per_client
         )
     else:
         raise ValueError("split_mode must be 'iid' or 'noniid'")
 
     client_sizes = [len(cd) for cd in client_datasets]
-    client_loaders = [DataLoader(cd, batch_size=config["batch_size"], shuffle=True) for cd in client_datasets]
+    client_loaders = [
+        DataLoader(cd, batch_size=config["batch_size"], shuffle=True)
+        for cd in client_datasets
+    ]
 
     # --- init global model ---
     global_model = GenerateModel(
@@ -893,16 +1028,44 @@ def run_fl_sensitivity_once(
         kernel_size=config["window_size"]
     ).to(device)
 
+    # reuse one client shell safely
     client_model = copy.deepcopy(global_model)
 
+    # --- init SCAFFOLD control variates if needed ---
+    if algo == "SCAFFOLD":
+        c_global = {
+            name: torch.zeros_like(param.detach().cpu())
+            for name, param in global_model.named_parameters()
+        }
+        c_clients = [
+            {
+                name: torch.zeros_like(param.detach().cpu())
+                for name, param in global_model.named_parameters()
+            }
+            for _ in range(num_clients)
+        ]
+    else:
+        c_global = None
+        c_clients = None
+
     # --- FL rounds ---
-    for rnd in tqdm(range(config["rounds"]), colour="blue",
-                    desc=f"{algo} {split_mode} | K={num_clients} | E={local_epochs}"):
+    for rnd in tqdm(
+        range(config["rounds"]),
+        colour="blue",
+        desc=f"{algo} {split_mode} | K={num_clients} | E={local_epochs}"
+    ):
         client_params = []
-        for loader in client_loaders:
+        new_c_clients = []
+
+        global_params_snapshot = {
+            k: v.detach().clone()
+            for k, v in global_model.state_dict().items()
+        }
+
+        for idx, loader in enumerate(client_loaders):
             client_model.load_state_dict(global_model.state_dict())
 
-            _, client_state, _ = client_update(
+            _, client_state, c_local = client_update(
                 model=client_model,
                 train_loader=loader,
                 epochs=local_epochs,
@@ -911,16 +1074,40 @@ def run_fl_sensitivity_once(
                 use_focal=config["use_focal"],
                 gamma=config["gamma"],
                 mu=mu,
-                global_params=(global_model.state_dict() if algo == "FedProx" else None),
-                c_global=None,
-                c_local=None,
+                global_params=global_params_snapshot,
+                c_global=c_global if algo == "SCAFFOLD" else None,
+                c_local=c_clients[idx] if algo == "SCAFFOLD" else None,
                 algorithm=algo,
+                momentum=momentum
             )
+
             client_params.append(client_state)
 
-        # server aggregation: sample-size weighted FedAvg (safe for IID + nonIID)
-        new_params = FedAvg_weighted(client_params, client_sizes)
-        global_model.load_state_dict(new_params)
+            if algo == "SCAFFOLD":
+                new_c_clients.append(c_local)
+
+        # --- server aggregation ---
+        if algo == "FedAvg":
+            new_params = FedAvg(global_model.state_dict(), client_params)
+            global_model.load_state_dict(new_params)
+
+        elif algo == "FedProx":
+            new_params = FedProx(global_model.state_dict(), client_params, mu=mu)
+            global_model.load_state_dict(new_params)
+
+        elif algo == "SCAFFOLD":
+            new_params, c_global = Scaffold(
+                global_model.state_dict(),
+                client_params,
+                c_global,
+                c_clients,
+                new_c_clients
+            )
+            global_model.load_state_dict(new_params)
+            c_clients = new_c_clients
+
+        else:
+            raise ValueError("algo must be 'FedAvg', 'FedProx', or 'SCAFFOLD'")
 
     # --- eval ---
     _, per_label_thr = find_best_thresholds_per_label(global_model, val_loader, device)
@@ -929,152 +1116,1026 @@ def run_fl_sensitivity_once(
     elapsed = time.time() - start_time
     return metrics, elapsed
 
+# %% [markdown]
+# ### Non-IID Severity Tuning with Split Diagnostics
+# 
+# Before using KD to address non-IID degradation, we first verify that the
+# chosen non-IID split is actually meaningfully harsher than IID.
+# 
+# This section:
+# - builds client splits for IID and candidate non-IID settings
+# - reports client-level diagnostics
+# - helps choose a stricter non-IID configuration for downstream experiments
+
 # %%
-# # =========================
-# # Sensitivity Sweep (FULL)
-# # =========================
+def summarize_client_label_distribution(client_dataset, n_total_labels: int):
+    """
+    Summarize label distribution statistics for one client subset.
+    """
+    if hasattr(client_dataset, "indices"):
+        indices = client_dataset.indices
+        Y_client = train_dataset.tensors[1][indices].cpu()
+    else:
+        Y_client = torch.stack([client_dataset[i][1] for i in range(len(client_dataset))]).cpu()
 
-# client_counts = [2, 3, 5, 8, 10]      # 2–20 as requested
+    n_samples = int(len(Y_client))
 
-# # keep fast first; later bump rounds to your real value
-# sweep_config = config.copy()
-# sweep_config["rounds"] = 10  # debug; set higher later
+    if n_samples == 0:
+        return {
+            "n_samples": 0,
+            "n_active_labels": 0,
+            "active_label_fraction": 0.0,
+            "avg_labels_per_sample": np.nan,
+            "top10_labels": [],
+            "top10_counts": [],
+            "label_prevalence_mean": 0.0,
+            "label_prevalence_std": 0.0,
+        }
 
-# # choose non-IID severity (keep fixed across all methods)
-# noniid_params = dict(size_alpha=0.5, labels_per_client=10, bias_strength=0.85)
+    label_counts = Y_client.sum(dim=0).numpy()
+    active_labels = np.where(label_counts > 0)[0]
 
-# # methods to compare
-# METHODS = [
-#     #dict(method="FedAvg",  algo="FedAvg",  mu=None,  local_epochs=3)
-#     dict(method="FedAvg_E1", algo="FedAvg", mu=None, local_epochs=1),
+    avg_labels_per_sample = Y_client.sum(dim=1).float().mean().item()
+    label_prevalence = label_counts / max(n_samples, 1)
 
-#     #dict(method="FedProx_mu0.01_E3", algo="FedProx", mu=0.01, local_epochs=3)
-#     #dict(method="FedProx_mu0.1_E3",  algo="FedProx", mu=0.10, local_epochs=3)
+    top_label_ids = np.argsort(-label_counts)[:10]
+    top_label_counts = label_counts[top_label_ids]
 
-#     dict(method="FedProx_mu0.01_E1", algo="FedProx", mu=0.01, local_epochs=1),
-#     dict(method="FedProx_mu0.1_E1",  algo="FedProx", mu=0.10, local_epochs=1),
+    return {
+        "n_samples": n_samples,
+        "n_active_labels": int(len(active_labels)),
+        "active_label_fraction": float(len(active_labels) / n_total_labels),
+        "avg_labels_per_sample": float(avg_labels_per_sample),
+        "top10_labels": top_label_ids.tolist(),
+        "top10_counts": top_label_counts.tolist(),
+        "label_prevalence_mean": float(label_prevalence.mean()),
+        "label_prevalence_std": float(label_prevalence.std()),
+    }
 
+# %%
+def diagnose_split(
+    split_mode: str,
+    dataset,
+    num_clients: int,
+    seed: int = 42,
+    size_alpha: float = 0.5,
+    labels_per_client: int = 10,
+    bias_strength: float = 0.85,
+    min_size_per_client: int = 100,
+    show_client_details: bool = True,
+    split_name: str = None
+):
+    """
+    Build a split and print diagnostics for how heterogeneous it is.
+    Returns:
+        df: one row per client
+        client_datasets: list of Subset datasets
+    """
+    if hasattr(dataset, "tensors"):
+        n_total_labels = dataset.tensors[1].shape[1]
+    else:
+        sample_y = dataset[0][1]
+        n_total_labels = sample_y.shape[0]
+
+    if split_mode == "iid":
+        client_datasets = split_dataset_iid(
+            dataset,
+            num_clients=num_clients,
+            seed=seed
+        )
+        split_params = {
+            "size_alpha": None,
+            "labels_per_client": None,
+            "bias_strength": None,
+            "min_size_per_client": None,
+        }
+
+    elif split_mode == "noniid":
+        client_datasets = split_dataset_noniid_multilabel(
+            dataset,
+            num_clients=num_clients,
+            seed=seed,
+            size_alpha=size_alpha,
+            labels_per_client=labels_per_client,
+            bias_strength=bias_strength,
+            min_size_per_client=min_size_per_client
+        )
+        split_params = {
+            "size_alpha": size_alpha,
+            "labels_per_client": labels_per_client,
+            "bias_strength": bias_strength,
+            "min_size_per_client": min_size_per_client,
+        }
+
+    else:
+        raise ValueError("split_mode must be 'iid' or 'noniid'")
+
+    rows = []
+    for cid, client_ds in enumerate(client_datasets):
+        stats = summarize_client_label_distribution(client_ds, n_total_labels)
+        row = {
+            "split_name": split_name if split_name is not None else split_mode,
+            "split": split_mode,
+            "client": cid,
+            **split_params,
+            **stats,
+        }
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    print("\n" + "=" * 80)
+    print(
+        f"SPLIT DIAGNOSTICS | split_name={split_name if split_name is not None else split_mode} | "
+        f"split={split_mode} | clients={num_clients}"
+    )
+
+    if split_mode == "noniid":
+        print(
+            f"size_alpha={size_alpha} | "
+            f"labels_per_client={labels_per_client} | "
+            f"bias_strength={bias_strength} | "
+            f"min_size_per_client={min_size_per_client}"
+        )
+
+    print(f"Client size range: {df['n_samples'].min()} to {df['n_samples'].max()}")
+    print(
+        f"Active labels/client range: "
+        f"{df['n_active_labels'].min()} to {df['n_active_labels'].max()}"
+    )
+    print(
+        f"Avg labels/sample range: "
+        f"{df['avg_labels_per_sample'].min():.2f} to {df['avg_labels_per_sample'].max():.2f}"
+    )
+    print(
+        f"Label prevalence std range: "
+        f"{df['label_prevalence_std'].min():.4f} to {df['label_prevalence_std'].max():.4f}"
+    )
+
+    if show_client_details:
+        display(
+            df[[
+                "split_name",
+                "client",
+                "n_samples",
+                "n_active_labels",
+                "active_label_fraction",
+                "avg_labels_per_sample",
+                "label_prevalence_std",
+                "top10_labels",
+                "top10_counts",
+            ]]
+        )
+
+    return df, client_datasets
+
+# %%
+def compare_split_candidates(
+    dataset,
+    num_clients: int,
+    candidate_noniid_params: list,
+    seed: int = 42,
+    min_size_per_client: int = 100,
+    show_all_client_details: bool = True
+):
+    """
+    Run diagnostics for IID plus several candidate non-IID settings.
+    Returns:
+        summary_df: one row per candidate split
+        detailed_results: dict mapping split_name -> per-client dataframe
+    """
+    summary_rows = []
+    detailed_results = {}
+
+    iid_df, _ = diagnose_split(
+        split_mode="iid",
+        dataset=dataset,
+        num_clients=num_clients,
+        seed=seed,
+        show_client_details=show_all_client_details,
+        split_name="iid"
+    )
+    detailed_results["iid"] = iid_df
+
+    summary_rows.append({
+        "split_name": "iid",
+        "size_alpha": None,
+        "labels_per_client": None,
+        "bias_strength": None,
+        "min_size_per_client": None,
+        "client_size_min": int(iid_df["n_samples"].min()),
+        "client_size_max": int(iid_df["n_samples"].max()),
+        "active_labels_min": int(iid_df["n_active_labels"].min()),
+        "active_labels_max": int(iid_df["n_active_labels"].max()),
+        "avg_labels_per_sample_min": float(iid_df["avg_labels_per_sample"].min()),
+        "avg_labels_per_sample_max": float(iid_df["avg_labels_per_sample"].max()),
+        "label_prevalence_std_mean": float(iid_df["label_prevalence_std"].mean()),
+        "label_prevalence_std_min": float(iid_df["label_prevalence_std"].min()),
+        "label_prevalence_std_max": float(iid_df["label_prevalence_std"].max()),
+    })
+
+    for params in candidate_noniid_params:
+        split_name = (
+            f"noniid_a{params['size_alpha']}_"
+            f"l{params['labels_per_client']}_"
+            f"b{params['bias_strength']}"
+        )
+
+        df, _ = diagnose_split(
+            split_mode="noniid",
+            dataset=dataset,
+            num_clients=num_clients,
+            seed=seed,
+            size_alpha=params["size_alpha"],
+            labels_per_client=params["labels_per_client"],
+            bias_strength=params["bias_strength"],
+            min_size_per_client=min_size_per_client,
+            show_client_details=show_all_client_details,
+            split_name=split_name
+        )
+        detailed_results[split_name] = df
+
+        summary_rows.append({
+            "split_name": split_name,
+            "size_alpha": params["size_alpha"],
+            "labels_per_client": params["labels_per_client"],
+            "bias_strength": params["bias_strength"],
+            "min_size_per_client": min_size_per_client,
+            "client_size_min": int(df["n_samples"].min()),
+            "client_size_max": int(df["n_samples"].max()),
+            "active_labels_min": int(df["n_active_labels"].min()),
+            "active_labels_max": int(df["n_active_labels"].max()),
+            "avg_labels_per_sample_min": float(df["avg_labels_per_sample"].min()),
+            "avg_labels_per_sample_max": float(df["avg_labels_per_sample"].max()),
+            "label_prevalence_std_mean": float(df["label_prevalence_std"].mean()),
+            "label_prevalence_std_min": float(df["label_prevalence_std"].min()),
+            "label_prevalence_std_max": float(df["label_prevalence_std"].max()),
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    return summary_df, detailed_results
+
+# %%
+# Candidate non-IID settings to test
+
+# candidate_noniid_params = [
+#     {"size_alpha": 0.5, "labels_per_client": 10, "bias_strength": 0.85},  # current
+#     {"size_alpha": 0.3, "labels_per_client": 7,  "bias_strength": 0.90},  # moderate stricter
+#     {"size_alpha": 0.3, "labels_per_client": 5,  "bias_strength": 0.90},  # stricter
+#     {"size_alpha": 0.2, "labels_per_client": 5,  "bias_strength": 0.90},
+#     {"size_alpha": 0.2, "labels_per_client": 5,  "bias_strength": 0.95},
+#     {"size_alpha": 0.1, "labels_per_client": 3,  "bias_strength": 0.95},
+#     {"size_alpha": 0.05, "labels_per_client": 2, "bias_strength": 0.98},
 # ]
 
-# out_path = "../History/sensitivity_all_methods.csv"
-
-# all_rows = []
-# for split_mode in ["iid", "noniid"]:
-#     for m in METHODS:
-#         for k in client_counts:
-#             print(f"\n=== {split_mode.upper()} | {m['method']} | K={k} ===")
-
-#             metrics, elapsed = run_fl_sensitivity_once(
-#                 split_mode=split_mode,
-#                 num_clients=k,
-#                 local_epochs=m["local_epochs"],
-#                 config=sweep_config,
-#                 train_dataset=train_dataset,
-#                 val_loader=val_loader,
-#                 test_loader=test_loader,
-#                 device=device,
-#                 seed=42,
-#                 algo=m["algo"],
-#                 mu=(m["mu"] if m["mu"] is not None else 0.0),
-#                 **(noniid_params if split_mode == "noniid" else {})
-#             )
-
-#             row = dict(
-#                 split=split_mode,
-#                 method=m["method"],
-#                 algo=m["algo"],
-#                 mu=m["mu"],
-#                 local_epochs=m["local_epochs"],
-#                 clients=k,
-#                 auc_macro=metrics.get("auc_macro"),
-#                 auc_micro=metrics.get("auc_micro"),
-#                 f1_macro=metrics.get("f1_macro"),
-#                 f1_micro=metrics.get("f1_micro"),
-#                 pr_auc_macro=metrics.get("pr_auc_macro"),
-#                 pr_auc_micro=metrics.get("pr_auc_micro"),
-#                 time_sec=elapsed,
-#             )
-#             if split_mode == "noniid":
-#                 row.update(noniid_params)
-
-#             all_rows.append(row)
-
-#             pd.DataFrame(all_rows).to_csv(out_path, index=False)
-
-# print(f"\nDone. Saved to {out_path}")
-# sens_all = pd.DataFrame(all_rows)
-# display(sens_all)
+candidate_noniid_params = [
+    {"size_alpha": 0.5, "labels_per_client": 10, "bias_strength": 0.85},  # old reference
+    {"size_alpha": 0.5, "labels_per_client": 15, "bias_strength": 0.60},
+    {"size_alpha": 0.5, "labels_per_client": 15, "bias_strength": 0.70},
+    {"size_alpha": 0.5, "labels_per_client": 20, "bias_strength": 0.60},
+    {"size_alpha": 0.5, "labels_per_client": 20, "bias_strength": 0.70},
+]
 
 # %%
-# # Load + table (primary metrics)
+# Full candidate comparison at the hardest intended setting.
+# This will print and display EVERY candidate in full, including IID.
 
-# out_path = "../History/sensitivity_all_methods.csv"
-# sens_all = pd.read_csv(out_path)
-# print("Loaded:", out_path, "rows=", len(sens_all))
+strictness_diag_summary, strictness_diag_details = compare_split_candidates(
+    dataset=train_dataset,
+    num_clients=20,
+    candidate_noniid_params=candidate_noniid_params,
+    seed=42,
+    min_size_per_client=100,
+    show_all_client_details=True
+)
 
-# # Comparison table: primary metrics (Macro F1, PR-AUC Macro)
-# table = sens_all[["split","method","clients","f1_macro","pr_auc_macro","time_sec"]].copy()
-# display(table.head())
+print("\n" + "=" * 100)
+print("SUMMARY TABLE ACROSS ALL CANDIDATES")
+print("=" * 100)
+
+display(
+    strictness_diag_summary.sort_values(
+        by=["label_prevalence_std_mean", "client_size_min"],
+        ascending=[False, True]
+    ).reset_index(drop=True)
+)
+
+# %% [markdown]
+# ### FedAvg K=20 Comparison Across IID and Multiple non-IID Settings
+# 
+# Before running the full client-count sweep, this section compares several candidate
+# split settings under the same strong FedAvg baseline:
+# - Clients: 20
+# - Rounds: 100
+# - Local epochs: 3
+# 
+# This is intentionally flexible:
+# - you can add more candidate settings later
+# - results are saved incrementally
+# - completed runs are skipped automatically on rerun
+# 
+# Goal:
+# - compare IID against several candidate non-IID settings in one place
+# - choose the most appropriate non-IID baseline for downstream KD experiments
 
 # %%
-# # Plotting
+# Config / output paths cell
 
-# # Pre-define visually distinct markers/linestyles (works for both color and B/W)
-# MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">"]
-# LINESTYLES = ["-", "--", "-.", ":", (0,(3,1,1,1)), (0,(5,5)), (0,(1,1))]
+compare_config = config.copy()
+compare_config["rounds"] = 100
+compare_local_epochs = 3
+compare_client_count = 20
 
-# def plot_macro_f1_all_methods(df, split_mode: str, bw: bool = False):
-#     d = df[df["split"] == split_mode].copy()
+# Add / remove settings here as needed later
+COMPARE_SPLITS = [
+    dict(
+        split_name="iid",
+        split_mode="iid"
+    ),
+    dict(
+        split_name="noniid_old_ref_a05_l10_b085_min100",
+        split_mode="noniid",
+        size_alpha=0.5,
+        labels_per_client=10,
+        bias_strength=0.85,
+        min_size_per_client=100
+    ),
+    dict(
+        split_name="noniid_stricter_a03_l7_b09_min100",
+        split_mode="noniid",
+        size_alpha=0.3,
+        labels_per_client=7,
+        bias_strength=0.9,
+        min_size_per_client=100
+    ),
+    dict(
+        split_name="noniid_overlap_a05_l15_b07_min100",
+        split_mode="noniid",
+        size_alpha=0.5,
+        labels_per_client=15,
+        bias_strength=0.7,
+        min_size_per_client=100
+    ),
+]
 
-#     # consistent order in legend (so runs are stable)
-#     methods = sorted(d["method"].unique())
+COMPARE_TAG = "fedavg_k20_r100_e3_multi_split_compare"
 
-#     plt.figure(figsize=(10, 5))
+COMPARE_CSV = os.path.join(
+    KD_DIRS["baseline_fl_sensitivity"],
+    f"{COMPARE_TAG}.csv"
+)
 
-#     # cycle marker/style pairs so each method is distinguishable
-#     style_cycle = itertools.cycle([
-#         (m, ls) for m in MARKERS for ls in LINESTYLES
-#     ])
+COMPARE_JSON = os.path.join(
+    KD_DIRS["baseline_fl_sensitivity"],
+    f"{COMPARE_TAG}.json"
+)
 
-#     for method in methods:
-#         g = d[d["method"] == method].sort_values("clients")
-#         marker, ls = next(style_cycle)
+print("Comparison output files:")
+print(" ", COMPARE_CSV)
+print(" ", COMPARE_JSON)
 
-#         if bw:
-#             plt.plot(
-#                 g["clients"], g["f1_macro"],
-#                 color="black",
-#                 linestyle=ls,
-#                 marker=marker,
-#                 markersize=6,
-#                 linewidth=2,
-#                 label=method
-#             )
-#         else:
-#             plt.plot(
-#                 g["clients"], g["f1_macro"],
-#                 linestyle=ls,
-#                 marker=marker,
-#                 markersize=6,
-#                 linewidth=2,
-#                 label=method
-#             )
+# %%
+# Runner cell with resume / skip-completed support
 
-#     plt.xlabel("Number of Clients")
-#     plt.ylabel("Macro F1")
-#     plt.title(f"Macro F1 vs #Clients ({split_mode.upper()})")
-#     plt.grid(True, alpha=0.3)
-#     plt.legend(fontsize=8, ncols=2, frameon=True)
-#     plt.tight_layout()
-#     plt.show()
+compare_rows = []
+compare_completed = set()
 
-# # Color
-# plot_macro_f1_all_methods(sens_all, "iid", bw=False)
-# plot_macro_f1_all_methods(sens_all, "noniid", bw=False)
+if os.path.exists(COMPARE_CSV):
+    compare_existing = pd.read_csv(COMPARE_CSV)
+    compare_rows = compare_existing.to_dict(orient="records")
+    compare_completed = set(compare_existing["split_name"].tolist())
+    print(f"Found existing comparison results at {COMPARE_CSV}")
+    print(f"Loaded {len(compare_existing)} completed rows.")
+else:
+    print("No existing comparison results found. Starting fresh.")
 
-# # Black & White
-# plot_macro_f1_all_methods(sens_all, "iid", bw=True)
-# plot_macro_f1_all_methods(sens_all, "noniid", bw=True)
+for split_cfg in COMPARE_SPLITS:
+    split_name = split_cfg["split_name"]
+    split_mode = split_cfg["split_mode"]
+
+    if split_name in compare_completed:
+        print(f"Skipping completed run: {split_name}")
+        continue
+
+    print("\n" + "=" * 100)
+    print(
+        f"RUNNING | {split_name} | "
+        f"FedAvg | K={compare_client_count} | R={compare_config['rounds']} | E={compare_local_epochs}"
+    )
+    print("=" * 100)
+
+    run_kwargs = dict(
+        split_mode=split_mode,
+        num_clients=compare_client_count,
+        local_epochs=compare_local_epochs,
+        config=compare_config,
+        train_dataset=train_dataset,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        device=device,
+        seed=42,
+        algo="FedAvg",
+        mu=0.0,
+        momentum=0.0,
+    )
+
+    if split_mode == "noniid":
+        run_kwargs.update(
+            size_alpha=split_cfg["size_alpha"],
+            labels_per_client=split_cfg["labels_per_client"],
+            bias_strength=split_cfg["bias_strength"],
+            min_size_per_client=split_cfg["min_size_per_client"]
+        )
+
+    try:
+        metrics, elapsed = run_fl_sensitivity_once(**run_kwargs)
+
+        row = {
+            "split_name": split_name,
+            "split": split_mode,
+            "method": "FedAvg",
+            "algo": "FedAvg",
+            "clients": compare_client_count,
+            "rounds": compare_config["rounds"],
+            "local_epochs": compare_local_epochs,
+            "lr": compare_config["lr"],
+            "mu": None,
+            "momentum": None,
+            "auc_macro": metrics.get("auc_macro"),
+            "auc_micro": metrics.get("auc_micro"),
+            "f1_macro": metrics.get("f1_macro"),
+            "f1_micro": metrics.get("f1_micro"),
+            "pr_auc_macro": metrics.get("pr_auc_macro"),
+            "pr_auc_micro": metrics.get("pr_auc_micro"),
+            "best_f1_micro": metrics.get("best_f1_micro"),
+            "best_thr": metrics.get("best_thr"),
+            "time_sec": elapsed,
+        }
+
+        if split_mode == "noniid":
+            row.update({
+                "size_alpha": split_cfg["size_alpha"],
+                "labels_per_client": split_cfg["labels_per_client"],
+                "bias_strength": split_cfg["bias_strength"],
+                "min_size_per_client": split_cfg["min_size_per_client"],
+            })
+        else:
+            row.update({
+                "size_alpha": None,
+                "labels_per_client": None,
+                "bias_strength": None,
+                "min_size_per_client": None,
+            })
+
+        compare_rows.append(row)
+        compare_completed.add(split_name)
+
+        save_dict_rows_to_csv(compare_rows, COMPARE_CSV)
+        save_json(
+            {"rows": [to_serializable_row(r) for r in compare_rows]},
+            COMPARE_JSON
+        )
+
+        print(f"Saved result to {COMPARE_CSV}")
+        print(f"Saved result to {COMPARE_JSON}")
+
+    except Exception as e:
+        print(f"FAILED: {split_name}")
+        print(f"Reason: {e}")
+
+compare_df = pd.DataFrame(compare_rows)
+display(compare_df)
+
+# %%
+# Load + main comparison table
+
+compare_df = pd.read_csv(COMPARE_CSV)
+print("Loaded:", COMPARE_CSV, "rows=", len(compare_df))
+
+comparison_table = compare_df[[
+    "split_name",
+    "split",
+    "clients",
+    "rounds",
+    "local_epochs",
+    "size_alpha",
+    "labels_per_client",
+    "bias_strength",
+    "min_size_per_client",
+    "f1_macro",
+    "f1_micro",
+    "pr_auc_macro",
+    "pr_auc_micro",
+    "auc_macro",
+    "auc_micro",
+    "time_sec"
+]].copy()
+
+display(comparison_table.sort_values("split_name").reset_index(drop=True))
+
+# %%
+# IID-relative delta table
+
+compare_df = pd.read_csv(COMPARE_CSV)
+
+iid_ref = compare_df[compare_df["split"] == "iid"].iloc[0]
+
+delta_rows = []
+for _, row in compare_df.iterrows():
+    delta_rows.append({
+        "split_name": row["split_name"],
+        "split": row["split"],
+        "f1_macro": row["f1_macro"],
+        "delta_f1_macro_vs_iid": row["f1_macro"] - iid_ref["f1_macro"],
+        "pr_auc_macro": row["pr_auc_macro"],
+        "delta_pr_auc_macro_vs_iid": row["pr_auc_macro"] - iid_ref["pr_auc_macro"],
+        "auc_macro": row["auc_macro"],
+        "delta_auc_macro_vs_iid": row["auc_macro"] - iid_ref["auc_macro"],
+        "time_sec": row["time_sec"],
+    })
+
+delta_table = pd.DataFrame(delta_rows).sort_values(
+    by=["delta_f1_macro_vs_iid", "delta_pr_auc_macro_vs_iid", "delta_auc_macro_vs_iid"]
+).reset_index(drop=True)
+
+display(delta_table)
+
+# %%
+# Plot: macro metrics across compared split settings
+
+compare_df = pd.read_csv(COMPARE_CSV)
+
+plot_order = [cfg["split_name"] for cfg in COMPARE_SPLITS]
+plot_df = compare_df.set_index("split_name").loc[plot_order].reset_index()
+
+metrics_to_plot = ["f1_macro", "pr_auc_macro", "auc_macro"]
+
+for metric in metrics_to_plot:
+    plt.figure(figsize=(10, 4))
+    plt.bar(plot_df["split_name"], plot_df[metric])
+    plt.title(f"FedAvg K=20, R=100, E=3 | {metric}")
+    plt.ylabel(metric.replace("_", " ").title())
+    plt.xticks(rotation=30, ha="right")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+# %%
+# Compact interpretation helper
+
+compare_df = pd.read_csv(COMPARE_CSV)
+
+iid_ref = compare_df[compare_df["split"] == "iid"].iloc[0]
+
+print("=== FedAvg Multi-Split Comparison Summary ===")
+print(f"IID reference: F1_macro={iid_ref['f1_macro']:.4f} | PR-AUC_macro={iid_ref['pr_auc_macro']:.4f} | AUC_macro={iid_ref['auc_macro']:.4f}")
+print()
+
+for _, row in compare_df.sort_values("split_name").iterrows():
+    if row["split"] == "iid":
+        continue
+
+    print(f"{row['split_name']}")
+    print(
+        f"  F1 Macro      : {row['f1_macro']:.4f} "
+        f"(delta vs IID = {row['f1_macro'] - iid_ref['f1_macro']:+.4f})"
+    )
+    print(
+        f"  PR-AUC Macro  : {row['pr_auc_macro']:.4f} "
+        f"(delta vs IID = {row['pr_auc_macro'] - iid_ref['pr_auc_macro']:+.4f})"
+    )
+    print(
+        f"  AUC Macro     : {row['auc_macro']:.4f} "
+        f"(delta vs IID = {row['auc_macro'] - iid_ref['auc_macro']:+.4f})"
+    )
+    print(
+        f"  Params         : size_alpha={row['size_alpha']}, "
+        f"labels_per_client={row['labels_per_client']}, "
+        f"bias_strength={row['bias_strength']}, "
+        f"min_size_per_client={row['min_size_per_client']}"
+    )
+    print()
+
+# %% [markdown]
+# ### Actual Sweep
+
+# %%
+# =========================
+# Baseline FL Sensitivity Sweep (FULL)
+# =========================
+
+client_counts = [2, 3, 4, 8, 10, 12, 15, 20]
+
+# full run settings
+sweep_config = config.copy()
+sweep_config["rounds"] = 100
+sweep_config["epochs"] = 3
+
+# chosen non-IID severity for the paper baseline
+noniid_params = dict(
+    size_alpha=0.5,
+    labels_per_client=10,
+    bias_strength=0.85,
+    min_size_per_client=100
+)
+
+# best tuned method-specific hyperparameters from fixed baseline / attention setup
+BEST_BASELINE_PARAMS = {
+    "FedAvg": {
+        "lr": 0.002,
+        "mu": None,
+        "momentum": None,
+        "local_epochs": 3,
+    },
+    "FedProx": {
+        "lr": 0.002,
+        "mu": 0.001,
+        "momentum": None,
+        "local_epochs": 3,
+    },
+    "SCAFFOLD": {
+        "lr": 1.25,
+        "mu": None,
+        "momentum": 0.0,
+        "local_epochs": 3,
+    },
+}
+
+# methods to compare
+METHODS = [
+    dict(method="FedAvg",   algo="FedAvg"),
+    dict(method="FedProx",  algo="FedProx"),
+    dict(method="SCAFFOLD", algo="SCAFFOLD"),
+]
+
+BASELINE_TAG = "a05_l10_b085_min100_r100_e3"
+BASELINE_SENS_CSV  = os.path.join(
+    KD_DIRS["baseline_fl_sensitivity"],
+    f"baseline_sensitivity_results_{BASELINE_TAG}.csv"
+)
+BASELINE_SENS_JSON = os.path.join(
+    KD_DIRS["baseline_fl_sensitivity"],
+    f"baseline_sensitivity_results_{BASELINE_TAG}.json"
+)
+out_csv = BASELINE_SENS_CSV
+out_json = BASELINE_SENS_JSON
+
+# --- Resume / skip-completed support ---
+if os.path.exists(out_csv):
+    existing_df = pd.read_csv(out_csv)
+    all_rows = existing_df.to_dict(orient="records")
+    completed_keys = set(
+        zip(
+            existing_df["split"],
+            existing_df["method"],
+            existing_df["clients"]
+        )
+    )
+    print(f"Found existing baseline sensitivity results at {out_csv}")
+    print(f"Loaded {len(existing_df)} completed rows.")
+else:
+    all_rows = []
+    completed_keys = set()
+    print("No existing baseline sensitivity results found. Starting fresh.")
+
+for split_mode in ["iid", "noniid"]:
+    for m in METHODS:
+        method_params = BEST_BASELINE_PARAMS[m["algo"]]
+
+        for k in client_counts:
+            run_key = (split_mode, m["method"], k)
+
+            if run_key in completed_keys:
+                print(f"Skipping completed run: {split_mode} | {m['method']} | K={k}")
+                continue
+
+            print(f"\n=== {split_mode.upper()} | {m['method']} | K={k} ===")
+
+            trial_config = sweep_config.copy()
+            trial_config["lr"] = method_params["lr"]
+
+            try:
+                metrics, elapsed = run_fl_sensitivity_once(
+                    split_mode=split_mode,
+                    num_clients=k,
+                    local_epochs=method_params["local_epochs"],
+                    config=trial_config,
+                    train_dataset=train_dataset,
+                    val_loader=val_loader,
+                    test_loader=test_loader,
+                    device=device,
+                    seed=42,
+                    algo=m["algo"],
+                    mu=(method_params["mu"] if method_params["mu"] is not None else 0.0),
+                    momentum=(method_params["momentum"] if method_params["momentum"] is not None else 0.0),
+                    **(noniid_params if split_mode == "noniid" else {})
+                )
+
+                row = {
+                    "split": split_mode,
+                    "method": m["method"],
+                    "algo": m["algo"],
+                    "lr": method_params["lr"],
+                    "mu": method_params["mu"],
+                    "momentum": method_params["momentum"],
+                    "local_epochs": method_params["local_epochs"],
+                    "rounds": trial_config["rounds"],
+                    "clients": k,
+                    "auc_macro": metrics.get("auc_macro"),
+                    "auc_micro": metrics.get("auc_micro"),
+                    "f1_macro": metrics.get("f1_macro"),
+                    "f1_micro": metrics.get("f1_micro"),
+                    "pr_auc_macro": metrics.get("pr_auc_macro"),
+                    "pr_auc_micro": metrics.get("pr_auc_micro"),
+                    "best_f1_micro": metrics.get("best_f1_micro"),
+                    "best_thr": metrics.get("best_thr"),
+                    "time_sec": elapsed,
+                }
+
+                if split_mode == "noniid":
+                    row.update(noniid_params)
+
+                all_rows.append(row)
+                completed_keys.add(run_key)
+
+                save_dict_rows_to_csv(all_rows, out_csv)
+                save_json(
+                    {"rows": [to_serializable_row(r) for r in all_rows]},
+                    out_json
+                )
+
+                print(f"Saved result to {out_csv}")
+                print(f"Saved result to {out_json}")
+
+            except Exception as e:
+                print(f"FAILED: {split_mode} | {m['method']} | K={k}")
+                print(f"Reason: {e}")
+
+print(f"\nBaseline sweep finished. Results saved to:")
+print(f"  CSV : {out_csv}")
+print(f"  JSON: {out_json}")
+
+sens_all = pd.DataFrame(all_rows)
+display(sens_all)
+
+# %%
+# Load + table (primary metrics)
+
+out_csv = BASELINE_SENS_CSV
+sens_all = pd.read_csv(out_csv)
+print("Loaded:", out_csv, "rows=", len(sens_all))
+
+# Comparison table: primary metrics + method-specific hyperparameters
+table = sens_all[[
+    "split",
+    "method",
+    "clients",
+    "lr",
+    "mu",
+    "momentum",
+    "local_epochs",
+    "rounds",
+    "f1_macro",
+    "pr_auc_macro",
+    "auc_macro",
+    "time_sec"
+]].copy()
+
+display(table)
+
+# %%
+# Plotting
+
+# Pre-define visually distinct markers/linestyles (works for both color and B/W)
+MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">"]
+LINESTYLES = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 5)), (0, (1, 1))]
+
+def plot_metric_all_methods(df, split_mode: str, metric: str = "f1_macro", bw: bool = False):
+    d = df[df["split"] == split_mode].copy()
+
+    # consistent order in legend
+    methods = sorted(d["method"].unique())
+
+    plt.figure(figsize=(10, 5))
+
+    style_cycle = itertools.cycle([
+        (m, ls) for m in MARKERS for ls in LINESTYLES
+    ])
+
+    for method in methods:
+        g = d[d["method"] == method].sort_values("clients")
+        marker, ls = next(style_cycle)
+
+        if bw:
+            plt.plot(
+                g["clients"], g[metric],
+                color="black",
+                linestyle=ls,
+                marker=marker,
+                markersize=6,
+                linewidth=2,
+                label=method
+            )
+        else:
+            plt.plot(
+                g["clients"], g[metric],
+                linestyle=ls,
+                marker=marker,
+                markersize=6,
+                linewidth=2,
+                label=method
+            )
+
+    plt.xlabel("Number of Clients")
+    plt.ylabel(metric.replace("_", " ").title())
+    plt.title(f"{metric.replace('_', ' ').title()} vs #Clients ({split_mode.upper()})")
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=8, ncols=2, frameon=True)
+    plt.tight_layout()
+    plt.show()
+
+# Color
+plot_metric_all_methods(sens_all, "iid", metric="f1_macro", bw=False)
+plot_metric_all_methods(sens_all, "noniid", metric="f1_macro", bw=False)
+
+plot_metric_all_methods(sens_all, "iid", metric="pr_auc_macro", bw=False)
+plot_metric_all_methods(sens_all, "noniid", metric="pr_auc_macro", bw=False)
+
+# Black & White
+# plot_metric_all_methods(sens_all, "iid", metric="f1_macro", bw=True)
+# plot_metric_all_methods(sens_all, "noniid", metric="f1_macro", bw=True)
+
+# %%
+# IID vs non-IID delta tables (non-IID minus IID)
+
+out_csv = BASELINE_SENS_CSV
+sens_all = pd.read_csv(out_csv)
+print("Loaded:", out_csv, "rows=", len(sens_all))
+
+# Output paths
+DELTA_TAG = BASELINE_TAG
+DELTA_CSV = os.path.join(
+    KD_DIRS["baseline_fl_sensitivity"],
+    f"iid_vs_noniid_delta_{DELTA_TAG}.csv"
+)
+DELTA_JSON = os.path.join(
+    KD_DIRS["baseline_fl_sensitivity"],
+    f"iid_vs_noniid_delta_{DELTA_TAG}.json"
+)
+
+# Keep only columns we need
+delta_source = sens_all[[
+    "split",
+    "method",
+    "clients",
+    "f1_macro",
+    "f1_micro",
+    "pr_auc_macro",
+    "pr_auc_micro",
+    "auc_macro",
+    "auc_micro",
+    "time_sec"
+]].copy()
+
+# Split into IID and non-IID views
+iid_df = (
+    delta_source[delta_source["split"] == "iid"]
+    .drop(columns=["split"])
+    .rename(columns=lambda c: f"iid_{c}" if c not in ["method", "clients"] else c)
+)
+
+noniid_df = (
+    delta_source[delta_source["split"] == "noniid"]
+    .drop(columns=["split"])
+    .rename(columns=lambda c: f"noniid_{c}" if c not in ["method", "clients"] else c)
+)
+
+# Merge
+iid_vs_noniid_delta = iid_df.merge(
+    noniid_df,
+    on=["method", "clients"],
+    how="inner"
+)
+
+# Compute deltas
+for metric in ["f1_macro", "f1_micro", "pr_auc_macro", "pr_auc_micro", "auc_macro", "auc_micro", "time_sec"]:
+    iid_vs_noniid_delta[f"delta_{metric}"] = (
+        iid_vs_noniid_delta[f"noniid_{metric}"] -
+        iid_vs_noniid_delta[f"iid_{metric}"]
+    )
+
+iid_vs_noniid_delta = iid_vs_noniid_delta.sort_values(
+    by=["method", "clients"]
+).reset_index(drop=True)
+
+# Save results
+save_dict_rows_to_csv(
+    iid_vs_noniid_delta.to_dict(orient="records"),
+    DELTA_CSV
+)
+save_json(
+    {"rows": [to_serializable_row(r) for r in iid_vs_noniid_delta.to_dict(orient="records")]},
+    DELTA_JSON
+)
+
+print("\nSaved delta table:")
+print("  CSV :", DELTA_CSV)
+print("  JSON:", DELTA_JSON)
+
+# =========================
+# DISPLAY TABLE
+# =========================
+
+print("\n" + "="*80)
+print("IID vs NON-IID DELTA TABLE (non-IID - IID)")
+print("="*80)
+
+display(iid_vs_noniid_delta[[
+    "method", "clients",
+    "iid_f1_macro", "noniid_f1_macro", "delta_f1_macro",
+    "iid_pr_auc_macro", "noniid_pr_auc_macro", "delta_pr_auc_macro",
+    "iid_auc_macro", "noniid_auc_macro", "delta_auc_macro",
+]])
+
+# =========================
+# METHOD-LEVEL SUMMARY
+# =========================
+
+delta_summary = (
+    iid_vs_noniid_delta.groupby("method", as_index=False)[[
+        "delta_f1_macro",
+        "delta_pr_auc_macro",
+        "delta_auc_macro",
+        "delta_time_sec",
+    ]]
+    .mean()
+    .sort_values(by="delta_f1_macro")
+    .reset_index(drop=True)
+)
+
+print("\n" + "="*80)
+print("MEAN NON-IID PENALTY (averaged across clients)")
+print("="*80)
+
+display(delta_summary)
+
+# =========================
+# INTERPRETATION PRINTS
+# =========================
+
+print("\n" + "="*80)
+print("INTERPRETATION SUMMARY")
+print("="*80)
+
+for _, row in delta_summary.iterrows():
+    method = row["method"]
+    print(f"\n{method}:")
+    print(f"  Δ F1 Macro      : {row['delta_f1_macro']:.4f}")
+    print(f"  Δ PR-AUC Macro  : {row['delta_pr_auc_macro']:.4f}")
+    print(f"  Δ AUC Macro     : {row['delta_auc_macro']:.4f}")
+    print(f"  Δ Time (sec)    : {row['delta_time_sec']:.2f}")
+
+# =========================
+# WHERE IS GAP LARGEST?
+# =========================
+
+max_gap_rows = iid_vs_noniid_delta.loc[
+    iid_vs_noniid_delta.groupby("method")["delta_f1_macro"].idxmin()
+]
+
+print("\n" + "="*80)
+print("LARGEST PERFORMANCE DROP (per method)")
+print("="*80)
+
+display(max_gap_rows[[
+    "method",
+    "clients",
+    "delta_f1_macro",
+    "delta_pr_auc_macro",
+    "delta_auc_macro"
+]])
+
+# =========================
+# PIVOTS (paper-friendly)
+# =========================
+
+pivot_delta_f1 = iid_vs_noniid_delta.pivot_table(
+    index="clients",
+    columns="method",
+    values="delta_f1_macro"
+)
+
+pivot_delta_pr = iid_vs_noniid_delta.pivot_table(
+    index="clients",
+    columns="method",
+    values="delta_pr_auc_macro"
+)
+
+print("\n=== Pivot: Δ F1 Macro ===")
+display(pivot_delta_f1)
+
+print("\n=== Pivot: Δ PR-AUC Macro ===")
+display(pivot_delta_pr)
 
 # %% [markdown]
 # ## Knowledge Distillation Extensions (Option 1 and Option 3)
