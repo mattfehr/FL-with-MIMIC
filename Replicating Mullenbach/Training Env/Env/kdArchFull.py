@@ -68,7 +68,7 @@ print(f"Using device: {device}")
 
 
 # %%
-# Output directory structure for KD Arch notebook
+# Output directory structure for KD heterogeneous notebook
 
 FOUNDATION_HISTORY_DIR = os.path.join("..", "History", "KD_Heterogeneous")
 os.makedirs(FOUNDATION_HISTORY_DIR, exist_ok=True)
@@ -81,8 +81,6 @@ FOUNDATION_DIRS = {
     "baseline_reference": ensure_dir(os.path.join(FOUNDATION_HISTORY_DIR, "baseline_reference")),
     "split_diagnostics": ensure_dir(os.path.join(FOUNDATION_HISTORY_DIR, "split_diagnostics")),
     "heterogeneous_kd": ensure_dir(os.path.join(FOUNDATION_HISTORY_DIR, "heterogeneous_kd")),
-    "server_distill_ablations": ensure_dir(os.path.join(FOUNDATION_HISTORY_DIR, "server_distill_ablations")),
-    "final_sweeps": ensure_dir(os.path.join(FOUNDATION_HISTORY_DIR, "final_sweeps")),
 }
 
 # %%
@@ -1393,7 +1391,7 @@ def compare_split_candidates(
 # %%
 # KD output paths for the heterogeneous-model section
 
-HET_KD_DIR = ensure_dir(os.path.join(FOUNDATION_HISTORY_DIR, "heterogeneous_kd"))
+HET_KD_DIR = FOUNDATION_DIRS["heterogeneous_kd"]
 HET_KD_SWEEPS_DIR = ensure_dir(os.path.join(HET_KD_DIR, "sweeps"))
 HET_KD_TUNING_DIR = ensure_dir(os.path.join(HET_KD_DIR, "tuning"))
 HET_KD_FINAL_DIR = ensure_dir(os.path.join(HET_KD_DIR, "final"))
@@ -1407,8 +1405,14 @@ KD_HET_PHASE1_JSON = os.path.join(HET_KD_TUNING_DIR, "opt3_heterogeneous_phase1_
 KD_HET_PHASE2_CSV  = os.path.join(HET_KD_TUNING_DIR, "opt3_heterogeneous_phase2_server_distill.csv")
 KD_HET_PHASE2_JSON = os.path.join(HET_KD_TUNING_DIR, "opt3_heterogeneous_phase2_server_distill.json")
 
-KD_HET_FINAL_CSV  = os.path.join(HET_KD_FINAL_DIR, "opt3_heterogeneous_final.csv")
-KD_HET_FINAL_JSON = os.path.join(HET_KD_FINAL_DIR, "opt3_heterogeneous_final.json")
+KD_HET_FINAL_NONIID_CSV  = os.path.join(HET_KD_FINAL_DIR, "opt3_strong_heterogeneous_final_noniid.csv")
+KD_HET_FINAL_NONIID_JSON = os.path.join(HET_KD_FINAL_DIR, "opt3_strong_heterogeneous_final_noniid.json")
+
+KD_HET_FINAL_IID_CSV  = os.path.join(HET_KD_FINAL_DIR, "opt3_strong_heterogeneous_final_iid.csv")
+KD_HET_FINAL_IID_JSON = os.path.join(HET_KD_FINAL_DIR, "opt3_strong_heterogeneous_final_iid.json")
+
+KD_HET_FINAL_COMBINED_CSV  = os.path.join(HET_KD_FINAL_DIR, "opt3_strong_heterogeneous_final_combined.csv")
+KD_HET_FINAL_COMBINED_JSON = os.path.join(HET_KD_FINAL_DIR, "opt3_strong_heterogeneous_final_combined.json")
 
 print("KD output files initialized.")
 
@@ -2200,8 +2204,7 @@ smoke_kwargs = dict(
 print("Smoke-test config ready.")
 
 # %%
-# %%
-# Uncomment any subset of these to run a quick sanity check.
+# # Uncomment any subset of these to run a quick sanity check.
 
 # smoke_results = {}
 
@@ -2348,8 +2351,7 @@ else:
     print("No existing heterogeneous KD sweep results found. Starting fresh.")
 
 # %%
-# %%
-# Uncomment to run the heterogeneous teacher sweep.
+# # Uncomment to run the heterogeneous teacher sweep.
 
 # for split_mode in ["iid", "noniid"]:
 #     for m in HETERO_KD_METHODS:
@@ -2503,6 +2505,9 @@ print("=== Pivot: PR-AUC Macro ===")
 display(hetero_pivot_pr)
 
 # %%
+MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">"]
+LINESTYLES = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 5)), (0, (1, 1))]
+
 def plot_hetero_metric(df, split_mode: str, metric: str = "f1_macro", bw: bool = False):
     d = df[df["split"] == split_mode].copy()
     methods = sorted(d["method_name"].unique())
@@ -2671,7 +2676,7 @@ else:
     print("No existing Phase 1 results found. Starting fresh.")
 
 # %%
-# Uncomment to run Phase 1 tuning.
+# # Uncomment to run Phase 1 tuning.
 
 # for k in phase1_client_counts:
 #     for alpha in phase1_alpha_grid:
@@ -2856,13 +2861,25 @@ plot_phase1_metric(phase1_df, clients_value=3, metric="f1_macro")
 plot_phase1_metric(phase1_df, clients_value=10, metric="f1_macro")
 
 # %% [markdown]
-# ### Phase 2: Server Distillation Tuning on Top of Best Phase 1 Setting
+# ### Phase 2: Server Distillation Tuning on Top of Overridden Phase 1 Setting
 # 
-# Using the best strong-heterogeneous Option 3 setting from Phase 1, tune:
-# - `server_distill_steps`
-# - `server_distill_lr`
+# We manually override the Phase 1 choice here to emphasize the stronger /
+# more realistic fragmentation setting. Instead of using the mean-best setting
+# across K=3 and K=10, we use:
+# - kd_alpha = 0.7
+# - kd_temperature = 1.0
+# 
+# This matches the stronger K=10 result and keeps Phase 2 focused on the
+# heterogeneous-hospital setting we care about most.
 
 # %%
+# Manual override from Phase 1 before Phase 2
+
+best_phase1_alpha = 0.7
+best_phase1_temp = 1.0
+
+print(f"Phase 2 override: kd_alpha={best_phase1_alpha}, kd_temperature={best_phase1_temp}")
+
 phase2_client_counts = [3, 10]
 
 phase2_steps_grid = [5, 10, 20]
@@ -2903,7 +2920,7 @@ else:
     print("No existing Phase 2 results found. Starting fresh.")
 
 # %%
-# Uncomment to run Phase 2 tuning.
+# # Uncomment to run Phase 2 tuning.
 
 # for k in phase2_client_counts:
 #     for sd_steps in phase2_steps_grid:
@@ -3044,16 +3061,41 @@ phase2_best_per_k = (
 display(phase2_best_per_k)
 
 # %%
-phase1_best_compare = phase1_best_per_k[[
+# Use the manual override values for the Phase 1 comparison table as well
+
+phase1_best_compare = pd.DataFrame([
+    {
+        "clients": 3,
+        "kd_alpha": best_phase1_alpha,
+        "kd_temperature": best_phase1_temp,
+        "variant": "Opt3_StrongHeterogeneous_Best_Phase1_Override"
+    },
+    {
+        "clients": 10,
+        "kd_alpha": best_phase1_alpha,
+        "kd_temperature": best_phase1_temp,
+        "variant": "Opt3_StrongHeterogeneous_Best_Phase1_Override"
+    }
+])
+
+# attach the actual Phase 1 metrics for the overridden setting if present
+phase1_override_rows = phase1_df[
+    (phase1_df["kd_alpha"] == best_phase1_alpha) &
+    (phase1_df["kd_temperature"] == best_phase1_temp) &
+    (phase1_df["clients"].isin([3, 10]))
+][[
     "clients",
-    "kd_alpha",
-    "kd_temperature",
     "f1_macro",
     "pr_auc_macro",
     "auc_macro",
     "time_sec"
 ]].copy()
-phase1_best_compare["variant"] = "Opt3_StrongHeterogeneous_Best_Phase1"
+
+phase1_best_compare = phase1_best_compare.merge(
+    phase1_override_rows,
+    on="clients",
+    how="left"
+)
 
 phase2_best_compare = phase2_best_per_k[[
     "clients",
@@ -3099,8 +3141,8 @@ plot_phase2_metric(phase2_df, clients_value=10, metric="f1_macro")
 # %%
 final_compare = []
 
-for k in sorted(set(phase1_best_per_k["clients"]).intersection(set(phase2_best_per_k["clients"]))):
-    p1 = phase1_best_per_k[phase1_best_per_k["clients"] == k].iloc[0]
+for k in sorted(set(phase1_best_compare["clients"]).intersection(set(phase2_best_per_k["clients"]))):
+    p1 = phase1_best_compare[phase1_best_compare["clients"] == k].iloc[0]
     p2 = phase2_best_per_k[phase2_best_per_k["clients"] == k].iloc[0]
 
     final_compare.append({
@@ -3238,7 +3280,7 @@ else:
     print("No existing final non-IID results found. Starting fresh.")
 
 # %%
-# Uncomment to run the final non-IID sweep.
+# # Uncomment to run the final non-IID sweep.
 
 # for m in FINAL_HET_METHODS:
 #     for k in final_client_counts:
@@ -3372,93 +3414,93 @@ else:
 # %%
 # Uncomment to run the final IID sweep.
 
-# for m in FINAL_HET_METHODS:
-#     for k in final_client_counts:
-#         run_key = (m["method_name"], k)
+for m in FINAL_HET_METHODS:
+    for k in final_client_counts:
+        run_key = (m["method_name"], k)
 
-#         if run_key in final_iid_completed:
-#             print(f"Skipping completed run: {m['method_name']} | K={k}")
-#             continue
+        if run_key in final_iid_completed:
+            print(f"Skipping completed run: {m['method_name']} | K={k}")
+            continue
 
-#         print("\n" + "=" * 100)
-#         print(f"FINAL IID | {m['method_name']} | K={k}")
-#         print("=" * 100)
+        print("\n" + "=" * 100)
+        print(f"FINAL IID | {m['method_name']} | K={k}")
+        print("=" * 100)
 
-#         try:
-#             metrics, elapsed = run_fl_kd_once(
-#                 split_mode="iid",
-#                 num_clients=k,
-#                 local_epochs=final_local_epochs,
-#                 config=final_config,
-#                 kd_config=final_opt3_kd_config,
-#                 train_dataset=train_dataset,
-#                 val_loader=val_loader,
-#                 test_loader=test_loader,
-#                 device=device,
-#                 seed=42,
-#                 method=m["method"],
-#                 base_algo=m["base_algo"],
-#                 mu=m["mu"],
-#                 server_distill=m["server_distill"]
-#             )
+        try:
+            metrics, elapsed = run_fl_kd_once(
+                split_mode="iid",
+                num_clients=k,
+                local_epochs=final_local_epochs,
+                config=final_config,
+                kd_config=final_opt3_kd_config,
+                train_dataset=train_dataset,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                device=device,
+                seed=42,
+                method=m["method"],
+                base_algo=m["base_algo"],
+                mu=m["mu"],
+                server_distill=m["server_distill"]
+            )
 
-#             row = {
-#                 "split": "iid",
-#                 "clients": k,
+            row = {
+                "split": "iid",
+                "clients": k,
 
-#                 "method_name": m["method_name"],
-#                 "method": m["method"],
-#                 "base_algo": m["base_algo"],
-#                 "mu": m["mu"],
-#                 "server_distill": m["server_distill"],
+                "method_name": m["method_name"],
+                "method": m["method"],
+                "base_algo": m["base_algo"],
+                "mu": m["mu"],
+                "server_distill": m["server_distill"],
 
-#                 "local_epochs": final_local_epochs,
-#                 "rounds": final_config["rounds"],
+                "local_epochs": final_local_epochs,
+                "rounds": final_config["rounds"],
 
-#                 "kd_alpha": final_opt3_kd_config["kd_alpha"],
-#                 "kd_temperature": final_opt3_kd_config["kd_temperature"],
-#                 "teacher_pool_name": final_opt3_kd_config["teacher_pool_name"],
-#                 "teacher_assignment": final_opt3_kd_config.get("teacher_assignment", None),
-#                 "teacher_steps_per_batch": final_opt3_kd_config.get("teacher_steps_per_batch", None),
-#                 "server_distill_steps": (
-#                     final_opt3_kd_config["server_distill_steps"] if m["server_distill"] else None
-#                 ),
-#                 "server_distill_lr": (
-#                     final_opt3_kd_config["server_distill_lr"] if m["server_distill"] else None
-#                 ),
+                "kd_alpha": final_opt3_kd_config["kd_alpha"],
+                "kd_temperature": final_opt3_kd_config["kd_temperature"],
+                "teacher_pool_name": final_opt3_kd_config["teacher_pool_name"],
+                "teacher_assignment": final_opt3_kd_config.get("teacher_assignment", None),
+                "teacher_steps_per_batch": final_opt3_kd_config.get("teacher_steps_per_batch", None),
+                "server_distill_steps": (
+                    final_opt3_kd_config["server_distill_steps"] if m["server_distill"] else None
+                ),
+                "server_distill_lr": (
+                    final_opt3_kd_config["server_distill_lr"] if m["server_distill"] else None
+                ),
 
-#                 "f1_macro": metrics.get("f1_macro"),
-#                 "f1_micro": metrics.get("f1_micro"),
-#                 "pr_auc_macro": metrics.get("pr_auc_macro"),
-#                 "pr_auc_micro": metrics.get("pr_auc_micro"),
-#                 "auc_macro": metrics.get("auc_macro"),
-#                 "auc_micro": metrics.get("auc_micro"),
-#                 "best_f1_micro": metrics.get("best_f1_micro"),
-#                 "best_thr": metrics.get("best_thr"),
+                "f1_macro": metrics.get("f1_macro"),
+                "f1_micro": metrics.get("f1_micro"),
+                "pr_auc_macro": metrics.get("pr_auc_macro"),
+                "pr_auc_micro": metrics.get("pr_auc_micro"),
+                "auc_macro": metrics.get("auc_macro"),
+                "auc_micro": metrics.get("auc_micro"),
+                "best_f1_micro": metrics.get("best_f1_micro"),
+                "best_thr": metrics.get("best_thr"),
 
-#                 "student_param_count": metrics.get("student_param_count"),
-#                 "teacher_param_count_mean": metrics.get("teacher_param_count_mean"),
-#                 "teacher_param_count_min": metrics.get("teacher_param_count_min"),
-#                 "teacher_param_count_max": metrics.get("teacher_param_count_max"),
+                "student_param_count": metrics.get("student_param_count"),
+                "teacher_param_count_mean": metrics.get("teacher_param_count_mean"),
+                "teacher_param_count_min": metrics.get("teacher_param_count_min"),
+                "teacher_param_count_max": metrics.get("teacher_param_count_max"),
 
-#                 "time_sec": elapsed,
-#             }
+                "time_sec": elapsed,
+            }
 
-#             final_iid_rows.append(row)
-#             final_iid_completed.add(run_key)
+            final_iid_rows.append(row)
+            final_iid_completed.add(run_key)
 
-#             save_dict_rows_to_csv(final_iid_rows, KD_HET_FINAL_IID_CSV)
-#             save_json(
-#                 {"rows": [to_serializable_row(r) for r in final_iid_rows]},
-#                 KD_HET_FINAL_IID_JSON
-#             )
+            save_dict_rows_to_csv(final_iid_rows, KD_HET_FINAL_IID_CSV)
+            save_json(
+                {"rows": [to_serializable_row(r) for r in final_iid_rows]},
+                KD_HET_FINAL_IID_JSON
+            )
 
-#             print(f"Saved result to {KD_HET_FINAL_IID_CSV}")
-#             print(f"Saved result to {KD_HET_FINAL_IID_JSON}")
+            print(f"Saved result to {KD_HET_FINAL_IID_CSV}")
+            print(f"Saved result to {KD_HET_FINAL_IID_JSON}")
 
-#         except Exception as e:
-#             print(f"FAILED: {m['method_name']} | K={k}")
-#             print(f"Reason: {e}")
+        except Exception as e:
+            print(f"FAILED: {m['method_name']} | K={k}")
+            print(f"Reason: {e}")
 
 # %%
 final_opt3_iid_df = pd.read_csv(KD_HET_FINAL_IID_CSV)
