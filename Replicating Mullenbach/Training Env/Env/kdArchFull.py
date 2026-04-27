@@ -3389,6 +3389,82 @@ final_opt3_noniid_pivot = final_opt3_noniid_df.pivot_table(
 )
 display(final_opt3_noniid_pivot)
 
+# %%
+# ## Final Presentation Plots: System Heterogeneity on Non-IID Data
+# 
+# This cell plots the Non-IID results with presentation-ready 
+# labels, highlighting the architectural flexibility of Option 3 compared to the 
+# rigid FedAvg baseline.
+
+def plot_final_noniid_presentation(df, metric="f1_macro"):
+    # Target methods from the final sweep
+    methods = [
+        "Baseline_FedAvg",
+        "Opt3_StrongHeterogeneous_Tuned",
+        "Opt3_StrongHeterogeneous_Tuned_SD"
+    ]
+    
+    # Presentation-friendly labels mapping
+    clean_labels = {
+        "Baseline_FedAvg": "Baseline FedAvg",
+        "Opt3_StrongHeterogeneous_Tuned": "Flexible KD (Local Heterogeneity)",
+        "Opt3_StrongHeterogeneous_Tuned_SD": "Flexible KD + Server Distillation"
+    }
+    
+    # Distinguishable colors and markers for the Expo
+    colors = {
+        "Baseline_FedAvg": "#d62728",  # Red (Standard)
+        "Opt3_StrongHeterogeneous_Tuned": "#1f77b4",  # Blue (Ours)
+        "Opt3_StrongHeterogeneous_Tuned_SD": "#2ca02c"   # Green (Ours + SD)
+    }
+              
+    markers = {
+        "Baseline_FedAvg": "s", 
+        "Opt3_StrongHeterogeneous_Tuned": "o", 
+        "Opt3_StrongHeterogeneous_Tuned_SD": "^"
+    }
+
+    plt.figure(figsize=(10, 6))
+
+    for method in methods:
+        g = df[df["method_name"] == method].sort_values("clients")
+        
+        # Safely skip if a method hasn't been run yet
+        if len(g) == 0:
+            continue
+            
+        plt.plot(
+            g["clients"],
+            g[metric],
+            marker=markers.get(method, "o"),
+            color=colors.get(method, "#000000"),
+            linewidth=2.5,
+            markersize=8,
+            label=clean_labels.get(method, method)
+        )
+
+    # Styling for maximum readability on a poster/slides
+    plt.xlabel("Number of Hospital Clients", fontsize=12, fontweight='bold')
+    plt.ylabel(metric.replace("_", " ").title(), fontsize=12, fontweight='bold')
+    plt.title(f"Performance under System Heterogeneity (Non-IID)\nBaseline FedAvg vs. Flexible KD Architecture", fontsize=14)
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    # Ensure x-ticks align with the actual client counts tested
+    valid_clients = sorted(df['clients'].unique())
+    plt.xticks(valid_clients)
+    
+    plt.legend(fontsize=11, frameon=True, shadow=True)
+    plt.tight_layout()
+    plt.show()
+
+# 1. Plot the F1 Macro (Primary Metric)
+print("Generating Final Non-IID Plot for F1 Macro...")
+plot_final_noniid_presentation(final_opt3_noniid_df, metric="f1_macro")
+
+# 2. Plot the PR-AUC Macro (Secondary Metric)
+print("Generating Final Non-IID Plot for PR-AUC Macro...")
+plot_final_noniid_presentation(final_opt3_noniid_df, metric="pr_auc_macro")
+
 # %% [markdown]
 # ### Final IID Sweep
 
