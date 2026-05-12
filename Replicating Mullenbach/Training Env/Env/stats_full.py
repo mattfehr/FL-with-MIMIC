@@ -12058,6 +12058,339 @@ else:
 # Figure captions should state:
 # Error bars show 95% confidence intervals across random seeds.
 
+# %%
+PAPER_FIGURE_DIR = ensure_dir(os.path.join(FIGURES_DIR, "paper_ready"))
+
+PAPER_FIGURE_PATHS = {
+    "predictive_f1_macro": os.path.join(PAPER_FIGURE_DIR, "fig_predictive_f1_macro_ci.png"),
+    "predictive_pr_auc_macro": os.path.join(PAPER_FIGURE_DIR, "fig_predictive_pr_auc_macro_ci.png"),
+    "kd_f1_macro": os.path.join(PAPER_FIGURE_DIR, "fig_kd_f1_macro_ci.png"),
+    "attention_similarity": os.path.join(PAPER_FIGURE_DIR, "fig_attention_similarity_ci.png"),
+    "reliability_fp_bins": os.path.join(PAPER_FIGURE_DIR, "fig_reliability_fp_by_agreement_bin.png"),
+}
+
+print("Paper-ready figure directory:", PAPER_FIGURE_DIR)
+for name, path in PAPER_FIGURE_PATHS.items():
+    print(f"  {name}: {path}")
+
+# %% [markdown]
+# ### 18.1 Figure helper functions
+
+# %%
+def _load_df_from_var_or_csv(var_name: str, csv_path: Optional[str] = None) -> pd.DataFrame:
+    """
+    Use an in-memory DataFrame if it exists; otherwise try loading from CSV.
+    """
+    obj = globals().get(var_name, None)
+
+    if isinstance(obj, pd.DataFrame):
+        return obj.copy()
+
+    if csv_path is not None and os.path.exists(csv_path):
+        return pd.read_csv(csv_path)
+
+    return pd.DataFrame()
+
+
+def _extract_metric_summary_for_plot(
+    summary_long_df: pd.DataFrame,
+    metric: str,
+    group_cols: List[str],
+) -> pd.DataFrame:
+    """
+    Extract mean and CI bounds for a metric from a long summary table.
+    """
+    if summary_long_df.empty:
+        return pd.DataFrame()
+
+    needed = set(group_cols + ["metric", "mean", "ci_low", "ci_high"])
+    missing = needed - set(summary_long_df.columns)
+
+    if missing:
+        print(f"[plot helper] Missing columns for metric={metric}: {missing}")
+        return pd.DataFrame()
+
+    out = summary_long_df[summary_long_df["metric"] == metric].copy()
+
+    for col in ["mean", "ci_low", "ci_high"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out = out.dropna(subset=["mean", "ci_low", "ci_high"])
+
+    return out
+
+
+def plot_metric_ci_bar(
+    df: pd.DataFrame,
+    label_col: str,
+    metric_name: str,
+    title: str,
+    ylabel: str,
+    output_path: str,
+    order: Optional[List[str]] = None,
+    figsize: Tuple[float, float] = (10, 5),
+    rotate_xticks: int = 30,
+) -> Optional[str]:
+    """
+    Plot mean with 95% CI error bars.
+    """
+    if df.empty:
+        print(f"[skip figure] No data for {title}")
+        return None
+
+    plot_df = df.copy()
+
+    if order is not None:
+        plot_df["_order"] = plot_df[label_col].apply(
+            lambda x: order.index(x) if x in order else 999
+        )
+        plot_df = plot_df.sort_values(["_order", label_col]).drop(columns=["_order"])
+    else:
+        plot_df = plot_df.sort_values(label_col)
+
+    labels = plot_df[label_col].astype(str).tolist()
+    means = plot_df["mean"].astype(float).to_numpy()
+    lower = means - plot_df["ci_low"].astype(float).to_numpy()
+    upper = plot_df["ci_high"].astype(float).to_numpy() - means
+
+    x = np.arange(len(labels))
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.bar(x, means)
+    ax.errorbar(
+        x,
+        means,
+        yerr=np.vstack([lower, upper]),
+        fmt="none",
+        capsize=5,
+        linewidth=1.5,
+    )
+
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel("")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=rotate_xticks, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+
+    caption = "Error bars show 95% confidence intervals across random seeds."
+    fig.text(0.5, -0.02, caption, ha="center", fontsize=9)
+
+    fig.tight_layout()
+    ensure_dir(os.path.dirname(output_path))
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.show()
+
+    print("Saved figure:", output_path)
+    return output_path
+
+# %% [markdown]
+# ### 18.2 Predictive performance figures
+# 
+
+# %%
+predictive_summary_for_figures_df = _load_df_from_var_or_csv(
+    "predictive_summary_long_df",
+    globals().get("PREDICTIVE_SUMMARY_LONG_CSV", None),
+)
+
+paper_method_order = [
+    "Centralized",
+    "FedAvg",
+    "FedProx",
+    "SCAFFOLD",
+    "KD_Baseline_FedAvg",
+    "KD_StrongHeterogeneous",
+    "KD_StrongHeterogeneous_SD",
+]
+
+# Main Macro-F1 figure.
+f1_macro_fig_df = _extract_metric_summary_for_plot(
+    summary_long_df=predictive_summary_for_figures_df,
+    metric="f1_macro",
+    group_cols=["experiment_group", "method"],
+)
+
+if not f1_macro_fig_df.empty:
+    f1_macro_fig_df = f1_macro_fig_df[
+        f1_macro_fig_df["experiment_group"].isin(["main_table", "kd_main"])
+    ].copy()
+
+plot_metric_ci_bar(
+    df=f1_macro_fig_df,
+    label_col="method",
+    metric_name="f1_macro",
+    title="Macro-F1 across methods",
+    ylabel="Macro-F1",
+    output_path=PAPER_FIGURE_PATHS["predictive_f1_macro"],
+    order=paper_method_order,
+)
+
+# PR-AUC Macro figure.
+pr_auc_macro_fig_df = _extract_metric_summary_for_plot(
+    summary_long_df=predictive_summary_for_figures_df,
+    metric="pr_auc_macro",
+    group_cols=["experiment_group", "method"],
+)
+
+if not pr_auc_macro_fig_df.empty:
+    pr_auc_macro_fig_df = pr_auc_macro_fig_df[
+        pr_auc_macro_fig_df["experiment_group"].isin(["main_table", "kd_main"])
+    ].copy()
+
+plot_metric_ci_bar(
+    df=pr_auc_macro_fig_df,
+    label_col="method",
+    metric_name="pr_auc_macro",
+    title="Macro PR-AUC across methods",
+    ylabel="Macro PR-AUC",
+    output_path=PAPER_FIGURE_PATHS["predictive_pr_auc_macro"],
+    order=paper_method_order,
+)
+
+# %% [markdown]
+# ### 18.3 KD-focused figure
+
+# %%
+kd_f1_fig_df = _extract_metric_summary_for_plot(
+    summary_long_df=predictive_summary_for_figures_df,
+    metric="f1_macro",
+    group_cols=["experiment_group", "method"],
+)
+
+if not kd_f1_fig_df.empty:
+    kd_f1_fig_df = kd_f1_fig_df[
+        kd_f1_fig_df["method"].isin([
+            "KD_Baseline_FedAvg",
+            "KD_StrongHeterogeneous",
+            "KD_StrongHeterogeneous_SD",
+        ])
+    ].copy()
+
+plot_metric_ci_bar(
+    df=kd_f1_fig_df,
+    label_col="method",
+    metric_name="f1_macro",
+    title="KD method Macro-F1 comparison",
+    ylabel="Macro-F1",
+    output_path=PAPER_FIGURE_PATHS["kd_f1_macro"],
+    order=[
+        "KD_Baseline_FedAvg",
+        "KD_StrongHeterogeneous",
+        "KD_StrongHeterogeneous_SD",
+    ],
+)
+
+# %% [markdown]
+# ### 18.4 Attention/rationale agreement figure
+
+# %%
+attention_summary_for_figures_df = _load_df_from_var_or_csv(
+    "attention_summary_long_df",
+    globals().get("ATTENTION_SUMMARY_LONG_CSV", None),
+)
+
+attention_fig_df = _extract_metric_summary_for_plot(
+    summary_long_df=attention_summary_for_figures_df,
+    metric="token_cosine",
+    group_cols=["pair", "mode"],
+)
+
+plot_metric_ci_bar(
+    df=attention_fig_df,
+    label_col="pair",
+    metric_name="token_cosine",
+    title="Token-level rationale agreement",
+    ylabel="Token cosine similarity",
+    output_path=PAPER_FIGURE_PATHS["attention_similarity"],
+    order=None,
+    figsize=(11, 5),
+)
+
+# %% [markdown]
+# ### 18.5 Reliability figure: false-positive rate by agreement bin
+
+# %%
+reliability_bins_for_figures_df = _load_df_from_var_or_csv(
+    "reliability_bins_summary_df",
+    globals().get("RELIABILITY_BIN_SUMMARY_CSV", None),
+)
+
+def plot_reliability_fp_bins(
+    df: pd.DataFrame,
+    output_path: str,
+    agreement_metric: str = "min_agreement",
+) -> Optional[str]:
+    """
+    Plot false-positive rate by attention-agreement quantile bin.
+    """
+    if df.empty:
+        print("[skip figure] No reliability bin summary available.")
+        return None
+
+    plot_df = df.copy()
+
+    if "agreement_metric" in plot_df.columns:
+        plot_df = plot_df[plot_df["agreement_metric"] == agreement_metric].copy()
+
+    if "metric" in plot_df.columns:
+        plot_df = plot_df[plot_df["metric"] == "fp_rate"].copy()
+
+    required = {"agreement_bin", "mean", "ci_low", "ci_high"}
+    missing = required - set(plot_df.columns)
+
+    if missing:
+        print(f"[skip figure] Reliability bin summary missing columns: {missing}")
+        return None
+
+    for col in ["agreement_bin", "mean", "ci_low", "ci_high"]:
+        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+
+    plot_df = plot_df.dropna(subset=["agreement_bin", "mean", "ci_low", "ci_high"])
+    plot_df = plot_df.sort_values("agreement_bin")
+
+    if plot_df.empty:
+        print("[skip figure] No reliability bin rows after filtering.")
+        return None
+
+    x = plot_df["agreement_bin"].astype(int).to_numpy()
+    y = plot_df["mean"].astype(float).to_numpy()
+    lower = y - plot_df["ci_low"].astype(float).to_numpy()
+    upper = plot_df["ci_high"].astype(float).to_numpy() - y
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.errorbar(
+        x,
+        y,
+        yerr=np.vstack([lower, upper]),
+        marker="o",
+        capsize=5,
+        linewidth=1.5,
+    )
+
+    ax.set_title("False-positive rate by attention-agreement quantile")
+    ax.set_xlabel("Agreement quantile bin")
+    ax.set_ylabel("False-positive rate")
+    ax.grid(alpha=0.3)
+
+    caption = "Error bars show 95% confidence intervals across random seeds."
+    fig.text(0.5, -0.02, caption, ha="center", fontsize=9)
+
+    fig.tight_layout()
+    ensure_dir(os.path.dirname(output_path))
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.show()
+
+    print("Saved figure:", output_path)
+    return output_path
+
+
+plot_reliability_fp_bins(
+    df=reliability_bins_for_figures_df,
+    output_path=PAPER_FIGURE_PATHS["reliability_fp_bins"],
+    agreement_metric="min_agreement",
+)
+
 # %% [markdown]
 # ## 19. Paper-Ready Tables
 # 
@@ -12070,6 +12403,207 @@ else:
 # - Reliability correlation results
 # 
 # Tables should be saved as CSV and optionally printed in LaTeX format.
+
+# %%
+PAPER_TABLE_DIR = ensure_dir(os.path.join(TABLES_DIR, "paper_ready"))
+
+PAPER_TABLE_PATHS = {
+    "predictive_main": os.path.join(PAPER_TABLE_DIR, "paper_table_predictive_main.csv"),
+    "predictive_pairwise": os.path.join(PAPER_TABLE_DIR, "paper_table_predictive_pairwise.csv"),
+    "attention_alignment": os.path.join(PAPER_TABLE_DIR, "paper_table_attention_alignment.csv"),
+    "attention_pairwise": os.path.join(PAPER_TABLE_DIR, "paper_table_attention_pairwise.csv"),
+    "reliability_correlations": os.path.join(PAPER_TABLE_DIR, "paper_table_reliability_correlations.csv"),
+    "reliability_fp_bins": os.path.join(PAPER_TABLE_DIR, "paper_table_reliability_fp_bins.csv"),
+}
+
+print("Paper-ready table directory:", PAPER_TABLE_DIR)
+for name, path in PAPER_TABLE_PATHS.items():
+    print(f"  {name}: {path}")
+
+# %% [markdown]
+# ### 19.1 Table export helpers
+
+# %%
+def save_paper_table(
+    df: pd.DataFrame,
+    path: str,
+    title: str,
+    latex_preview: bool = True,
+    max_preview_rows: int = 80,
+) -> pd.DataFrame:
+    """
+    Save one paper table and optionally print a LaTeX preview.
+    """
+    if df is None or df.empty:
+        print(f"[skip table] {title}: no rows available.")
+        return pd.DataFrame()
+
+    ensure_dir(os.path.dirname(path))
+    df.to_csv(path, index=False)
+
+    print(f"Saved {title}:")
+    print("  ", path)
+
+    display(df.head(max_preview_rows))
+
+    if latex_preview:
+        print("\nLaTeX preview:")
+        print(df_to_latex_string(df, index=False, escape=False))
+
+    return df
+
+
+def rename_metric_columns_for_display(
+    df: pd.DataFrame,
+    metric_display_map: Dict[str, str],
+) -> pd.DataFrame:
+    """
+    Rename raw metric columns to paper-display names when present.
+    """
+    if df.empty:
+        return df
+
+    rename_map = {
+        raw: display
+        for raw, display in metric_display_map.items()
+        if raw in df.columns
+    }
+
+    return df.rename(columns=rename_map)
+
+# %% [markdown]
+# ### 19.2 Main predictive performance table
+
+# %%
+predictive_main_table_for_paper_df = _load_df_from_var_or_csv(
+    "predictive_main_table_df",
+    globals().get("PREDICTIVE_MAIN_TABLE_CSV", None),
+)
+
+if not predictive_main_table_for_paper_df.empty:
+    predictive_main_table_for_paper_df = rename_metric_columns_for_display(
+        predictive_main_table_for_paper_df,
+        PREDICTIVE_METRIC_DISPLAY_NAMES,
+    )
+
+save_paper_table(
+    df=predictive_main_table_for_paper_df,
+    path=PAPER_TABLE_PATHS["predictive_main"],
+    title="paper-ready predictive main table",
+    latex_preview=True,
+)
+
+# %% [markdown]
+# ### 19.3 Predictive pairwise statistical-test table
+# 
+
+# %%
+predictive_pairwise_for_paper_df = _load_df_from_var_or_csv(
+    "predictive_pairwise_formatted_df",
+    globals().get("PREDICTIVE_PAIRWISE_TESTS_FORMATTED_CSV", None),
+)
+
+save_paper_table(
+    df=predictive_pairwise_for_paper_df,
+    path=PAPER_TABLE_PATHS["predictive_pairwise"],
+    title="paper-ready predictive pairwise table",
+    latex_preview=True,
+)
+
+# %% [markdown]
+# ### 19.4 Attention/rationale alignment table
+
+# %%
+attention_alignment_for_paper_df = _load_df_from_var_or_csv(
+    "attention_summary_wide_df",
+    globals().get("ATTENTION_SUMMARY_WIDE_CSV", None),
+)
+
+if not attention_alignment_for_paper_df.empty:
+    attention_alignment_for_paper_df = rename_metric_columns_for_display(
+        attention_alignment_for_paper_df,
+        ATTENTION_METRIC_DISPLAY_NAMES,
+    )
+
+save_paper_table(
+    df=attention_alignment_for_paper_df,
+    path=PAPER_TABLE_PATHS["attention_alignment"],
+    title="paper-ready attention/rationale alignment table",
+    latex_preview=True,
+)
+
+# %% [markdown]
+# ### 19.5 Attention pairwise statistical-test table
+
+# %%
+attention_pairwise_for_paper_df = _load_df_from_var_or_csv(
+    "attention_pairwise_formatted_df",
+    globals().get("ATTENTION_PAIRWISE_TESTS_FORMATTED_CSV", None),
+)
+
+save_paper_table(
+    df=attention_pairwise_for_paper_df,
+    path=PAPER_TABLE_PATHS["attention_pairwise"],
+    title="paper-ready attention pairwise table",
+    latex_preview=True,
+)
+
+# %% [markdown]
+# ### 19.6 Reliability tables
+
+# %%
+reliability_corr_for_paper_df = _load_df_from_var_or_csv(
+    "reliability_corr_summary_df",
+    globals().get("RELIABILITY_CORR_SUMMARY_CSV", None),
+)
+
+save_paper_table(
+    df=reliability_corr_for_paper_df,
+    path=PAPER_TABLE_PATHS["reliability_correlations"],
+    title="paper-ready reliability correlation table",
+    latex_preview=True,
+)
+
+reliability_bins_for_paper_df = _load_df_from_var_or_csv(
+    "reliability_bins_summary_df",
+    globals().get("RELIABILITY_BIN_SUMMARY_CSV", None),
+)
+
+save_paper_table(
+    df=reliability_bins_for_paper_df,
+    path=PAPER_TABLE_PATHS["reliability_fp_bins"],
+    title="paper-ready reliability bin table",
+    latex_preview=False,
+)
+
+# %% [markdown]
+# ### 19.7 Paper artifact index
+# 
+
+# %%
+paper_artifact_rows = []
+
+for artifact_type, paths in [
+    ("figure", PAPER_FIGURE_PATHS),
+    ("table", PAPER_TABLE_PATHS),
+]:
+    for name, path in paths.items():
+        paper_artifact_rows.append({
+            "artifact_type": artifact_type,
+            "name": name,
+            "path": path,
+            "exists": os.path.exists(path),
+        })
+
+paper_artifact_index_df = pd.DataFrame(paper_artifact_rows)
+
+PAPER_ARTIFACT_INDEX_CSV = os.path.join(PAPER_TABLE_DIR, "paper_artifact_index.csv")
+paper_artifact_index_df.to_csv(PAPER_ARTIFACT_INDEX_CSV, index=False)
+
+print("Saved paper artifact index:")
+print("  ", PAPER_ARTIFACT_INDEX_CSV)
+
+display(paper_artifact_index_df)
 
 # %% [markdown]
 # ## 20. Final Sanity Checks
@@ -12085,4 +12619,396 @@ else:
 # - Pairwise comparisons use matched seeds
 # 
 # This section should be run before copying results into the paper.
+
+# %%
+FINAL_SANITY_REPORT_CSV = os.path.join(PAPER_TABLE_DIR, "final_sanity_report.csv")
+FINAL_SANITY_ISSUES_CSV = os.path.join(PAPER_TABLE_DIR, "final_sanity_issues.csv")
+
+print("Final sanity-check outputs:")
+print("  Report:", FINAL_SANITY_REPORT_CSV)
+print("  Issues:", FINAL_SANITY_ISSUES_CSV)
+
+# %% [markdown]
+# ### 20.1 Sanity-check helpers
+
+# %%
+def add_sanity_check(
+    rows: List[dict],
+    check_name: str,
+    passed: bool,
+    severity: str,
+    message: str,
+    details: Optional[dict] = None,
+) -> None:
+    """
+    Append one sanity-check result row.
+    """
+    row = {
+        "check_name": check_name,
+        "passed": bool(passed),
+        "severity": severity,
+        "message": message,
+    }
+
+    if details is not None:
+        row.update(details)
+
+    rows.append(to_serializable_row(row))
+
+
+def _df_has_no_missing_metrics(
+    df: pd.DataFrame,
+    metrics: List[str],
+) -> Tuple[bool, List[str]]:
+    """
+    Check whether all requested metric columns exist and contain no NaNs.
+    """
+    if df.empty:
+        return False, metrics
+
+    missing_or_bad = []
+
+    for metric in metrics:
+        if metric not in df.columns:
+            missing_or_bad.append(metric)
+            continue
+
+        values = pd.to_numeric(df[metric], errors="coerce")
+
+        if values.isna().any():
+            missing_or_bad.append(metric)
+
+    return len(missing_or_bad) == 0, missing_or_bad
+
+
+def _paths_exist_from_column(df: pd.DataFrame, col: str) -> Tuple[bool, int, int]:
+    """
+    Check how many paths in a DataFrame column exist.
+    """
+    if df.empty or col not in df.columns:
+        return False, 0, 0
+
+    paths = [
+        p for p in df[col].dropna().astype(str).tolist()
+        if p and p.lower() != "nan"
+    ]
+
+    exists_count = sum(os.path.exists(p) for p in paths)
+
+    return exists_count == len(paths) and len(paths) > 0, exists_count, len(paths)
+
+# %% [markdown]
+# ### 20.2 Predictive-result completeness checks
+
+# %%
+sanity_rows = []
+
+predictive_raw_for_sanity_df = load_predictive_raw_results(PREDICTIVE_RAW_CSV)
+predictive_ok_for_sanity_df = (
+    predictive_raw_for_sanity_df[predictive_raw_for_sanity_df["status"] == "ok"].copy()
+    if not predictive_raw_for_sanity_df.empty and "status" in predictive_raw_for_sanity_df.columns
+    else pd.DataFrame()
+)
+
+expected_n_seeds = len(PREDICTIVE_SWEEP_SEEDS) if "PREDICTIVE_SWEEP_SEEDS" in globals() else N_SEEDS
+
+if predictive_ok_for_sanity_df.empty:
+    add_sanity_check(
+        sanity_rows,
+        "predictive_successful_rows_exist",
+        False,
+        "error",
+        "No successful predictive rows found.",
+    )
+else:
+    seed_counts = (
+        predictive_ok_for_sanity_df
+        .groupby(["experiment_group", "method"])["seed"]
+        .nunique()
+        .reset_index(name="n_seeds")
+    )
+
+    incomplete = seed_counts[seed_counts["n_seeds"] < expected_n_seeds]
+
+    add_sanity_check(
+        sanity_rows,
+        "predictive_expected_seed_count",
+        len(incomplete) == 0,
+        "error" if len(incomplete) > 0 else "info",
+        "Each predictive method has the expected number of successful seeds.",
+        {
+            "expected_n_seeds": expected_n_seeds,
+            "n_incomplete_methods": int(len(incomplete)),
+        },
+    )
+
+    if len(incomplete) > 0:
+        display(incomplete)
+
+    metrics_ok, bad_metrics = _df_has_no_missing_metrics(
+        predictive_ok_for_sanity_df,
+        PREDICTIVE_STATS_METRICS,
+    )
+
+    add_sanity_check(
+        sanity_rows,
+        "predictive_main_metrics_complete",
+        metrics_ok,
+        "error" if not metrics_ok else "info",
+        "Predictive successful rows contain all main metric columns without missing values.",
+        {"bad_metrics": bad_metrics},
+    )
+
+    ckpt_ok, ckpt_exists, ckpt_total = _paths_exist_from_column(
+        predictive_ok_for_sanity_df,
+        "checkpoint_path",
+    )
+
+    add_sanity_check(
+        sanity_rows,
+        "predictive_checkpoint_paths_exist",
+        ckpt_ok,
+        "error" if not ckpt_ok else "info",
+        "Checkpoint paths exist for successful predictive rows.",
+        {
+            "existing_paths": ckpt_exists,
+            "total_paths": ckpt_total,
+        },
+    )
+
+    thr_ok, thr_exists, thr_total = _paths_exist_from_column(
+        predictive_ok_for_sanity_df,
+        "threshold_path",
+    )
+
+    add_sanity_check(
+        sanity_rows,
+        "predictive_threshold_paths_exist",
+        thr_ok,
+        "error" if not thr_ok else "info",
+        "Threshold paths exist for successful predictive rows.",
+        {
+            "existing_paths": thr_exists,
+            "total_paths": thr_total,
+        },
+    )
+
+# %% [markdown]
+# ### 20.3 Statistical-table completeness checks
+# 
+
+# %%
+predictive_summary_check_df = _load_df_from_var_or_csv(
+    "predictive_summary_long_df",
+    globals().get("PREDICTIVE_SUMMARY_LONG_CSV", None),
+)
+
+if predictive_summary_check_df.empty:
+    add_sanity_check(
+        sanity_rows,
+        "predictive_summary_exists",
+        False,
+        "error",
+        "Predictive mean/CI summary is missing.",
+    )
+else:
+    needed_cols = {"metric", "mean", "ci_low", "ci_high", "formatted"}
+    missing_cols = needed_cols - set(predictive_summary_check_df.columns)
+
+    add_sanity_check(
+        sanity_rows,
+        "predictive_summary_ci_columns",
+        len(missing_cols) == 0,
+        "error" if missing_cols else "info",
+        "Predictive summary contains mean, CI, and formatted columns.",
+        {"missing_columns": sorted(missing_cols)},
+    )
+
+    expected_metrics_present = set(PREDICTIVE_STATS_METRICS).issubset(
+        set(predictive_summary_check_df["metric"].dropna().astype(str))
+    )
+
+    add_sanity_check(
+        sanity_rows,
+        "predictive_summary_all_metrics_present",
+        expected_metrics_present,
+        "error" if not expected_metrics_present else "info",
+        "Predictive summary contains every main predictive metric.",
+    )
+
+predictive_pairwise_check_df = _load_df_from_var_or_csv(
+    "predictive_pairwise_tests_df",
+    globals().get("PREDICTIVE_PAIRWISE_TESTS_CSV", None),
+)
+
+if predictive_pairwise_check_df.empty:
+    add_sanity_check(
+        sanity_rows,
+        "predictive_pairwise_tests_exist",
+        False,
+        "warning",
+        "Predictive pairwise tests are missing or empty.",
+    )
+else:
+    n_bad_pairs = int(
+        predictive_pairwise_check_df["n_pairs"].fillna(0).astype(float).lt(2).sum()
+        if "n_pairs" in predictive_pairwise_check_df.columns
+        else len(predictive_pairwise_check_df)
+    )
+
+    add_sanity_check(
+        sanity_rows,
+        "predictive_pairwise_matched_seeds",
+        n_bad_pairs == 0,
+        "warning" if n_bad_pairs > 0 else "info",
+        "Predictive pairwise tests have at least two matched seed pairs.",
+        {"n_bad_pairwise_rows": n_bad_pairs},
+    )
+
+# %% [markdown]
+# ### 20.4 Attention and reliability completeness checks
+# 
+
+# %%
+attention_summary_check_df = _load_df_from_var_or_csv(
+    "attention_summary_long_df",
+    globals().get("ATTENTION_SUMMARY_LONG_CSV", None),
+)
+
+if attention_summary_check_df.empty:
+    add_sanity_check(
+        sanity_rows,
+        "attention_summary_exists",
+        False,
+        "warning",
+        "Attention mean/CI summary is missing. This is expected only if Section 13/16 was not run.",
+    )
+else:
+    attention_ci_cols = {"metric", "mean", "ci_low", "ci_high", "formatted"}
+    missing_attention_cols = attention_ci_cols - set(attention_summary_check_df.columns)
+
+    add_sanity_check(
+        sanity_rows,
+        "attention_summary_ci_columns",
+        len(missing_attention_cols) == 0,
+        "warning" if missing_attention_cols else "info",
+        "Attention summary contains mean, CI, and formatted columns.",
+        {"missing_columns": sorted(missing_attention_cols)},
+    )
+
+attention_pairwise_check_df = _load_df_from_var_or_csv(
+    "attention_pairwise_tests_df",
+    globals().get("ATTENTION_PAIRWISE_TESTS_CSV", None),
+)
+
+if attention_pairwise_check_df.empty:
+    add_sanity_check(
+        sanity_rows,
+        "attention_pairwise_tests_exist",
+        False,
+        "warning",
+        "Attention pairwise tests are missing or empty.",
+    )
+else:
+    n_bad_attention_pairs = int(
+        attention_pairwise_check_df["n_pairs"].fillna(0).astype(float).lt(2).sum()
+        if "n_pairs" in attention_pairwise_check_df.columns
+        else len(attention_pairwise_check_df)
+    )
+
+    add_sanity_check(
+        sanity_rows,
+        "attention_pairwise_matched_seeds",
+        n_bad_attention_pairs == 0,
+        "warning" if n_bad_attention_pairs > 0 else "info",
+        "Attention pairwise tests have at least two matched seed pairs.",
+        {"n_bad_pairwise_rows": n_bad_attention_pairs},
+    )
+
+reliability_corr_check_df = _load_df_from_var_or_csv(
+    "reliability_corr_summary_df",
+    globals().get("RELIABILITY_CORR_SUMMARY_CSV", None),
+)
+
+add_sanity_check(
+    sanity_rows,
+    "reliability_correlation_summary_exists",
+    not reliability_corr_check_df.empty,
+    "warning" if reliability_corr_check_df.empty else "info",
+    "Reliability correlation summary exists.",
+    {"n_rows": int(len(reliability_corr_check_df))},
+)
+
+# %% [markdown]
+# ### 20.5 Paper artifact checks
+# 
+
+# %%
+paper_artifact_check_df = paper_artifact_index_df.copy() if "paper_artifact_index_df" in globals() else pd.DataFrame()
+
+if paper_artifact_check_df.empty:
+    add_sanity_check(
+        sanity_rows,
+        "paper_artifact_index_exists",
+        False,
+        "warning",
+        "Paper artifact index was not created.",
+    )
+else:
+    missing_artifacts = paper_artifact_check_df[~paper_artifact_check_df["exists"].astype(bool)]
+
+    add_sanity_check(
+        sanity_rows,
+        "paper_artifacts_exist",
+        len(missing_artifacts) == 0,
+        "warning" if len(missing_artifacts) > 0 else "info",
+        "All expected paper figures/tables exist.",
+        {
+            "n_missing_artifacts": int(len(missing_artifacts)),
+            "n_total_artifacts": int(len(paper_artifact_check_df)),
+        },
+    )
+
+    if len(missing_artifacts) > 0:
+        display(missing_artifacts)
+
+# %% [markdown]
+# ### 20.6 Final sanity report
+
+# %%
+final_sanity_report_df = pd.DataFrame(sanity_rows)
+
+if final_sanity_report_df.empty:
+    print("No sanity checks were run.")
+else:
+    final_sanity_report_df.to_csv(FINAL_SANITY_REPORT_CSV, index=False)
+
+    final_sanity_issues_df = final_sanity_report_df[
+        ~final_sanity_report_df["passed"].astype(bool)
+    ].copy()
+
+    final_sanity_issues_df.to_csv(FINAL_SANITY_ISSUES_CSV, index=False)
+
+    print("Saved final sanity report:")
+    print("  Report:", FINAL_SANITY_REPORT_CSV)
+    print("  Issues:", FINAL_SANITY_ISSUES_CSV)
+
+    print("\nSanity-check summary:")
+    display(
+        final_sanity_report_df
+        .groupby(["severity", "passed"])
+        .size()
+        .reset_index(name="n_checks")
+        .sort_values(["severity", "passed"])
+    )
+
+    print("\nFull sanity report:")
+    display(final_sanity_report_df)
+
+    if final_sanity_issues_df.empty:
+        print("\nAll sanity checks passed.")
+    else:
+        print("\nSanity-check issues to review:")
+        display(final_sanity_issues_df)
+
 
