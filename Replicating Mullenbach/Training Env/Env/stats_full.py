@@ -4556,6 +4556,74 @@ def make_reliability_row_for_sample(
         "top_k": int(top_k),
     })
 
+# %%
+def make_reliability_row_for_sample(
+    cache: Dict[str, dict],
+    X_tensor: torch.Tensor,
+    Y_tensor: torch.Tensor,
+    sample_idx: int,
+    label_idx: int,
+    model_a: str,
+    model_b: str,
+    top_k: int = BASE_CONFIG["attention_top_k"],
+    trim_context: bool = True,
+    window_size: int = BASE_CONFIG["window_size"],
+) -> dict:
+    """
+    Build one reliability row for an agree-positive sample.
+    """
+    token_sim = token_attention_similarity_for_sample(
+        cache=cache,
+        X_tensor=X_tensor,
+        sample_idx=sample_idx,
+        label_idx=label_idx,
+        model_a=model_a,
+        model_b=model_b,
+        top_k=top_k,
+        trim_context=trim_context,
+        window_size=window_size,
+    )
+
+    gt = int(Y_tensor[sample_idx, label_idx].item())
+
+    pred_a = bool(cache[model_a]["preds"][sample_idx, label_idx].item())
+    pred_b = bool(cache[model_b]["preds"][sample_idx, label_idx].item())
+
+    prob_a = float(cache[model_a]["probs"][sample_idx, label_idx].item())
+    prob_b = float(cache[model_b]["probs"][sample_idx, label_idx].item())
+
+    cosine = float(token_sim["cosine"])
+    jaccard_val = float(token_sim["jaccard"])
+
+    avg_agreement = float(np.nanmean([cosine, jaccard_val]))
+    min_agreement = float(np.nanmin([cosine, jaccard_val]))
+
+    is_fp = int(pred_a and pred_b and gt == 0)
+    is_tp = int(pred_a and pred_b and gt == 1)
+
+    return to_serializable_row({
+        "sample_idx": int(sample_idx),
+        "label_idx": int(label_idx),
+        "label_code": IDX_TO_CODE.get(int(label_idx), "UNK"),
+        "model_a": model_a,
+        "model_b": model_b,
+        "pair": f"{model_a}_vs_{model_b}",
+        "gt": gt,
+        "pred_a": pred_a,
+        "pred_b": pred_b,
+        "prob_a": prob_a,
+        "prob_b": prob_b,
+        "cosine": cosine,
+        "jaccard": jaccard_val,
+        "avg_agreement": avg_agreement,
+        "min_agreement": min_agreement,
+        "is_false_positive": is_fp,
+        "is_true_positive": is_tp,
+        "n_valid_positions": token_sim["n_valid_positions"],
+        "top_k": int(top_k),
+    })
+
+# %%
 def summarize_reliability_rows(rows: List[dict]) -> dict:
     """
     Summarize reliability rows for one seed/pair or one seed/pair/label.
@@ -7602,8 +7670,7 @@ else:
 # - Compare model pairs on token-level attention
 # - Compare model pairs on phrase-level rationales
 # - Compute false-positive behavior for agree-positive cases
-# - Save one aggregate raw row per seed/model-pair
-# - Save sample-level reliability rows for later correlation analysis
+# - Save one or more raw rows per seed/model-pair
 # 
 # Main model pairs:
 # - Centralized vs FedAvg
@@ -7613,16 +7680,120 @@ else:
 
 # %% [markdown]
 # ### 13.1 Attention sweep configuration
+# 
+# This cell controls which model pairs and seeds are included.
+# 
+# Keep `RUN_ATTENTION_SWEEP = False` while editing.
+# Set it to True only after the predictive seed sweep has completed and saved
+# checkpoints/thresholds.
+
+# %%
+# Main attention-analysis model pairs.
+# These method names should match the "method" column saved in PREDICTIVE_RAW_CSV.
+
+ATTENTION_ANCHOR_METHOD = "Centralized"
+
+ATTENTION_TARGET_METHODS = [
+    "FedAvg",
+    "FedProx",
+    "SCAFFOLD",
+    "KD_StrongHeterogeneous",
+    "KD_StrongHeterogeneous_SD",
+]
+
+# Optional extra pairs that do not use Centralized as anchor.
+# These can be useful for federated-vs-federated rationale comparisons.
+ATTENTION_EXTRA_PAIRS = [
+    # ("FedAvg", "SCAFFOLD"),
+    # ("FedAvg", "FedProx"),
+    # ("FedProx", "SCAFFOLD"),
+]
+
+ATTENTION_MODE = "agree_positive"
+
+# Token-level settings
+ATTENTION_TOP_K = BASE_CONFIG["attention_top_k"]
+ATTENTION_TRIM_CONTEXT = True
+
+# Phrase-level settings
+COMPUTE_PHRASE_ALIGNMENT = True
+PHRASE_TOP_K = 5
+PHRASE_WINDOW = 12
+PHRASE_USE_NMS = True
+PHRASE_NMS_THRESH = BASE_CONFIG["phrase_nms_iou"]
+PHRASE_NMS_GRAB_MULTIPLIER = 6
+
+# Reliability settings
+COMPUTE_RELIABILITY_ROWS = True
+SAVE_SAMPLE_LEVEL_RELIABILITY_ROWS = True
+RELIABILITY_AGREEMENT_METRICS = [
+    "cosine",
+    "jaccard",
+    "avg_agreement",
+    "min_agreement",
+]
+RELIABILITY_N_BINS = 5
+
+# Optional debug controls.
+# Use a small number while testing, e.g. 2 labels or 20 samples per label.
+# Use None for full analysis.
+ATTENTION_MAX_LABELS = None
+ATTENTION_MAX_SAMPLES_PER_LABEL = None
+
+# Sweep controls.
+RUN_ATTENTION_SWEEP = False
+SKIP_COMPLETED_ATTENTION_RUNS = True
+SKIP_PREVIOUS_ATTENTION_FAILURES = False
+MAX_ATTENTION_RUNS = None
+
+print("Attention sweep configuration:")
+print("  Anchor method:", ATTENTION_ANCHOR_METHOD)
+print("  Target methods:", ATTENTION_TARGET_METHODS)
+print("  Extra pairs:", ATTENTION_EXTRA_PAIRS)
+print("  Mode:", ATTENTION_MODE)
+print("  Compute phrase alignment:", COMPUTE_PHRASE_ALIGNMENT)
+print("  Compute reliability rows:", COMPUTE_RELIABILITY_ROWS)
+print("  Save sample-level reliability rows:", SAVE_SAMPLE_LEVEL_RELIABILITY_ROWS)
+print("  RUN_ATTENTION_SWEEP:", RUN_ATTENTION_SWEEP)
+
+# %% [markdown]
+# ### 13.2 Additional output paths
+# 
+# Section 3 already defined the main attention and reliability CSV paths.
+# 
+# This section adds a label-level attention CSV. The main attention CSV stores
+# one row per seed/model-pair; this label-level CSV stores one row per
+# seed/model-pair/label.
+
+# %%
+ATTENTION_LABEL_RAW_CSV = os.path.join(RUNS_DIR, "attention_label_raw_runs.csv")
+ATTENTION_FAILED_CSV = os.path.join(LOGS_DIR, "failed_attention_runs.csv")
+
+print("Attention output paths:")
+print("  Seed/pair summary:", ATTENTION_RAW_CSV)
+print("  Label-level summary:", ATTENTION_LABEL_RAW_CSV)
+print("  Reliability sample rows:", RELIABILITY_RAW_CSV)
+print("  Reliability bin rows:", RELIABILITY_BINS_RAW_CSV)
+print("  Failed attention runs:", ATTENTION_FAILED_CSV)
+
+# %% [markdown]
+# ### 13.3 Append-many CSV helper
+# 
+# Reliability analysis can create many sample-level rows, so appending one row
+# at a time would be slow.
 
 # %%
 def append_rows_to_csv(rows: List[dict], filepath: str) -> None:
     """
-    Append multiple rows to a CSV, expanding columns when needed.
+    Append many rows to a CSV file.
+
+    If the file exists and new rows contain new columns, rewrite with the union
+    of columns.
     """
+    ensure_dir(os.path.dirname(filepath))
+
     if not rows:
         return
-
-    ensure_dir(os.path.dirname(filepath))
 
     rows = [to_serializable_row(row) for row in rows]
     new_df = pd.DataFrame(rows)
@@ -7633,176 +7804,388 @@ def append_rows_to_csv(rows: List[dict], filepath: str) -> None:
 
     existing = pd.read_csv(filepath)
 
+    all_cols = list(existing.columns)
+
     for col in new_df.columns:
+        if col not in all_cols:
+            all_cols.append(col)
+
+    for col in all_cols:
         if col not in existing.columns:
             existing[col] = np.nan
-
-    for col in existing.columns:
         if col not in new_df.columns:
             new_df[col] = np.nan
 
-    new_df = new_df[existing.columns]
-    combined = pd.concat([existing, new_df], ignore_index=True, sort=False)
+    combined = pd.concat(
+        [existing[all_cols], new_df[all_cols]],
+        ignore_index=True,
+        sort=False,
+    )
+
     combined.to_csv(filepath, index=False)
 
+# %% [markdown]
+# ### 13.4 Predictive-result loading for attention analysis
+# 
+# Attention analysis depends on successful predictive runs because it needs:
+# - checkpoint path
+# - per-label threshold path
+# - model config path
+# 
+# This cell loads and deduplicates successful predictive rows.
 
-def build_attention_model_pairs(
-    predictive_df: Optional[pd.DataFrame] = None,
-    reference_method: str = "Centralized",
-    candidate_targets: Optional[List[str]] = None,
+# %%
+def load_successful_predictive_runs_for_attention(
+    predictive_csv: str = PREDICTIVE_RAW_CSV,
+) -> pd.DataFrame:
+    """
+    Load successful predictive rows and keep the latest row per experiment/method/seed.
+    """
+    df = load_predictive_raw_results(predictive_csv)
+
+    if df.empty:
+        print("No predictive results found.")
+        return df
+
+    if "status" in df.columns:
+        df = df[df["status"] == "ok"].copy()
+
+    if df.empty:
+        print("No successful predictive rows found.")
+        return df
+
+    if "seed" in df.columns:
+        df["seed"] = df["seed"].astype(int)
+
+    key_cols = [
+        c for c in ["experiment_id", "method", "seed"]
+        if c in df.columns
+    ]
+
+    if key_cols:
+        df = df.drop_duplicates(subset=key_cols, keep="last")
+
+    # Keep only rows with usable artifact paths.
+    required_cols = ["checkpoint_path", "threshold_path"]
+
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Predictive CSV is missing required column: {col}")
+
+    df["checkpoint_exists"] = df["checkpoint_path"].apply(
+        lambda p: isinstance(p, str) and os.path.exists(p)
+    )
+    df["threshold_exists"] = df["threshold_path"].apply(
+        lambda p: isinstance(p, str) and os.path.exists(p)
+    )
+
+    missing_artifacts = df[
+        (~df["checkpoint_exists"])
+        | (~df["threshold_exists"])
+    ]
+
+    if len(missing_artifacts) > 0:
+        print("[Warning] Some successful predictive rows are missing artifacts:")
+        display(
+            missing_artifacts[
+                [
+                    "experiment_group",
+                    "method",
+                    "seed",
+                    "checkpoint_path",
+                    "threshold_path",
+                    "checkpoint_exists",
+                    "threshold_exists",
+                ]
+            ].head(20)
+        )
+
+    df = df[
+        df["checkpoint_exists"]
+        & df["threshold_exists"]
+    ].copy()
+
+    return df
+
+
+predictive_ok_for_attention_df = load_successful_predictive_runs_for_attention(
+    PREDICTIVE_RAW_CSV
+)
+
+print("Successful predictive rows available for attention:", len(predictive_ok_for_attention_df))
+
+if not predictive_ok_for_attention_df.empty:
+    preview_cols = [
+        c for c in [
+            "experiment_group",
+            "method",
+            "seed",
+            "checkpoint_path",
+            "threshold_path",
+            "config_path",
+        ]
+        if c in predictive_ok_for_attention_df.columns
+    ]
+
+    display(
+        predictive_ok_for_attention_df[preview_cols]
+        .sort_values(["method", "seed"])
+        .head(30)
+    )
+
+# %% [markdown]
+# ### 13.5 Attention model-pair builder
+# 
+# This builds expected seed/model-pair rows only when both models exist for the
+# same seed.
+
+# %%
+def get_available_methods_by_seed(predictive_ok_df: pd.DataFrame) -> Dict[int, set]:
+    """
+    Return a mapping from seed -> set of methods with available checkpoint/thresholds.
+    """
+    methods_by_seed = defaultdict(set)
+
+    if predictive_ok_df.empty:
+        return dict(methods_by_seed)
+
+    for _, row in predictive_ok_df.iterrows():
+        methods_by_seed[int(row["seed"])].add(str(row["method"]))
+
+    return dict(methods_by_seed)
+
+
+def build_requested_attention_pairs(
+    anchor_method: str = ATTENTION_ANCHOR_METHOD,
+    target_methods: Optional[List[str]] = None,
+    extra_pairs: Optional[List[Tuple[str, str]]] = None,
 ) -> List[Tuple[str, str]]:
     """
-    Build default attention-comparison pairs.
+    Build requested attention model pairs.
     """
-    if candidate_targets is None:
-        candidate_targets = [
-            "FedAvg",
-            "FedProx",
-            "SCAFFOLD",
-            "KD_Baseline_FedAvg",
-            "KD_StrongHeterogeneous",
-            "KD_StrongHeterogeneous_SD",
-        ]
+    if target_methods is None:
+        target_methods = ATTENTION_TARGET_METHODS
 
-    if predictive_df is None or predictive_df.empty:
-        available_methods = {reference_method} | set(candidate_targets)
-    else:
-        df_ok = predictive_df.copy()
-        if "status" in df_ok.columns:
-            df_ok = df_ok[df_ok["status"] == "ok"]
-        available_methods = set(df_ok["method"].astype(str).unique().tolist())
+    if extra_pairs is None:
+        extra_pairs = ATTENTION_EXTRA_PAIRS
 
     pairs = []
 
-    for target in candidate_targets:
-        if target == reference_method:
+    for target in target_methods:
+        if target == anchor_method:
             continue
-        if reference_method in available_methods and target in available_methods:
-            pairs.append((reference_method, target))
+        pairs.append((anchor_method, target))
 
-    return pairs
+    for pair in extra_pairs:
+        if len(pair) != 2:
+            raise ValueError(f"Invalid pair: {pair}")
+        pairs.append(tuple(pair))
+
+    # Deduplicate while preserving order.
+    seen = set()
+    out = []
+
+    for a, b in pairs:
+        key = (a, b)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+
+    return out
 
 
-ATTENTION_REFERENCE_METHOD = "Centralized"
-ATTENTION_CANDIDATE_TARGET_METHODS = [
-    "FedAvg",
-    "FedProx",
-    "SCAFFOLD",
-    "KD_Baseline_FedAvg",
-    "KD_StrongHeterogeneous",
-    "KD_StrongHeterogeneous_SD",
-]
-
-ATTENTION_SWEEP_SEEDS = SEEDS
-ATTENTION_SWEEP_MODE = "agree_positive"
-
-ATTENTION_TOP_K = BASE_CONFIG["attention_top_k"]
-ATTENTION_TOP_K_PHRASES = 5
-ATTENTION_PHRASE_WINDOW = 12
-ATTENTION_TRIM_CONTEXT = True
-ATTENTION_USE_NMS = True
-ATTENTION_NMS_THRESH = BASE_CONFIG["phrase_nms_iou"]
-ATTENTION_NMS_GRAB_MULTIPLIER = 6
-
-ATTENTION_MAX_SAMPLES_PER_LABEL = None
-ATTENTION_MAX_LABELS = None
-ATTENTION_RELIABILITY_BINS = 5
-
-RUN_ATTENTION_SWEEP = False
-SKIP_COMPLETED_ATTENTION_RUNS = True
-MAX_ATTENTION_RUNS = None
-
-ATTENTION_LABEL_SUMMARY_DIR = ensure_dir(
-    os.path.join(CACHE_DIR, "attention_label_summaries")
-)
-ATTENTION_EXPECTED_CSV = os.path.join(CONFIG_DIR, "expected_attention_runs.csv")
-ATTENTION_COMPLETION_CSV = os.path.join(TABLES_DIR, "attention_completion_report.csv")
-ATTENTION_MISSING_CSV = os.path.join(TABLES_DIR, "attention_missing_runs.csv")
-
-predictive_for_attention_df = load_predictive_raw_results(PREDICTIVE_RAW_CSV)
-ATTENTION_MODEL_PAIRS = build_attention_model_pairs(
-    predictive_df=predictive_for_attention_df,
-    reference_method=ATTENTION_REFERENCE_METHOD,
-    candidate_targets=ATTENTION_CANDIDATE_TARGET_METHODS,
-)
-
-print("Attention sweep configuration:")
-print("  RUN_ATTENTION_SWEEP:", RUN_ATTENTION_SWEEP)
-print("  Seeds:", ATTENTION_SWEEP_SEEDS)
-print("  Reference method:", ATTENTION_REFERENCE_METHOD)
-print("  Number of configured pairs:", len(ATTENTION_MODEL_PAIRS))
-print("  Output summary CSV:", ATTENTION_RAW_CSV)
-print("  Output reliability CSV:", RELIABILITY_RAW_CSV)
-
-if ATTENTION_MODEL_PAIRS:
-    display(pd.DataFrame(ATTENTION_MODEL_PAIRS, columns=["model_a", "model_b"]))
-else:
-    print("No attention pairs are currently available from the predictive raw CSV.")
-
-# %% [markdown]
-# ### 13.2 Attention raw-result helpers
-
-# %%
-def compute_reliability_rows_for_pair_label(
-    cache: Dict[str, dict],
-    X_tensor: torch.Tensor,
-    Y_tensor: torch.Tensor,
-    model_a: str,
-    model_b: str,
-    label_idx: int,
-    top_k: int = BASE_CONFIG["attention_top_k"],
-    trim_context: bool = True,
-    window_size: int = BASE_CONFIG["window_size"],
-    max_samples: Optional[int] = None,
-) -> List[dict]:
+def build_expected_attention_runs(
+    predictive_ok_df: pd.DataFrame,
+    seeds: List[int],
+    requested_pairs: Optional[List[Tuple[str, str]]] = None,
+    mode: str = ATTENTION_MODE,
+) -> pd.DataFrame:
     """
-    Compute reliability rows for one model pair and label.
+    Build one expected attention-analysis row per seed/model-pair where both
+    model checkpoints are available.
     """
-    sample_indices = get_agree_indices(
-        cache=cache,
-        model_a=model_a,
-        model_b=model_b,
-        label_idx=label_idx,
-        mode="agree_positive",
-    )
+    if requested_pairs is None:
+        requested_pairs = build_requested_attention_pairs()
 
-    if max_samples is not None:
-        sample_indices = sample_indices[:max_samples]
+    methods_by_seed = get_available_methods_by_seed(predictive_ok_df)
 
     rows = []
 
-    for sample_idx in sample_indices:
-        row = make_reliability_row_for_sample(
-            cache=cache,
-            X_tensor=X_tensor,
-            Y_tensor=Y_tensor,
-            sample_idx=sample_idx,
-            label_idx=label_idx,
-            model_a=model_a,
-            model_b=model_b,
-            top_k=top_k,
-            trim_context=trim_context,
-            window_size=window_size,
-        )
+    for seed in seeds:
+        available = methods_by_seed.get(int(seed), set())
 
-        row["mode"] = "agree_positive"
-        row["label_description"] = CODE_TO_DESC.get(
-            IDX_TO_CODE.get(int(label_idx), "UNK"),
-            "Unknown ICD code",
-        )
-        rows.append(to_serializable_row(row))
+        for model_a, model_b in requested_pairs:
+            has_a = model_a in available
+            has_b = model_b in available
 
-    return rows
+            rows.append({
+                "seed": int(seed),
+                "model_a": model_a,
+                "model_b": model_b,
+                "pair": f"{model_a}_vs_{model_b}",
+                "mode": mode,
+                "available_model_a": bool(has_a),
+                "available_model_b": bool(has_b),
+                "available": bool(has_a and has_b),
+            })
+
+    return pd.DataFrame(rows)
 
 
-def make_attention_pair_key(
+REQUESTED_ATTENTION_PAIRS = build_requested_attention_pairs()
+expected_attention_df = build_expected_attention_runs(
+    predictive_ok_df=predictive_ok_for_attention_df,
+    seeds=PREDICTIVE_SWEEP_SEEDS,
+    requested_pairs=REQUESTED_ATTENTION_PAIRS,
+    mode=ATTENTION_MODE,
+)
+
+EXPECTED_ATTENTION_RUNS_CSV = os.path.join(CONFIG_DIR, "expected_attention_runs.csv")
+expected_attention_df.to_csv(EXPECTED_ATTENTION_RUNS_CSV, index=False)
+
+print("Requested attention pairs:")
+for pair in REQUESTED_ATTENTION_PAIRS:
+    print("  -", pair[0], "vs", pair[1])
+
+print("\nExpected available attention runs:", int(expected_attention_df["available"].sum()))
+print("Saved expected attention run table:", EXPECTED_ATTENTION_RUNS_CSV)
+
+display(expected_attention_df.head(30))
+
+# %% [markdown]
+# ### 13.6 Predictive artifact lookup helpers
+
+# %%
+def get_predictive_row_for_method_seed(
+    predictive_ok_df: pd.DataFrame,
+    method: str,
+    seed: int,
+) -> pd.Series:
+    """
+    Return the successful predictive row for one method/seed.
+    """
+    sub = predictive_ok_df[
+        (predictive_ok_df["method"].astype(str) == str(method))
+        & (predictive_ok_df["seed"].astype(int) == int(seed))
+    ]
+
+    if len(sub) == 0:
+        raise ValueError(f"No successful predictive row for method={method}, seed={seed}")
+
+    if len(sub) > 1:
+        print(f"[Warning] Multiple predictive rows found for method={method}, seed={seed}; using latest row.")
+
+    return sub.iloc[-1]
+
+
+def model_config_from_predictive_row(row: pd.Series) -> dict:
+    """
+    Recover model config from a predictive result row.
+
+    If the config JSON is unavailable, fall back to BASE_CONFIG.
+    """
+    config_path = row.get("config_path", None)
+
+    if isinstance(config_path, str) and os.path.exists(config_path):
+        try:
+            cfg = load_json(config_path)
+            exp = cfg.get("experiment", {})
+            return experiment_model_config(exp)
+        except Exception as e:
+            print(f"[Warning] Could not read config_path={config_path}: {repr(e)}")
+
+    return {
+        "n_filters": BASE_CONFIG["n_filters"],
+        "window_size": BASE_CONFIG["window_size"],
+        "dropout": BASE_CONFIG["dropout"],
+        "label_space": BASE_CONFIG["label_space"],
+    }
+
+
+def load_attention_model_and_threshold_from_predictive_row(
+    row: pd.Series,
+    device: torch.device = device,
+) -> Tuple[nn.Module, torch.Tensor]:
+    """
+    Load one model and threshold vector from a predictive result row.
+    """
+    checkpoint_path = row["checkpoint_path"]
+    threshold_path = row["threshold_path"]
+
+    if not isinstance(checkpoint_path, str) or not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    if not isinstance(threshold_path, str) or not os.path.exists(threshold_path):
+        raise FileNotFoundError(f"Threshold file not found: {threshold_path}")
+
+    model_config = model_config_from_predictive_row(row)
+
+    model = load_model_from_checkpoint(
+        checkpoint_path=checkpoint_path,
+        device=device,
+        model_config=model_config,
+    )
+
+    thresholds = load_thresholds(threshold_path).detach().cpu()
+
+    return model, thresholds
+
+
+def load_attention_pair_bundle(
+    predictive_ok_df: pd.DataFrame,
     seed: int,
     model_a: str,
     model_b: str,
-    mode: str = ATTENTION_SWEEP_MODE,
+    device: torch.device = device,
+) -> Tuple[Dict[str, nn.Module], Dict[str, torch.Tensor]]:
+    """
+    Load two models and their thresholds for one seed/model-pair.
+    """
+    row_a = get_predictive_row_for_method_seed(
+        predictive_ok_df=predictive_ok_df,
+        method=model_a,
+        seed=seed,
+    )
+    row_b = get_predictive_row_for_method_seed(
+        predictive_ok_df=predictive_ok_df,
+        method=model_b,
+        seed=seed,
+    )
+
+    loaded_a, thr_a = load_attention_model_and_threshold_from_predictive_row(
+        row=row_a,
+        device=device,
+    )
+    loaded_b, thr_b = load_attention_model_and_threshold_from_predictive_row(
+        row=row_b,
+        device=device,
+    )
+
+    models = {
+        model_a: loaded_a,
+        model_b: loaded_b,
+    }
+
+    thresholds = {
+        model_a: thr_a,
+        model_b: thr_b,
+    }
+
+    return models, thresholds
+
+# %% [markdown]
+# ### 13.7 Completed attention-run helpers
+# These make the attention sweep resumable.
+
+# %%
+def make_attention_run_key_from_values(
+    seed: int,
+    model_a: str,
+    model_b: str,
+    mode: str = ATTENTION_MODE,
 ) -> Tuple[int, str, str, str]:
     """
-    Build a completion key for one attention seed/pair result row.
+    Build a completed-run key for attention analysis.
     """
     return (
         int(seed),
@@ -7812,691 +8195,1165 @@ def make_attention_pair_key(
     )
 
 
-def load_attention_raw_results(
-    attention_csv: str = ATTENTION_RAW_CSV,
-) -> pd.DataFrame:
+def make_attention_run_key(row: pd.Series) -> Tuple[int, str, str, str]:
     """
-    Load seed-level attention summary rows.
+    Build an attention-run key from a row with seed/model_a/model_b/mode.
+    """
+    return make_attention_run_key_from_values(
+        seed=int(row["seed"]),
+        model_a=str(row["model_a"]),
+        model_b=str(row["model_b"]),
+        mode=str(row.get("mode", ATTENTION_MODE)),
+    )
+
+
+def get_completed_attention_key_sets(
+    attention_csv: str = ATTENTION_RAW_CSV,
+) -> Tuple[set, set, set]:
+    """
+    Return completed attention keys.
+
+    Returns:
+        ok_keys, failed_keys, all_seen_keys
     """
     df = read_csv_if_exists(attention_csv)
 
-    if df.empty:
-        return df
-
-    if "seed" in df.columns:
-        df["seed"] = df["seed"].astype(int)
-
-    return df
-
-
-def get_completed_attention_keys(
-    attention_csv: str = ATTENTION_RAW_CSV,
-) -> set:
-    """
-    Return completed attention summary keys from ATTENTION_RAW_CSV.
-    """
-    df = load_attention_raw_results(attention_csv)
+    ok_keys = set()
+    failed_keys = set()
+    all_seen_keys = set()
 
     if df.empty:
-        return set()
+        return ok_keys, failed_keys, all_seen_keys
 
-    required_cols = {"seed", "model_a", "model_b", "mode"}
-    missing = required_cols - set(df.columns)
+    required = {"seed", "model_a", "model_b"}
 
+    missing = required - set(df.columns)
     if missing:
-        print(f"[Warning] attention CSV missing required columns: {missing}")
-        return set()
-
-    if "status" in df.columns:
-        df = df[df["status"] == "ok"]
-
-    keys = set()
+        print(f"[Warning] attention CSV missing columns: {missing}")
+        return ok_keys, failed_keys, all_seen_keys
 
     for _, row in df.iterrows():
-        keys.add(
-            make_attention_pair_key(
-                seed=row["seed"],
-                model_a=row["model_a"],
-                model_b=row["model_b"],
-                mode=row["mode"],
-            )
+        key = make_attention_run_key_from_values(
+            seed=int(row["seed"]),
+            model_a=str(row["model_a"]),
+            model_b=str(row["model_b"]),
+            mode=str(row.get("mode", ATTENTION_MODE)),
         )
 
-    return keys
+        all_seen_keys.add(key)
 
+        status = row.get("status", None)
 
-def build_expected_attention_runs(
-    predictive_df: pd.DataFrame,
-    model_pairs: List[Tuple[str, str]],
-    seeds: List[int],
-    mode: str = ATTENTION_SWEEP_MODE,
-) -> pd.DataFrame:
-    """
-    Build the seed/pair grid that is eligible for attention analysis.
+        if status == "ok":
+            ok_keys.add(key)
+        elif status == "failed":
+            failed_keys.add(key)
 
-    A run is expected only if both methods have successful predictive rows for
-    that seed.
-    """
-    rows = []
-
-    if predictive_df.empty:
-        return pd.DataFrame()
-
-    df_ok = predictive_df.copy()
-    if "status" in df_ok.columns:
-        df_ok = df_ok[df_ok["status"] == "ok"]
-
-    for seed in seeds:
-        ok_methods = set(
-            df_ok[df_ok["seed"] == int(seed)]["method"].astype(str).unique().tolist()
-        )
-
-        for model_a, model_b in model_pairs:
-            if model_a in ok_methods and model_b in ok_methods:
-                rows.append({
-                    "seed": int(seed),
-                    "model_a": model_a,
-                    "model_b": model_b,
-                    "pair": f"{model_a}_vs_{model_b}",
-                    "mode": mode,
-                })
-
-    return pd.DataFrame(rows)
+    return ok_keys, failed_keys, all_seen_keys
 
 
 def find_missing_attention_runs(
-    predictive_df: pd.DataFrame,
-    model_pairs: List[Tuple[str, str]],
-    seeds: List[int],
+    expected_attention_df: pd.DataFrame,
     attention_csv: str = ATTENTION_RAW_CSV,
-    mode: str = ATTENTION_SWEEP_MODE,
+    skip_failed: bool = False,
 ) -> pd.DataFrame:
     """
-    Find seed/pair attention analyses that are still missing.
+    Find expected available attention runs that have not completed.
     """
-    expected_df = build_expected_attention_runs(
-        predictive_df=predictive_df,
-        model_pairs=model_pairs,
-        seeds=seeds,
-        mode=mode,
-    )
+    expected = expected_attention_df[expected_attention_df["available"]].copy()
 
-    completed_keys = get_completed_attention_keys(attention_csv)
+    ok_keys, failed_keys, _ = get_completed_attention_key_sets(attention_csv)
 
-    if expected_df.empty:
-        return expected_df
+    completed = ok_keys | failed_keys if skip_failed else ok_keys
 
-    missing_rows = []
+    rows = []
 
-    for _, row in expected_df.iterrows():
-        key = make_attention_pair_key(
-            seed=row["seed"],
-            model_a=row["model_a"],
-            model_b=row["model_b"],
-            mode=row["mode"],
-        )
+    for _, row in expected.iterrows():
+        key = make_attention_run_key(row)
 
-        if key not in completed_keys:
-            missing_rows.append(row.to_dict())
+        if key not in completed:
+            r = row.to_dict()
+            r["previously_failed"] = key in failed_keys
+            rows.append(r)
 
-    return pd.DataFrame(missing_rows)
-
-
-expected_attention_df = build_expected_attention_runs(
-    predictive_df=predictive_for_attention_df,
-    model_pairs=ATTENTION_MODEL_PAIRS,
-    seeds=ATTENTION_SWEEP_SEEDS,
-    mode=ATTENTION_SWEEP_MODE,
-)
-expected_attention_df.to_csv(ATTENTION_EXPECTED_CSV, index=False)
-
-print("Expected attention runs:", len(expected_attention_df))
-print("Saved expected attention-run table:", ATTENTION_EXPECTED_CSV)
-
-missing_attention_df = find_missing_attention_runs(
-    predictive_df=predictive_for_attention_df,
-    model_pairs=ATTENTION_MODEL_PAIRS,
-    seeds=ATTENTION_SWEEP_SEEDS,
-    attention_csv=ATTENTION_RAW_CSV,
-    mode=ATTENTION_SWEEP_MODE,
-)
-
-print("Missing attention runs:", len(missing_attention_df))
-if len(missing_attention_df) > 0:
-    display(missing_attention_df.head(20))
-
-# %% [markdown]
-# ### 13.3 Pair-level attention summary helpers
+    return pd.DataFrame(rows)
 
 # %%
-def weighted_mean_series(
-    values: pd.Series,
-    weights: pd.Series,
-) -> float:
-    """
-    Weighted mean wrapper for pandas Series.
-    """
-    return weighted_mean(
-        values.to_numpy(dtype=float),
-        weights.to_numpy(dtype=float),
+attention_status_df = read_csv_if_exists(ATTENTION_RAW_CSV)
+
+if attention_status_df.empty:
+    print("No attention raw results found yet.")
+else:
+    print("Existing attention raw results:", attention_status_df.shape)
+    display(
+        attention_status_df
+        .groupby(["pair", "mode", "status"])
+        .size()
+        .reset_index(name="n_rows")
     )
 
+missing_attention_df = find_missing_attention_runs(
+    expected_attention_df=expected_attention_df,
+    attention_csv=ATTENTION_RAW_CSV,
+    skip_failed=SKIP_PREVIOUS_ATTENTION_FAILURES,
+)
 
-def build_attention_pair_summary_from_label_df(
-    label_summary_df: pd.DataFrame,
-) -> dict:
+print("Missing available attention runs:", len(missing_attention_df))
+
+if len(missing_attention_df) > 0:
+    display(missing_attention_df.head(30))
+
+# %% [markdown]
+# ### 13.8 Label-level token, phrase, and reliability summarizer
+# 
+# This function computes all label-level summaries for one seed/model-pair.
+
+# %%
+def compute_label_level_attention_outputs_for_pair(
+    cache: Dict[str, dict],
+    X_tensor: torch.Tensor,
+    Y_tensor: torch.Tensor,
+    seed: int,
+    model_a: str,
+    model_b: str,
+    mode: str = ATTENTION_MODE,
+    max_labels: Optional[int] = ATTENTION_MAX_LABELS,
+    max_samples_per_label: Optional[int] = ATTENTION_MAX_SAMPLES_PER_LABEL,
+    compute_phrase: bool = COMPUTE_PHRASE_ALIGNMENT,
+    compute_reliability: bool = COMPUTE_RELIABILITY_ROWS,
+) -> Tuple[List[dict], List[dict], List[dict]]:
     """
-    Aggregate per-label summaries into one seed-level pair summary.
+    Compute label-level attention summaries plus optional reliability rows.
+
+    Returns:
+        label_summary_rows:
+            One row per seed/model-pair/label.
+        reliability_rows:
+            Sample-level reliability rows.
+        reliability_bin_rows:
+            Quantile-binned reliability rows.
     """
-    if label_summary_df.empty:
-        return {
-            "labels_total": 0,
-            "labels_token_covered": 0,
-            "labels_phrase_covered": 0,
-            "labels_reliability_covered": 0,
-            "token_total_kept": 0,
-            "phrase_total_kept": 0,
-            "n_agree_positive_total": 0,
-            "cosine": np.nan,
-            "jaccard": np.nan,
-            "phrase_iou": np.nan,
-            "fp_rate": np.nan,
-            "avg_agreement": np.nan,
-            "min_agreement": np.nan,
+    n_labels = Y_tensor.shape[1]
+
+    if max_labels is not None:
+        label_indices = list(range(min(int(max_labels), n_labels)))
+    else:
+        label_indices = list(range(n_labels))
+
+    pair_name = f"{model_a}_vs_{model_b}"
+
+    label_summary_rows = []
+    all_reliability_rows = []
+
+    for label_idx in tqdm(label_indices, desc=f"Labels {pair_name} seed={seed}"):
+        # Token summary.
+        token_summary = compute_token_alignment_summary_for_pair_label(
+            cache=cache,
+            X_tensor=X_tensor,
+            Y_tensor=Y_tensor,
+            model_a=model_a,
+            model_b=model_b,
+            label_idx=label_idx,
+            mode=mode,
+            top_k=ATTENTION_TOP_K,
+            trim_context=ATTENTION_TRIM_CONTEXT,
+            window_size=BASE_CONFIG["window_size"],
+            max_samples=max_samples_per_label,
+        )
+
+        # Phrase summary.
+        phrase_summary = {}
+
+        if compute_phrase:
+            phrase_rows = compute_phrase_alignment_rows_for_pair_label(
+                cache=cache,
+                X_tensor=X_tensor,
+                Y_tensor=Y_tensor,
+                model_a=model_a,
+                model_b=model_b,
+                label_idx=label_idx,
+                mode=mode,
+                top_k_phrases=PHRASE_TOP_K,
+                phrase_window=PHRASE_WINDOW,
+                trim_context=ATTENTION_TRIM_CONTEXT,
+                use_nms=PHRASE_USE_NMS,
+                nms_thresh=PHRASE_NMS_THRESH,
+                nms_grab_multiplier=PHRASE_NMS_GRAB_MULTIPLIER,
+                max_samples=max_samples_per_label,
+            )
+
+            phrase_summary = summarize_phrase_alignment_rows(phrase_rows)
+
+        # Reliability sample-level rows.
+        if compute_reliability:
+            rel_rows = compute_reliability_rows_for_pair_label(
+                cache=cache,
+                X_tensor=X_tensor,
+                Y_tensor=Y_tensor,
+                model_a=model_a,
+                model_b=model_b,
+                label_idx=label_idx,
+                top_k=ATTENTION_TOP_K,
+                trim_context=ATTENTION_TRIM_CONTEXT,
+                window_size=BASE_CONFIG["window_size"],
+                max_samples=max_samples_per_label,
+            )
+
+            for r in rel_rows:
+                r["seed"] = int(seed)
+                r["mode"] = mode
+                r["label_code"] = IDX_TO_CODE.get(int(label_idx), "UNK")
+                r["label_description"] = CODE_TO_DESC.get(
+                    IDX_TO_CODE.get(int(label_idx), "UNK"),
+                    "Unknown ICD code",
+                )
+
+            all_reliability_rows.extend(rel_rows)
+
+        row = {
+            "seed": int(seed),
+            "pair": pair_name,
+            "model_a": model_a,
+            "model_b": model_b,
+            "mode": mode,
+            "label_idx": int(label_idx),
+            "label_code": IDX_TO_CODE.get(int(label_idx), "UNK"),
+            "label_description": CODE_TO_DESC.get(
+                IDX_TO_CODE.get(int(label_idx), "UNK"),
+                "Unknown ICD code",
+            ),
+
+            "token_n_kept": token_summary.get("n_kept", 0),
+            "token_cosine_mean": token_summary.get("cosine_mean", np.nan),
+            "token_cosine_median": token_summary.get("cosine_median", np.nan),
+            "token_jaccard_mean": token_summary.get("jaccard_mean", np.nan),
+            "token_jaccard_median": token_summary.get("jaccard_median", np.nan),
+            "token_fp_rate": token_summary.get("fp_rate", np.nan),
         }
 
-    df = label_summary_df.copy()
+        if compute_phrase:
+            row.update({
+                "phrase_n_kept": phrase_summary.get("n_kept", 0),
+                "phrase_top1_iou_mean": phrase_summary.get("phrase_top1_iou_mean", np.nan),
+                "phrase_top5_max_iou_mean": phrase_summary.get("phrase_top5_max_iou_mean", np.nan),
+                "phrase_weighted_iou_mean": phrase_summary.get("phrase_weighted_iou_mean", np.nan),
+                "phrase_unweighted_iou_mean": phrase_summary.get("phrase_unweighted_iou_mean", np.nan),
+                "phrase_rankaware_iou_mean": phrase_summary.get("phrase_rankaware_iou_mean", np.nan),
+            })
 
-    token_w = df["token_n_kept"].astype(float)
-    phrase_w = df["phrase_n_kept"].astype(float)
-    rel_w = df["reliability_n_agree_positive"].astype(float)
+        label_summary_rows.append(to_serializable_row(row))
 
-    out = {
-        "labels_total": int(len(df)),
-        "labels_token_covered": int((token_w > 0).sum()),
-        "labels_phrase_covered": int((phrase_w > 0).sum()),
-        "labels_reliability_covered": int((rel_w > 0).sum()),
-        "token_total_kept": int(token_w.sum()),
-        "phrase_total_kept": int(phrase_w.sum()),
-        "n_agree_positive_total": int(rel_w.sum()),
+    # Reliability bins across all agree-positive cases for this seed/pair.
+    reliability_bin_rows = []
+
+    if compute_reliability and all_reliability_rows:
+        for agreement_metric in RELIABILITY_AGREEMENT_METRICS:
+            bins_df = fp_rate_by_agreement_quantile(
+                rows=all_reliability_rows,
+                agreement_col=agreement_metric,
+                n_bins=RELIABILITY_N_BINS,
+                min_bin_size=1,
+            )
+
+            if not bins_df.empty:
+                for _, bin_row in bins_df.iterrows():
+                    reliability_bin_rows.append(
+                        to_serializable_row({
+                            "seed": int(seed),
+                            "pair": pair_name,
+                            "model_a": model_a,
+                            "model_b": model_b,
+                            "mode": mode,
+                            **bin_row.to_dict(),
+                        })
+                    )
+
+    return label_summary_rows, all_reliability_rows, reliability_bin_rows
+
+# %% [markdown]
+# ### 13.9 Pair-level summary helper
+# 
+# This converts label-level rows and reliability rows into one seed/model-pair
+# summary row for `ATTENTION_RAW_CSV`.
+
+# %%
+def summarize_seed_pair_attention_outputs(
+    label_summary_rows: List[dict],
+    reliability_rows: List[dict],
+    seed: int,
+    model_a: str,
+    model_b: str,
+    mode: str = ATTENTION_MODE,
+    elapsed_sec: Optional[float] = None,
+    status: str = "ok",
+    error: Optional[str] = None,
+) -> dict:
+    """
+    Build one seed/model-pair summary row from label-level outputs.
+    """
+    pair_name = f"{model_a}_vs_{model_b}"
+
+    base = {
+        "seed": int(seed),
+        "pair": pair_name,
+        "model_a": model_a,
+        "model_b": model_b,
+        "mode": mode,
+        "status": status,
+        "elapsed_sec": elapsed_sec,
+        "top_k": int(ATTENTION_TOP_K),
+        "compute_phrase_alignment": bool(COMPUTE_PHRASE_ALIGNMENT),
+        "compute_reliability_rows": bool(COMPUTE_RELIABILITY_ROWS),
+        "max_labels": ATTENTION_MAX_LABELS,
+        "max_samples_per_label": ATTENTION_MAX_SAMPLES_PER_LABEL,
     }
 
-    weighted_specs = [
-        ("token_cosine_mean", token_w, "cosine"),
-        ("token_jaccard_mean", token_w, "jaccard"),
-        ("token_cosine_median", token_w, "cosine_median"),
-        ("token_jaccard_median", token_w, "jaccard_median"),
-        ("phrase_top1_iou_mean", phrase_w, "phrase_top1_iou"),
-        ("phrase_top5_max_iou_mean", phrase_w, "phrase_top5_max_iou"),
-        ("phrase_weighted_iou_mean", phrase_w, "phrase_iou"),
-        ("phrase_unweighted_iou_mean", phrase_w, "phrase_unweighted_iou"),
-        ("phrase_rankaware_iou_mean", phrase_w, "phrase_rankaware_iou"),
-        ("reliability_fp_rate", rel_w, "fp_rate"),
-        ("reliability_tp_rate", rel_w, "tp_rate"),
-        ("reliability_cosine_mean", rel_w, "reliability_cosine"),
-        ("reliability_jaccard_mean", rel_w, "reliability_jaccard"),
-        ("reliability_avg_agreement_mean", rel_w, "avg_agreement"),
-        ("reliability_min_agreement_mean", rel_w, "min_agreement"),
-    ]
+    if error is not None:
+        base["error"] = error
 
-    for src_col, weights, dst_col in weighted_specs:
-        if src_col in df.columns:
-            out[dst_col] = weighted_mean_series(df[src_col], weights)
+    if not label_summary_rows:
+        base.update({
+            "n_labels_total": int(N_LABELS),
+            "n_labels_token_covered": 0,
+            "n_labels_phrase_covered": 0,
+            "token_total_kept": 0,
+            "phrase_total_kept": 0,
+            "token_cosine": np.nan,
+            "token_jaccard": np.nan,
+            "token_fp_rate": np.nan,
+            "phrase_top1_iou": np.nan,
+            "phrase_top5_max_iou": np.nan,
+            "phrase_weighted_iou": np.nan,
+            "phrase_unweighted_iou": np.nan,
+            "phrase_rankaware_iou": np.nan,
+            "reliability_n_agree_positive": 0,
+            "reliability_fp_rate": np.nan,
+            "reliability_tp_rate": np.nan,
+        })
+        return to_serializable_row(base)
 
-    return out
+    df = pd.DataFrame(label_summary_rows)
 
+    token_weights = df["token_n_kept"].to_numpy(dtype=float)
 
-def run_attention_seed_analysis(
+    token_cosine = weighted_mean(
+        df["token_cosine_mean"].to_numpy(dtype=float),
+        token_weights,
+    )
+    token_jaccard = weighted_mean(
+        df["token_jaccard_mean"].to_numpy(dtype=float),
+        token_weights,
+    )
+    token_fp_rate = weighted_mean(
+        df["token_fp_rate"].to_numpy(dtype=float),
+        token_weights,
+    )
+
+    base.update({
+        "n_labels_total": int(N_LABELS),
+        "n_labels_token_covered": int((df["token_n_kept"] > 0).sum()),
+        "token_total_kept": int(df["token_n_kept"].sum()),
+        "token_cosine": token_cosine,
+        "token_jaccard": token_jaccard,
+        "token_fp_rate": token_fp_rate,
+    })
+
+    if "phrase_n_kept" in df.columns:
+        phrase_weights = df["phrase_n_kept"].to_numpy(dtype=float)
+
+        base.update({
+            "n_labels_phrase_covered": int((df["phrase_n_kept"] > 0).sum()),
+            "phrase_total_kept": int(df["phrase_n_kept"].sum()),
+            "phrase_top1_iou": weighted_mean(
+                df["phrase_top1_iou_mean"].to_numpy(dtype=float),
+                phrase_weights,
+            ),
+            "phrase_top5_max_iou": weighted_mean(
+                df["phrase_top5_max_iou_mean"].to_numpy(dtype=float),
+                phrase_weights,
+            ),
+            "phrase_weighted_iou": weighted_mean(
+                df["phrase_weighted_iou_mean"].to_numpy(dtype=float),
+                phrase_weights,
+            ),
+            "phrase_unweighted_iou": weighted_mean(
+                df["phrase_unweighted_iou_mean"].to_numpy(dtype=float),
+                phrase_weights,
+            ),
+            "phrase_rankaware_iou": weighted_mean(
+                df["phrase_rankaware_iou_mean"].to_numpy(dtype=float),
+                phrase_weights,
+            ),
+        })
+
+    else:
+        base.update({
+            "n_labels_phrase_covered": 0,
+            "phrase_total_kept": 0,
+            "phrase_top1_iou": np.nan,
+            "phrase_top5_max_iou": np.nan,
+            "phrase_weighted_iou": np.nan,
+            "phrase_unweighted_iou": np.nan,
+            "phrase_rankaware_iou": np.nan,
+        })
+
+    reliability_summary = summarize_reliability_rows(reliability_rows)
+
+    base.update({
+        "reliability_n_agree_positive": reliability_summary.get("n_agree_positive", 0),
+        "reliability_fp_rate": reliability_summary.get("fp_rate", np.nan),
+        "reliability_tp_rate": reliability_summary.get("tp_rate", np.nan),
+        "reliability_cosine_mean": reliability_summary.get("cosine_mean", np.nan),
+        "reliability_jaccard_mean": reliability_summary.get("jaccard_mean", np.nan),
+        "reliability_avg_agreement_mean": reliability_summary.get("avg_agreement_mean", np.nan),
+        "reliability_min_agreement_mean": reliability_summary.get("min_agreement_mean", np.nan),
+    })
+
+    return to_serializable_row(base)
+
+# %% [markdown]
+# ### 13.10 Run one seed/model-pair
+# 
+# This is the main worker used by the attention sweep.
+
+# %%
+def run_attention_for_seed_pair(
+    predictive_ok_df: pd.DataFrame,
     seed: int,
-    model_pairs: List[Tuple[str, str]],
-    predictive_df: pd.DataFrame,
-    mode: str = ATTENTION_SWEEP_MODE,
-    top_k: int = ATTENTION_TOP_K,
-    top_k_phrases: int = ATTENTION_TOP_K_PHRASES,
-    phrase_window: int = ATTENTION_PHRASE_WINDOW,
-    trim_context: bool = ATTENTION_TRIM_CONTEXT,
-    use_nms: bool = ATTENTION_USE_NMS,
-    nms_thresh: float = ATTENTION_NMS_THRESH,
-    nms_grab_multiplier: int = ATTENTION_NMS_GRAB_MULTIPLIER,
-    max_samples_per_label: Optional[int] = ATTENTION_MAX_SAMPLES_PER_LABEL,
-    max_labels: Optional[int] = ATTENTION_MAX_LABELS,
-    reliability_n_bins: int = ATTENTION_RELIABILITY_BINS,
+    model_a: str,
+    model_b: str,
+    mode: str = ATTENTION_MODE,
     device: torch.device = device,
 ) -> dict:
     """
-    Run the full attention/rationale analysis for one seed over multiple pairs.
+    Run attention/rationale analysis for one seed and one model pair.
+
+    Returns:
+        Dictionary containing:
+        - summary_row
+        - label_rows
+        - reliability_rows
+        - reliability_bin_rows
     """
-    if not model_pairs:
-        return {
-            "attention_rows": [],
-            "reliability_rows": [],
-            "reliability_bin_rows": [],
-        }
+    start_time = time.time()
 
-    methods = sorted(set(itertools.chain.from_iterable(model_pairs)))
+    print("\n" + "=" * 90)
+    print(f"Attention analysis | seed={seed} | {model_a} vs {model_b}")
+    print("=" * 90)
 
-    models_by_name, thresholds_by_name = load_attention_model_bundle(
-        run_rows=predictive_df,
+    models, thresholds = load_attention_pair_bundle(
+        predictive_ok_df=predictive_ok_df,
         seed=seed,
-        methods=methods,
+        model_a=model_a,
+        model_b=model_b,
         device=device,
     )
 
     cache = precompute_attention_cache(
-        models=models_by_name,
+        models=models,
         data_loader=test_loader,
-        thresholds_by_model=thresholds_by_name,
+        thresholds_by_model=thresholds,
         device=device,
-        show_progress=False,
+        show_progress=True,
     )
 
     check_attention_cache_shapes(
         cache=cache,
         expected_n=len(test_dataset),
-        expected_labels=N_LABELS,
+        expected_labels=BASE_CONFIG["label_space"],
     )
 
-    label_indices = list(range(N_LABELS))
-    if max_labels is not None:
-        label_indices = label_indices[: int(max_labels)]
+    label_rows, reliability_rows, reliability_bin_rows = compute_label_level_attention_outputs_for_pair(
+        cache=cache,
+        X_tensor=X_test,
+        Y_tensor=Y_test,
+        seed=seed,
+        model_a=model_a,
+        model_b=model_b,
+        mode=mode,
+        max_labels=ATTENTION_MAX_LABELS,
+        max_samples_per_label=ATTENTION_MAX_SAMPLES_PER_LABEL,
+        compute_phrase=COMPUTE_PHRASE_ALIGNMENT,
+        compute_reliability=COMPUTE_RELIABILITY_ROWS,
+    )
 
-    attention_rows = []
-    reliability_rows = []
-    reliability_bin_rows = []
+    elapsed_sec = time.time() - start_time
 
-    for model_a, model_b in model_pairs:
-        pair_label_rows = []
-        pair_reliability_rows = []
+    summary_row = summarize_seed_pair_attention_outputs(
+        label_summary_rows=label_rows,
+        reliability_rows=reliability_rows,
+        seed=seed,
+        model_a=model_a,
+        model_b=model_b,
+        mode=mode,
+        elapsed_sec=elapsed_sec,
+        status="ok",
+    )
 
-        iterator = tqdm(
-            label_indices,
-            desc=f"Attention seed={seed} {model_a} vs {model_b}",
-            leave=False,
-        )
-
-        for label_idx in iterator:
-            token_summary = compute_token_alignment_summary_for_pair_label(
-                cache=cache,
-                X_tensor=X_test,
-                Y_tensor=Y_test,
-                model_a=model_a,
-                model_b=model_b,
-                label_idx=label_idx,
-                mode=mode,
-                top_k=top_k,
-                trim_context=trim_context,
-                window_size=BASE_CONFIG["window_size"],
-                max_samples=max_samples_per_label,
-            )
-
-            phrase_rows = compute_phrase_alignment_rows_for_pair_label(
-                cache=cache,
-                X_tensor=X_test,
-                Y_tensor=Y_test,
-                model_a=model_a,
-                model_b=model_b,
-                label_idx=label_idx,
-                mode=mode,
-                top_k_phrases=top_k_phrases,
-                phrase_window=phrase_window,
-                trim_context=trim_context,
-                use_nms=use_nms,
-                nms_thresh=nms_thresh,
-                nms_grab_multiplier=nms_grab_multiplier,
-                max_samples=max_samples_per_label,
-            )
-            phrase_summary = summarize_phrase_alignment_rows(phrase_rows)
-
-            rel_rows = compute_reliability_rows_for_pair_label(
-                cache=cache,
-                X_tensor=X_test,
-                Y_tensor=Y_test,
-                model_a=model_a,
-                model_b=model_b,
-                label_idx=label_idx,
-                top_k=top_k,
-                trim_context=trim_context,
-                window_size=BASE_CONFIG["window_size"],
-                max_samples=max_samples_per_label,
-            )
-
-            rel_rows = [
-                to_serializable_row({
-                    **row,
-                    "seed": int(seed),
-                    "pair": f"{model_a}_vs_{model_b}",
-                    "model_a": model_a,
-                    "model_b": model_b,
-                    "mode": mode,
-                })
-                for row in rel_rows
-            ]
-
-            rel_summary = summarize_reliability_rows(rel_rows)
-
-            label_row = {
-                "seed": int(seed),
-                "pair": f"{model_a}_vs_{model_b}",
-                "model_a": model_a,
-                "model_b": model_b,
-                "mode": mode,
-                "label_idx": int(label_idx),
-                "label_code": IDX_TO_CODE.get(int(label_idx), "UNK"),
-                "label_description": CODE_TO_DESC.get(
-                    IDX_TO_CODE.get(int(label_idx), "UNK"),
-                    "Unknown ICD code",
-                ),
-                "top_k": int(top_k),
-                "top_k_phrases": int(top_k_phrases),
-                "token_n_kept": token_summary["n_kept"],
-                "token_cosine_mean": token_summary["cosine_mean"],
-                "token_cosine_median": token_summary["cosine_median"],
-                "token_jaccard_mean": token_summary["jaccard_mean"],
-                "token_jaccard_median": token_summary["jaccard_median"],
-                "token_fp_rate": token_summary["fp_rate"],
-                "phrase_n_kept": phrase_summary["n_kept"],
-                "phrase_top1_iou_mean": phrase_summary["phrase_top1_iou_mean"],
-                "phrase_top5_max_iou_mean": phrase_summary["phrase_top5_max_iou_mean"],
-                "phrase_weighted_iou_mean": phrase_summary["phrase_weighted_iou_mean"],
-                "phrase_unweighted_iou_mean": phrase_summary["phrase_unweighted_iou_mean"],
-                "phrase_rankaware_iou_mean": phrase_summary["phrase_rankaware_iou_mean"],
-                "reliability_n_agree_positive": rel_summary["n_agree_positive"],
-                "reliability_fp_rate": rel_summary["fp_rate"],
-                "reliability_tp_rate": rel_summary["tp_rate"],
-                "reliability_cosine_mean": rel_summary["cosine_mean"],
-                "reliability_jaccard_mean": rel_summary["jaccard_mean"],
-                "reliability_avg_agreement_mean": rel_summary["avg_agreement_mean"],
-                "reliability_min_agreement_mean": rel_summary["min_agreement_mean"],
-            }
-
-            pair_label_rows.append(to_serializable_row(label_row))
-            pair_reliability_rows.extend(rel_rows)
-
-        label_summary_df = pd.DataFrame(pair_label_rows)
-        label_summary_path = os.path.join(
-            ATTENTION_LABEL_SUMMARY_DIR,
-            f"attention_seed{seed}_{safe_name(model_a)}_vs_{safe_name(model_b)}.csv",
-        )
-        label_summary_df.to_csv(label_summary_path, index=False)
-
-        pair_summary = build_attention_pair_summary_from_label_df(label_summary_df)
-        pair_summary_row = to_serializable_row({
-            "seed": int(seed),
-            "pair": f"{model_a}_vs_{model_b}",
-            "model_a": model_a,
-            "model_b": model_b,
-            "mode": mode,
-            "top_k": int(top_k),
-            "top_k_phrases": int(top_k_phrases),
-            "phrase_window": int(phrase_window),
-            "nms_thresh": float(nms_thresh),
-            "status": "ok",
-            "label_summary_path": label_summary_path,
-            **pair_summary,
-        })
-        attention_rows.append(pair_summary_row)
-
-        for agreement_metric in ["cosine", "jaccard", "avg_agreement", "min_agreement"]:
-            bins_df = fp_rate_by_agreement_quantile(
-                rows=pair_reliability_rows,
-                agreement_col=agreement_metric,
-                n_bins=reliability_n_bins,
-                min_bin_size=1,
-            )
-
-            if bins_df.empty:
-                continue
-
-            for row in bins_df.to_dict(orient="records"):
-                reliability_bin_rows.append(to_serializable_row({
-                    "seed": int(seed),
-                    "pair": f"{model_a}_vs_{model_b}",
-                    "model_a": model_a,
-                    "model_b": model_b,
-                    "mode": mode,
-                    **row,
-                }))
-
-        reliability_rows.extend(pair_reliability_rows)
+    # Clean up large objects explicitly.
+    try:
+        del models
+        del thresholds
+        del cache
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
 
     return {
-        "attention_rows": attention_rows,
+        "summary_row": summary_row,
+        "label_rows": label_rows,
         "reliability_rows": reliability_rows,
         "reliability_bin_rows": reliability_bin_rows,
+        "status": "ok",
     }
 
 # %% [markdown]
-# ### 13.4 Attention seed-sweep runner
+# ### 13.11 Safe one-run wrapper
+# 
+# This prevents a single failed seed/model-pair from stopping the full sweep.
 
 # %%
-def run_attention_seed_sweep(
-    predictive_df: pd.DataFrame,
-    model_pairs: List[Tuple[str, str]],
-    seeds: List[int],
-    attention_csv: str = ATTENTION_RAW_CSV,
-    reliability_csv: str = RELIABILITY_RAW_CSV,
-    reliability_bins_csv: str = RELIABILITY_BINS_RAW_CSV,
-    skip_completed: bool = True,
-    max_runs: Optional[int] = None,
+def run_attention_for_seed_pair_safe(
+    predictive_ok_df: pd.DataFrame,
+    seed: int,
+    model_a: str,
+    model_b: str,
+    mode: str = ATTENTION_MODE,
     device: torch.device = device,
-) -> pd.DataFrame:
+) -> dict:
     """
-    Run the repeated-seed attention/rationale analysis.
+    Safe wrapper for one seed/model-pair attention run.
     """
-    completed_keys = get_completed_attention_keys(attention_csv)
-    df_ok = predictive_df.copy()
+    start_time = time.time()
 
-    if "status" in df_ok.columns:
-        df_ok = df_ok[df_ok["status"] == "ok"]
-
-    new_rows = []
-    launched = 0
-
-    for seed in seeds:
-        available_methods = set(
-            df_ok[df_ok["seed"] == int(seed)]["method"].astype(str).unique().tolist()
+    try:
+        return run_attention_for_seed_pair(
+            predictive_ok_df=predictive_ok_df,
+            seed=seed,
+            model_a=model_a,
+            model_b=model_b,
+            mode=mode,
+            device=device,
         )
 
-        seed_pairs = [
-            pair for pair in model_pairs
-            if pair[0] in available_methods and pair[1] in available_methods
-        ]
+    except Exception as e:
+        elapsed_sec = time.time() - start_time
+        err = repr(e)
 
-        if skip_completed:
-            seed_pairs = [
-                pair for pair in seed_pairs
-                if make_attention_pair_key(
-                    seed=seed,
-                    model_a=pair[0],
-                    model_b=pair[1],
-                    mode=ATTENTION_SWEEP_MODE,
-                ) not in completed_keys
-            ]
+        print(f"[ATTENTION FAILED] seed={seed} | {model_a} vs {model_b}")
+        print(err)
 
-        if not seed_pairs:
-            print(f"[Attention] seed={seed}: nothing to run.")
-            continue
-
-        if max_runs is not None and launched >= int(max_runs):
-            print(f"[Attention] reached max_runs={max_runs}. Stopping sweep.")
-            break
-
-        print("\n" + "=" * 90)
-        print(f"Running attention analysis for seed={seed}")
-        print("Pairs:", seed_pairs)
-        print("=" * 90)
-
-        try:
-            result = run_attention_seed_analysis(
-                seed=seed,
-                model_pairs=seed_pairs,
-                predictive_df=df_ok,
-                device=device,
-            )
-
-            append_rows_to_csv(result["attention_rows"], attention_csv)
-            append_rows_to_csv(result["reliability_rows"], reliability_csv)
-            append_rows_to_csv(result["reliability_bin_rows"], reliability_bins_csv)
-
-            new_rows.extend(result["attention_rows"])
-            launched += len(result["attention_rows"])
-
-            for row in result["attention_rows"]:
-                completed_keys.add(
-                    make_attention_pair_key(
-                        seed=row["seed"],
-                        model_a=row["model_a"],
-                        model_b=row["model_b"],
-                        mode=row["mode"],
-                    )
-                )
-
-        except Exception as e:
-            print(f"[Attention FAILED] seed={seed}")
-            print(repr(e))
-
-            failed_rows = [
-                to_serializable_row({
-                    "seed": int(seed),
-                    "pair": f"{model_a}_vs_{model_b}",
-                    "model_a": model_a,
-                    "model_b": model_b,
-                    "mode": ATTENTION_SWEEP_MODE,
-                    "status": "failed",
-                    "error": repr(e),
-                })
-                for model_a, model_b in seed_pairs
-            ]
-
-            append_rows_to_csv(failed_rows, attention_csv)
-            new_rows.extend(failed_rows)
+        summary_row = summarize_seed_pair_attention_outputs(
+            label_summary_rows=[],
+            reliability_rows=[],
+            seed=seed,
+            model_a=model_a,
+            model_b=model_b,
+            mode=mode,
+            elapsed_sec=elapsed_sec,
+            status="failed",
+            error=err,
+        )
 
         try:
             torch.cuda.empty_cache()
         except Exception:
             pass
 
-    return pd.DataFrame(new_rows)
+        return {
+            "summary_row": summary_row,
+            "label_rows": [],
+            "reliability_rows": [],
+            "reliability_bin_rows": [],
+            "status": "failed",
+            "error": err,
+        }
 
 # %% [markdown]
-# ### 13.5 Launch attention seed sweep
+# ### 13.12 Full attention seed-sweep runner
+# 
+# This loops over expected available seed/model-pair rows and appends outputs to:
+# - `ATTENTION_RAW_CSV`
+# - `ATTENTION_LABEL_RAW_CSV`
+# - `RELIABILITY_RAW_CSV`
+# - `RELIABILITY_BINS_RAW_CSV`
+
+# %%
+def run_attention_seed_sweep(
+    expected_attention_df: pd.DataFrame,
+    predictive_ok_df: pd.DataFrame,
+    attention_csv: str = ATTENTION_RAW_CSV,
+    attention_label_csv: str = ATTENTION_LABEL_RAW_CSV,
+    reliability_csv: str = RELIABILITY_RAW_CSV,
+    reliability_bins_csv: str = RELIABILITY_BINS_RAW_CSV,
+    failed_attention_csv: str = ATTENTION_FAILED_CSV,
+    skip_completed_ok: bool = True,
+    skip_previous_failures: bool = False,
+    max_runs: Optional[int] = None,
+    device: torch.device = device,
+) -> pd.DataFrame:
+    """
+    Run attention/rationale analysis across available seed/model-pair rows.
+    """
+    available_df = expected_attention_df[expected_attention_df["available"]].copy()
+
+    ok_keys, failed_keys, _ = get_completed_attention_key_sets(attention_csv)
+
+    new_summary_rows = []
+    launched = 0
+    skipped_ok = 0
+    skipped_failed = 0
+
+    print("\n" + "=" * 90)
+    print("Starting attention/rationale seed sweep")
+    print("=" * 90)
+    print("Available expected runs:", len(available_df))
+    print("Already completed OK:", len(ok_keys))
+    print("Previously failed:", len(failed_keys))
+    print("skip_completed_ok:", skip_completed_ok)
+    print("skip_previous_failures:", skip_previous_failures)
+    print("max_runs:", max_runs)
+    print("Attention CSV:", attention_csv)
+    print("=" * 90)
+
+    for idx, row in available_df.iterrows():
+        key = make_attention_run_key(row)
+
+        seed = int(row["seed"])
+        model_a = str(row["model_a"])
+        model_b = str(row["model_b"])
+        mode = str(row.get("mode", ATTENTION_MODE))
+
+        if skip_completed_ok and key in ok_keys:
+            skipped_ok += 1
+            print(f"[SKIP OK] seed={seed} | {model_a} vs {model_b}")
+            continue
+
+        if skip_previous_failures and key in failed_keys:
+            skipped_failed += 1
+            print(f"[SKIP FAILED] seed={seed} | {model_a} vs {model_b}")
+            continue
+
+        if max_runs is not None and launched >= int(max_runs):
+            print(f"Reached max_runs={max_runs}. Stopping attention sweep.")
+            break
+
+        result = run_attention_for_seed_pair_safe(
+            predictive_ok_df=predictive_ok_df,
+            seed=seed,
+            model_a=model_a,
+            model_b=model_b,
+            mode=mode,
+            device=device,
+        )
+
+        summary_row = result["summary_row"]
+        label_rows = result["label_rows"]
+        reliability_rows = result["reliability_rows"]
+        reliability_bin_rows = result["reliability_bin_rows"]
+
+        append_row_to_csv(summary_row, attention_csv)
+        new_summary_rows.append(summary_row)
+
+        if label_rows:
+            append_rows_to_csv(label_rows, attention_label_csv)
+
+        if (
+            SAVE_SAMPLE_LEVEL_RELIABILITY_ROWS
+            and reliability_rows
+        ):
+            append_rows_to_csv(reliability_rows, reliability_csv)
+
+        if reliability_bin_rows:
+            append_rows_to_csv(reliability_bin_rows, reliability_bins_csv)
+
+        if summary_row.get("status") == "failed":
+            append_row_to_csv(summary_row, failed_attention_csv)
+
+        launched += 1
+
+        if summary_row.get("status") == "ok":
+            ok_keys.add(key)
+        elif summary_row.get("status") == "failed":
+            failed_keys.add(key)
+
+        try:
+            del result
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    print("\n" + "=" * 90)
+    print("Attention/rationale seed sweep finished")
+    print("=" * 90)
+    print("Launched new runs:", launched)
+    print("Skipped completed OK:", skipped_ok)
+    print("Skipped previous failures:", skipped_failed)
+    print("New summary rows:", len(new_summary_rows))
+    print("Attention raw CSV:", attention_csv)
+
+    return pd.DataFrame(new_summary_rows)
+
+# %% [markdown]
+# ### 13.13 Launch attention/rationale seed sweep
+# 
+# This cell is protected by `RUN_ATTENTION_SWEEP`.
+# 
+# Before running this:
+# 1. Complete Section 12 predictive seed sweep.
+# 2. Rerun Sections 13.4 and 13.5 so the expected attention table sees the new checkpoints.
+# 3. Set `RUN_ATTENTION_SWEEP = True`.
 
 # %%
 if RUN_ATTENTION_SWEEP:
     attention_sweep_new_rows_df = run_attention_seed_sweep(
-        predictive_df=predictive_for_attention_df,
-        model_pairs=ATTENTION_MODEL_PAIRS,
-        seeds=ATTENTION_SWEEP_SEEDS,
+        expected_attention_df=expected_attention_df,
+        predictive_ok_df=predictive_ok_for_attention_df,
         attention_csv=ATTENTION_RAW_CSV,
+        attention_label_csv=ATTENTION_LABEL_RAW_CSV,
         reliability_csv=RELIABILITY_RAW_CSV,
         reliability_bins_csv=RELIABILITY_BINS_RAW_CSV,
-        skip_completed=SKIP_COMPLETED_ATTENTION_RUNS,
+        failed_attention_csv=ATTENTION_FAILED_CSV,
+        skip_completed_ok=SKIP_COMPLETED_ATTENTION_RUNS,
+        skip_previous_failures=SKIP_PREVIOUS_ATTENTION_FAILURES,
         max_runs=MAX_ATTENTION_RUNS,
         device=device,
     )
 
-    print("New attention rows from this call:")
+    print("New attention summary rows from this call:")
     display(attention_sweep_new_rows_df)
 
 else:
-    print("RUN_ATTENTION_SWEEP is False. No attention analysis launched.")
+    print("RUN_ATTENTION_SWEEP is False. No attention/rationale analysis launched.")
+    print("Set RUN_ATTENTION_SWEEP = True in Section 13.1 to launch the sweep.")
 
 # %% [markdown]
-# ### 13.6 Inspect attention raw results
+# ### 13.14 Inspect raw attention results
+# 
+# This can be run before, during, or after the full attention sweep.
 
 # %%
-attention_raw_df = load_attention_raw_results(ATTENTION_RAW_CSV)
+attention_raw_df = read_csv_if_exists(ATTENTION_RAW_CSV)
+
+if attention_raw_df.empty:
+    print("No attention raw results found yet:", ATTENTION_RAW_CSV)
+
+else:
+    print("Attention raw results shape:", attention_raw_df.shape)
+    print("Attention raw CSV:", ATTENTION_RAW_CSV)
+
+    print("\nStatus summary:")
+    display(
+        attention_raw_df
+        .groupby(["pair", "mode", "status"])
+        .size()
+        .reset_index(name="n_rows")
+        .sort_values(["pair", "mode", "status"])
+    )
+
+    preview_cols = [
+        c for c in [
+            "seed",
+            "pair",
+            "mode",
+            "status",
+            "token_total_kept",
+            "token_cosine",
+            "token_jaccard",
+            "phrase_weighted_iou",
+            "reliability_n_agree_positive",
+            "reliability_fp_rate",
+            "elapsed_sec",
+        ]
+        if c in attention_raw_df.columns
+    ]
+
+    display(
+        attention_raw_df[preview_cols]
+        .sort_values(["pair", "seed"])
+        .tail(30)
+    )
+
+# %% [markdown]
+# ### 13.15 Inspect label-level attention results
+
+# %%
+attention_label_raw_df = read_csv_if_exists(ATTENTION_LABEL_RAW_CSV)
+
+if attention_label_raw_df.empty:
+    print("No label-level attention results found yet:", ATTENTION_LABEL_RAW_CSV)
+
+else:
+    print("Label-level attention raw results shape:", attention_label_raw_df.shape)
+    print("Label-level attention raw CSV:", ATTENTION_LABEL_RAW_CSV)
+
+    preview_cols = [
+        c for c in [
+            "seed",
+            "pair",
+            "mode",
+            "label_idx",
+            "label_code",
+            "token_n_kept",
+            "token_cosine_mean",
+            "token_jaccard_mean",
+            "phrase_n_kept",
+            "phrase_weighted_iou_mean",
+        ]
+        if c in attention_label_raw_df.columns
+    ]
+
+    display(
+        attention_label_raw_df[preview_cols]
+        .sort_values(["pair", "seed", "label_idx"])
+        .head(30)
+    )
+
+# %% [markdown]
+# ### 13.16 Inspect reliability outputs
+
+# %%
 reliability_raw_df = read_csv_if_exists(RELIABILITY_RAW_CSV)
 reliability_bins_raw_df = read_csv_if_exists(RELIABILITY_BINS_RAW_CSV)
 
-if attention_raw_df.empty:
-    print("No attention summary rows found yet:", ATTENTION_RAW_CSV)
+if reliability_raw_df.empty:
+    print("No sample-level reliability rows found yet:", RELIABILITY_RAW_CSV)
 else:
-    print("Attention raw summary shape:", attention_raw_df.shape)
+    print("Reliability sample-level rows shape:", reliability_raw_df.shape)
+    print("Reliability sample-level CSV:", RELIABILITY_RAW_CSV)
+
+    preview_cols = [
+        c for c in [
+            "seed",
+            "pair",
+            "label_idx",
+            "label_code",
+            "gt",
+            "prob_a",
+            "prob_b",
+            "cosine",
+            "jaccard",
+            "avg_agreement",
+            "min_agreement",
+            "is_false_positive",
+            "is_true_positive",
+        ]
+        if c in reliability_raw_df.columns
+    ]
+
+    display(reliability_raw_df[preview_cols].head(30))
+
+if reliability_bins_raw_df.empty:
+    print("No reliability-bin rows found yet:", RELIABILITY_BINS_RAW_CSV)
+else:
+    print("Reliability-bin rows shape:", reliability_bins_raw_df.shape)
+    print("Reliability-bin CSV:", RELIABILITY_BINS_RAW_CSV)
+
     display(
-        attention_raw_df.sort_values(["seed", "pair"]).tail(20)
+        reliability_bins_raw_df
+        .sort_values(["pair", "seed", "agreement_metric", "agreement_bin"])
+        .head(30)
     )
 
-print("Reliability sample-level rows:", len(reliability_raw_df))
-print("Reliability binned rows:", len(reliability_bins_raw_df))
+# %% [markdown]
+# ### 13.17 Attention completion report
+# 
+# This compares the expected attention seed/model-pair grid against the raw
+# attention summary CSV.
 
-attention_missing_df = find_missing_attention_runs(
-    predictive_df=predictive_for_attention_df,
-    model_pairs=ATTENTION_MODEL_PAIRS,
-    seeds=ATTENTION_SWEEP_SEEDS,
+# %%
+def attention_completion_report(
+    expected_attention_df: pd.DataFrame,
+    attention_csv: str = ATTENTION_RAW_CSV,
+    skip_failed: bool = False,
+) -> dict:
+    """
+    Build a completion report for attention/rationale analysis.
+    """
+    expected_available = expected_attention_df[expected_attention_df["available"]].copy()
+    raw_df = read_csv_if_exists(attention_csv)
+
+    missing_df = find_missing_attention_runs(
+        expected_attention_df=expected_attention_df,
+        attention_csv=attention_csv,
+        skip_failed=skip_failed,
+    )
+
+    if raw_df.empty:
+        ok_df = pd.DataFrame()
+        failed_df = pd.DataFrame()
+    else:
+        ok_df = raw_df[raw_df["status"] == "ok"] if "status" in raw_df.columns else pd.DataFrame()
+        failed_df = raw_df[raw_df["status"] == "failed"] if "status" in raw_df.columns else pd.DataFrame()
+
+    expected_by_pair = (
+        expected_available
+        .groupby(["pair", "mode"])
+        .size()
+        .reset_index(name="expected_runs")
+    )
+
+    if not ok_df.empty:
+        ok_by_pair = (
+            ok_df
+            .groupby(["pair", "mode"])
+            .size()
+            .reset_index(name="ok_runs")
+        )
+    else:
+        ok_by_pair = pd.DataFrame(columns=["pair", "mode", "ok_runs"])
+
+    if not failed_df.empty:
+        failed_by_pair = (
+            failed_df
+            .groupby(["pair", "mode"])
+            .size()
+            .reset_index(name="failed_rows")
+        )
+    else:
+        failed_by_pair = pd.DataFrame(columns=["pair", "mode", "failed_rows"])
+
+    completion_df = expected_by_pair.merge(
+        ok_by_pair,
+        on=["pair", "mode"],
+        how="left",
+    ).merge(
+        failed_by_pair,
+        on=["pair", "mode"],
+        how="left",
+    )
+
+    completion_df["ok_runs"] = completion_df["ok_runs"].fillna(0).astype(int)
+    completion_df["failed_rows"] = completion_df["failed_rows"].fillna(0).astype(int)
+    completion_df["missing_runs"] = completion_df["expected_runs"] - completion_df["ok_runs"]
+    completion_df["complete"] = completion_df["missing_runs"] == 0
+
+    return {
+        "expected_available_df": expected_available,
+        "raw_df": raw_df,
+        "ok_df": ok_df,
+        "failed_df": failed_df,
+        "missing_df": missing_df,
+        "completion_df": completion_df,
+    }
+
+
+attention_completion = attention_completion_report(
+    expected_attention_df=expected_attention_df,
     attention_csv=ATTENTION_RAW_CSV,
-    mode=ATTENTION_SWEEP_MODE,
+    skip_failed=SKIP_PREVIOUS_ATTENTION_FAILURES,
 )
 
-attention_completion_df = expected_attention_df.copy()
-attention_completion_df["complete"] = False
+print("Attention completion by pair:")
+display(attention_completion["completion_df"])
 
-if not attention_completion_df.empty:
-    completed_attention_keys = get_completed_attention_keys(ATTENTION_RAW_CSV)
+print("Expected available runs:", len(attention_completion["expected_available_df"]))
+print("Successful rows:", len(attention_completion["ok_df"]))
+print("Failed rows:", len(attention_completion["failed_df"]))
+print("Missing runs:", len(attention_completion["missing_df"]))
 
-    attention_completion_df["complete"] = attention_completion_df.apply(
-        lambda row: make_attention_pair_key(
-            seed=row["seed"],
-            model_a=row["model_a"],
-            model_b=row["model_b"],
-            mode=row["mode"],
-        ) in completed_attention_keys,
-        axis=1,
+if len(attention_completion["missing_df"]) > 0:
+    print("\nMissing attention run preview:")
+    display(attention_completion["missing_df"].head(30))
+
+if len(attention_completion["failed_df"]) > 0:
+    print("\nFailed attention run preview:")
+    failed_preview_cols = [
+        c for c in [
+            "seed",
+            "pair",
+            "mode",
+            "status",
+            "error",
+            "elapsed_sec",
+        ]
+        if c in attention_completion["failed_df"].columns
+    ]
+
+    display(attention_completion["failed_df"][failed_preview_cols].tail(20))
+
+# %% [markdown]
+# ### 13.18 Save attention completion report
+
+# %%
+ATTENTION_COMPLETION_CSV = os.path.join(TABLES_DIR, "attention_completion_report.csv")
+ATTENTION_MISSING_CSV = os.path.join(TABLES_DIR, "attention_missing_runs.csv")
+ATTENTION_OK_ROWS_CSV = os.path.join(TABLES_DIR, "attention_ok_rows_snapshot.csv")
+
+attention_completion["completion_df"].to_csv(ATTENTION_COMPLETION_CSV, index=False)
+attention_completion["missing_df"].to_csv(ATTENTION_MISSING_CSV, index=False)
+
+if not attention_completion["ok_df"].empty:
+    attention_completion["ok_df"].to_csv(ATTENTION_OK_ROWS_CSV, index=False)
+
+print("Saved attention completion report:")
+print("  Completion:", ATTENTION_COMPLETION_CSV)
+print("  Missing:   ", ATTENTION_MISSING_CSV)
+print("  OK rows:   ", ATTENTION_OK_ROWS_CSV)
+
+# %% [markdown]
+# ### 13.19 Quick attention metric snapshot
+# 
+# This is not the final statistical analysis.
+# 
+# It only gives a quick look at current seed/model-pair attention results.
+# Mean/CI and paired tests happen later in Section 16.
+
+# %%
+def quick_attention_metric_snapshot(
+    attention_csv: str = ATTENTION_RAW_CSV,
+) -> pd.DataFrame:
+    """
+    Quick mean/std/count snapshot of current successful attention runs.
+    """
+    df = read_csv_if_exists(attention_csv)
+
+    if df.empty:
+        print("No attention results found.")
+        return pd.DataFrame()
+
+    if "status" in df.columns:
+        df = df[df["status"] == "ok"].copy()
+
+    if df.empty:
+        print("No successful attention results found.")
+        return pd.DataFrame()
+
+    metric_cols = [
+        c for c in [
+            "token_cosine",
+            "token_jaccard",
+            "phrase_top1_iou",
+            "phrase_top5_max_iou",
+            "phrase_weighted_iou",
+            "phrase_unweighted_iou",
+            "phrase_rankaware_iou",
+            "reliability_fp_rate",
+            "reliability_tp_rate",
+        ]
+        if c in df.columns
+    ]
+
+    if not metric_cols:
+        print("No attention metric columns found.")
+        return pd.DataFrame()
+
+    summary = (
+        df
+        .groupby(["pair", "mode"])[metric_cols]
+        .agg(["count", "mean", "std", "min", "max"])
     )
 
-    completion_summary_attention_df = (
-        attention_completion_df
-        .groupby(["model_a", "model_b", "pair"])["complete"]
-        .agg(["count", "sum"])
-        .reset_index()
-        .rename(columns={"count": "expected_runs", "sum": "completed_runs"})
-    )
-    completion_summary_attention_df["missing_runs"] = (
-        completion_summary_attention_df["expected_runs"]
-        - completion_summary_attention_df["completed_runs"]
-    )
+    return summary
 
-    display(completion_summary_attention_df)
-    completion_summary_attention_df.to_csv(ATTENTION_COMPLETION_CSV, index=False)
-    attention_missing_df.to_csv(ATTENTION_MISSING_CSV, index=False)
+
+quick_attention_snapshot_df = quick_attention_metric_snapshot(ATTENTION_RAW_CSV)
+
+if not quick_attention_snapshot_df.empty:
+    display(quick_attention_snapshot_df)
 
 # %% [markdown]
 # ## 14. Statistical Helper Functions
 # 
 # This section defines the statistical analysis utilities.
 # 
-# It includes:
+# It will include:
 # - Mean calculation
 # - 95% confidence interval calculation
 # - Mean/CI formatting for paper tables
 # - Paired t-test helper
 # - Paired Cohen's d helper
 # - Multiple-comparison correction helper
-# - Correlation summary helpers
-# - Fisher-z confidence interval helper
+# - Correlation helper
+# - Fisher-z confidence interval helper, if needed
 # 
-# These functions operate on saved raw CSV results rather than directly
+# These functions should operate on saved raw CSV results rather than directly
 # depending on model objects.
 
 # %% [markdown]
-# ### 14.1 Core descriptive-statistics helpers
+# ### 14.1 Numeric cleaning helpers
+# 
+# These helpers convert metric columns into finite numeric arrays.
+# 
+# They are used throughout the statistical summaries so that missing values,
+# failed runs, and non-numeric entries do not break the analysis.
 
 # %%
 def clean_numeric(values: Any) -> np.ndarray:
     """
-    Convert a sequence to a finite float NumPy array, dropping NaNs.
+    Convert a sequence to a finite float NumPy array, dropping NaNs and infinities.
+
+    Args:
+        values:
+            List, NumPy array, Pandas Series, or other array-like object.
+
+    Returns:
+        1D NumPy array of finite floats.
     """
+    if values is None:
+        return np.array([], dtype=float)
+
     arr = np.asarray(values, dtype=float).reshape(-1)
     arr = arr[np.isfinite(arr)]
+
     return arr
 
+# %%
+def clean_paired_numeric(
+    x: Any,
+    y: Any,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Convert two paired sequences into finite numeric arrays while preserving pairs.
 
+    A pair is kept only if both x and y are finite.
+
+    Args:
+        x:
+            First sequence.
+        y:
+            Second sequence.
+
+    Returns:
+        x_clean, y_clean:
+            Paired 1D NumPy arrays.
+    """
+    x_arr = np.asarray(x, dtype=float).reshape(-1)
+    y_arr = np.asarray(y, dtype=float).reshape(-1)
+
+    n = min(len(x_arr), len(y_arr))
+    x_arr = x_arr[:n]
+    y_arr = y_arr[:n]
+
+    mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+
+    return x_arr[mask], y_arr[mask]
+
+# %% [markdown]
+# ### 14.2 Mean and 95% confidence interval helpers
+# 
+# Confidence intervals are computed across seed-level results using a t-based
+# interval.
+# 
+# This is appropriate for the repeated-seed summaries because the number of
+# seeds is small.
+
+# %%
 def mean_confidence_interval(
     values: Any,
     confidence: float = 0.95,
 ) -> dict:
     """
-    Compute mean and t-based confidence interval for a 1D sample.
+    Compute mean, standard deviation, standard error, and t-based confidence interval.
+
+    Args:
+        values:
+            Numeric values, usually one value per seed.
+        confidence:
+            Confidence level.
+
+    Returns:
+        Dictionary with n, mean, std, sem, ci_low, ci_high, and ci_half_width.
     """
     arr = clean_numeric(values)
     n = int(arr.size)
@@ -8527,7 +9384,14 @@ def mean_confidence_interval(
 
     std_val = float(np.std(arr, ddof=1))
     sem_val = float(std_val / np.sqrt(n))
-    tcrit = float(stats.t.ppf((1.0 + confidence) / 2.0, df=n - 1))
+
+    tcrit = float(
+        stats.t.ppf(
+            (1.0 + confidence) / 2.0,
+            df=n - 1,
+        )
+    )
+
     half_width = float(tcrit * sem_val)
 
     return {
@@ -8540,15 +9404,34 @@ def mean_confidence_interval(
         "ci_half_width": half_width,
     }
 
-
+# %%
 def format_mean_ci(
     mean_val: float,
     ci_low: float,
     ci_high: float,
     digits: int = 3,
+    include_label: bool = True,
 ) -> str:
     """
-    Format one metric as 'mean (95% CI: low-high)'.
+    Format one metric as a paper-ready mean/CI string.
+
+    Example:
+        0.623 (95% CI: 0.615-0.630)
+
+    Args:
+        mean_val:
+            Mean value.
+        ci_low:
+            Lower confidence interval bound.
+        ci_high:
+            Upper confidence interval bound.
+        digits:
+            Number of decimal places.
+        include_label:
+            If True, include the text '95% CI:'.
+
+    Returns:
+        Formatted string.
     """
     if not np.isfinite(mean_val):
         return "nan"
@@ -8556,50 +9439,90 @@ def format_mean_ci(
     if not np.isfinite(ci_low) or not np.isfinite(ci_high):
         return f"{mean_val:.{digits}f}"
 
-    return (
-        f"{mean_val:.{digits}f} "
-        f"(95% CI: {ci_low:.{digits}f}-{ci_high:.{digits}f})"
-    )
+    if include_label:
+        return (
+            f"{mean_val:.{digits}f} "
+            f"(95% CI: {ci_low:.{digits}f}-{ci_high:.{digits}f})"
+        )
 
+    return f"{mean_val:.{digits}f} ({ci_low:.{digits}f}-{ci_high:.{digits}f})"
 
+# %%
 def summarize_metrics_with_ci(
     df: pd.DataFrame,
     group_cols: List[str],
     metrics: List[str],
+    confidence: float = 0.95,
+    digits: int = 3,
 ) -> pd.DataFrame:
     """
-    Summarize one or more numeric metrics with mean and 95% CI.
+    Summarize one or more numeric metrics with mean and confidence intervals.
+
+    Args:
+        df:
+            Raw or seed-level results DataFrame.
+        group_cols:
+            Columns defining groups, e.g. ["experiment_group", "method"].
+        metrics:
+            Numeric metric columns to summarize.
+        confidence:
+            Confidence level.
+        digits:
+            Decimal places for formatted strings.
+
+    Returns:
+        Long-format DataFrame with one row per group/metric.
     """
     if df.empty:
         return pd.DataFrame()
 
+    missing_groups = [c for c in group_cols if c not in df.columns]
+    if missing_groups:
+        raise ValueError(f"Missing group columns: {missing_groups}")
+
     rows = []
 
-    for group_key, sub in df.groupby(group_cols):
+    available_metrics = [
+        metric
+        for metric in metrics
+        if metric in df.columns
+    ]
+
+    if not available_metrics:
+        return pd.DataFrame()
+
+    for group_key, sub in df.groupby(group_cols, dropna=False):
         if not isinstance(group_key, tuple):
             group_key = (group_key,)
 
         group_dict = dict(zip(group_cols, group_key))
 
-        for metric in metrics:
-            if metric not in sub.columns:
-                continue
+        for metric in available_metrics:
+            stats_row = mean_confidence_interval(
+                sub[metric].to_numpy(dtype=float),
+                confidence=confidence,
+            )
 
-            stats_row = mean_confidence_interval(sub[metric].to_numpy(dtype=float))
             rows.append({
                 **group_dict,
                 "metric": metric,
                 **stats_row,
                 "formatted": format_mean_ci(
-                    stats_row["mean"],
-                    stats_row["ci_low"],
-                    stats_row["ci_high"],
+                    mean_val=stats_row["mean"],
+                    ci_low=stats_row["ci_low"],
+                    ci_high=stats_row["ci_high"],
+                    digits=digits,
                 ),
             })
 
     return pd.DataFrame(rows)
 
+# %% [markdown]
+# ### 14.3 Table-formatting helpers
+# 
+# These helpers convert long-format summary rows into paper-friendly wide tables.
 
+# %%
 def make_formatted_wide_table(
     summary_df: pd.DataFrame,
     index_cols: List[str],
@@ -8608,9 +9531,30 @@ def make_formatted_wide_table(
 ) -> pd.DataFrame:
     """
     Pivot long summary rows into a paper-friendly wide table.
+
+    Args:
+        summary_df:
+            Long-format summary DataFrame from summarize_metrics_with_ci.
+        index_cols:
+            Columns to keep as row identifiers.
+        metric_col:
+            Column containing metric names.
+        value_col:
+            Column containing formatted values.
+
+    Returns:
+        Wide-format DataFrame.
     """
     if summary_df.empty:
         return pd.DataFrame()
+
+    missing = [
+        c for c in index_cols + [metric_col, value_col]
+        if c not in summary_df.columns
+    ]
+
+    if missing:
+        raise ValueError(f"Cannot make wide table. Missing columns: {missing}")
 
     wide = (
         summary_df
@@ -8624,39 +9568,168 @@ def make_formatted_wide_table(
     )
 
     wide.columns.name = None
+
     return wide
 
+# %%
+def df_to_latex_string(
+    df: pd.DataFrame,
+    index: bool = False,
+    escape: bool = False,
+) -> str:
+    """
+    Convert a DataFrame to a LaTeX table string.
+
+    Args:
+        df:
+            DataFrame to export.
+        index:
+            Whether to include the DataFrame index.
+        escape:
+            Whether Pandas should escape LaTeX special characters.
+
+    Returns:
+        LaTeX table string, or a fallback comment if conversion fails.
+    """
+    if df.empty:
+        return ""
+
+    try:
+        return df.to_latex(index=index, escape=escape)
+    except Exception as e:
+        return f"% Failed to render LaTeX table: {repr(e)}"
+
 # %% [markdown]
-# ### 14.2 Paired-comparison helpers
+# ### 14.4 Deduplication helpers
+# 
+# These helpers prevent accidental double-counting if a run is rerun and another
+# successful row is appended to the raw CSV.
+# 
+# The default behavior is to keep the latest row for each key.
 
 # %%
-def cohens_d_paired(x: Any, y: Any) -> float:
+def dedupe_latest_rows(
+    df: pd.DataFrame,
+    key_cols: List[str],
+    status_col: Optional[str] = None,
+    ok_status: str = "ok",
+    keep_status_ok_only: bool = False,
+) -> pd.DataFrame:
     """
-    Paired Cohen's d using the distribution of paired differences (y - x).
-    """
-    x_arr = clean_numeric(x)
-    y_arr = clean_numeric(y)
+    Keep the latest row for each key.
 
-    n = min(len(x_arr), len(y_arr))
-    if n < 2:
+    Args:
+        df:
+            Input DataFrame.
+        key_cols:
+            Columns defining unique runs.
+        status_col:
+            Optional status column.
+        ok_status:
+            Successful-run status value.
+        keep_status_ok_only:
+            If True, filter to status == ok_status before deduplicating.
+
+    Returns:
+        Deduplicated DataFrame.
+    """
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+
+    if (
+        keep_status_ok_only
+        and status_col is not None
+        and status_col in out.columns
+    ):
+        out = out[out[status_col] == ok_status].copy()
+
+    existing_keys = [
+        c for c in key_cols
+        if c in out.columns
+    ]
+
+    if not existing_keys:
+        return out
+
+    return out.drop_duplicates(
+        subset=existing_keys,
+        keep="last",
+    ).copy()
+
+# %%
+def dedupe_latest_ok_runs(
+    df: pd.DataFrame,
+    key_cols: List[str],
+    status_col: str = "status",
+) -> pd.DataFrame:
+    """
+    Convenience wrapper for keeping the latest successful row per run key.
+    """
+    return dedupe_latest_rows(
+        df=df,
+        key_cols=key_cols,
+        status_col=status_col,
+        ok_status="ok",
+        keep_status_ok_only=True,
+    )
+
+# %% [markdown]
+# ### 14.5 Paired effect-size helpers
+# 
+# The paired effect size is computed from the distribution of paired differences:
+# 
+# d_z = mean(y - x) / sd(y - x)
+# 
+# This matches the paired t-test design because the same seeds are used across
+# compared methods.
+
+# %%
+def cohens_d_paired(
+    x: Any,
+    y: Any,
+) -> float:
+    """
+    Paired Cohen's d_z using the distribution of paired differences.
+
+    Args:
+        x:
+            Left/baseline values.
+        y:
+            Right/comparison values.
+
+    Returns:
+        Paired Cohen's d_z. Positive means y > x on average.
+    """
+    x_arr, y_arr = clean_paired_numeric(x, y)
+
+    if len(x_arr) < 2:
         return np.nan
 
-    diff = y_arr[:n] - x_arr[:n]
+    diff = y_arr - x_arr
     diff = diff[np.isfinite(diff)]
 
-    if diff.size < 2:
+    if len(diff) < 2:
         return np.nan
 
-    sd = np.std(diff, ddof=1)
-    if sd == 0:
+    sd_diff = float(np.std(diff, ddof=1))
+
+    if sd_diff == 0:
         return np.nan
 
-    return float(np.mean(diff) / sd)
+    return float(np.mean(diff) / sd_diff)
 
-
+# %%
 def interpret_cohens_d(d: float) -> str:
     """
-    Interpret Cohen's d using the usual small/medium/large thresholds.
+    Interpret Cohen's d using common thresholds.
+
+    Thresholds:
+    - < 0.2: negligible
+    - 0.2 to < 0.5: small
+    - 0.5 to < 0.8: medium
+    - >= 0.8: large
     """
     if not np.isfinite(d):
         return "undefined"
@@ -8665,13 +9738,28 @@ def interpret_cohens_d(d: float) -> str:
 
     if ad < 0.2:
         return "negligible"
+
     if ad < 0.5:
         return "small"
+
     if ad < 0.8:
         return "medium"
+
     return "large"
 
+# %% [markdown]
+# ### 14.6 Paired t-test helper
+# 
+# This helper aligns two methods/pairs by seed before running the test.
+# 
+# The test is performed on:
+# 
+# right - left
+# 
+# Therefore, a positive mean difference or positive t-value means the right
+# method/pair has a larger value than the left method/pair.
 
+# %%
 def paired_comparison_from_df(
     df: pd.DataFrame,
     group_col: str,
@@ -8680,23 +9768,71 @@ def paired_comparison_from_df(
     metric: str,
     pair_on: str = "seed",
     extra_merge_cols: Optional[List[str]] = None,
+    dedupe: bool = True,
 ) -> dict:
     """
     Run a paired t-test between two groups after aligning rows by seed.
 
-    The test is performed on (right - left), so a positive t-value means the
-    right group tends to be larger.
+    Args:
+        df:
+            DataFrame containing group, seed, and metric columns.
+        group_col:
+            Column containing method or pair names.
+        left_name:
+            Baseline group name.
+        right_name:
+            Comparison group name.
+        metric:
+            Metric column to compare.
+        pair_on:
+            Primary pairing column, usually "seed".
+        extra_merge_cols:
+            Additional columns to use when aligning pairs.
+        dedupe:
+            If True, drop duplicate group/pair rows before merging.
+
+    Returns:
+        Dictionary containing t-test, p-value, mean difference, and Cohen's d_z.
     """
     if extra_merge_cols is None:
         extra_merge_cols = []
 
-    needed_cols = [group_col, pair_on, metric] + extra_merge_cols
-    sub = df[[c for c in needed_cols if c in df.columns]].copy()
+    needed = [group_col, pair_on, metric] + extra_merge_cols
+    missing = [c for c in needed if c not in df.columns]
 
-    left_df = sub[sub[group_col] == left_name].copy()
-    right_df = sub[sub[group_col] == right_name].copy()
+    if missing:
+        return {
+            group_col: left_name,
+            f"{group_col}_right": right_name,
+            "metric": metric,
+            "n_pairs": 0,
+            "df": np.nan,
+            "t_value": np.nan,
+            "p_value": np.nan,
+            "mean_left": np.nan,
+            "mean_right": np.nan,
+            "mean_diff_right_minus_left": np.nan,
+            "cohens_dz": np.nan,
+            "effect_size_interpretation": "undefined",
+            "comparison_label": f"{right_name} vs {left_name}",
+            "error": f"Missing columns: {missing}",
+        }
 
-    merge_keys = [pair_on] + [c for c in extra_merge_cols if c in left_df.columns and c in right_df.columns]
+    sub = df[needed].copy()
+
+    merge_keys = [pair_on] + [
+        c for c in extra_merge_cols
+        if c in sub.columns
+    ]
+
+    if dedupe:
+        sub = sub.drop_duplicates(
+            subset=[group_col] + merge_keys,
+            keep="last",
+        ).copy()
+
+    left_df = sub[sub[group_col].astype(str) == str(left_name)].copy()
+    right_df = sub[sub[group_col].astype(str) == str(right_name)].copy()
 
     paired = left_df.merge(
         right_df,
@@ -8720,75 +9856,98 @@ def paired_comparison_from_df(
             "mean_left": np.nan,
             "mean_right": np.nan,
             "mean_diff_right_minus_left": np.nan,
-            "cohens_d": np.nan,
+            "cohens_dz": np.nan,
             "effect_size_interpretation": "undefined",
             "comparison_label": f"{right_name} vs {left_name}",
         }
 
-    paired = paired.dropna(subset=[left_metric, right_metric]).copy()
+    paired = paired.dropna(
+        subset=[left_metric, right_metric],
+    ).copy()
 
-    if len(paired) < 2:
+    x, y = clean_paired_numeric(
+        paired[left_metric].to_numpy(dtype=float),
+        paired[right_metric].to_numpy(dtype=float),
+    )
+
+    if len(x) < 2:
         return {
             group_col: left_name,
             f"{group_col}_right": right_name,
             "metric": metric,
-            "n_pairs": int(len(paired)),
+            "n_pairs": int(len(x)),
             "df": np.nan,
             "t_value": np.nan,
             "p_value": np.nan,
-            "mean_left": float(paired[left_metric].mean()) if len(paired) > 0 else np.nan,
-            "mean_right": float(paired[right_metric].mean()) if len(paired) > 0 else np.nan,
-            "mean_diff_right_minus_left": float((paired[right_metric] - paired[left_metric]).mean()) if len(paired) > 0 else np.nan,
-            "cohens_d": np.nan,
+            "mean_left": float(np.mean(x)) if len(x) > 0 else np.nan,
+            "mean_right": float(np.mean(y)) if len(y) > 0 else np.nan,
+            "mean_diff_right_minus_left": float(np.mean(y - x)) if len(x) > 0 else np.nan,
+            "cohens_dz": np.nan,
             "effect_size_interpretation": "undefined",
             "comparison_label": f"{right_name} vs {left_name}",
         }
 
     t_value, p_value = stats.ttest_rel(
-        paired[right_metric].astype(float),
-        paired[left_metric].astype(float),
+        y,
+        x,
         nan_policy="omit",
     )
 
-    diff = (
-        paired[right_metric].astype(float).to_numpy()
-        - paired[left_metric].astype(float).to_numpy()
-    )
-
-    d_val = cohens_d_paired(
-        paired[left_metric].astype(float).to_numpy(),
-        paired[right_metric].astype(float).to_numpy(),
-    )
+    diff = y - x
+    d_val = cohens_d_paired(x, y)
 
     return {
         group_col: left_name,
         f"{group_col}_right": right_name,
         "metric": metric,
-        "n_pairs": int(len(paired)),
-        "df": int(len(paired) - 1),
+        "n_pairs": int(len(x)),
+        "df": int(len(x) - 1),
         "t_value": float(t_value),
         "p_value": float(p_value),
-        "mean_left": float(paired[left_metric].mean()),
-        "mean_right": float(paired[right_metric].mean()),
+        "mean_left": float(np.mean(x)),
+        "mean_right": float(np.mean(y)),
         "mean_diff_right_minus_left": float(np.mean(diff)),
-        "cohens_d": float(d_val) if np.isfinite(d_val) else np.nan,
+        "cohens_dz": float(d_val) if np.isfinite(d_val) else np.nan,
         "effect_size_interpretation": interpret_cohens_d(d_val),
         "comparison_label": f"{right_name} vs {left_name}",
     }
 
+# %% [markdown]
+# ### 14.7 Multiple-comparison correction helper
+# 
+# Holm correction is used when `statsmodels` is available.
+# 
+# If `statsmodels` is unavailable, the helper falls back to a conservative
+# Bonferroni-style correction.
 
+# %%
 def apply_multiple_comparison_correction(
     df: pd.DataFrame,
     p_col: str = "p_value",
     method: str = "holm",
+    alpha: float = 0.05,
 ) -> pd.DataFrame:
     """
-    Add adjusted p-values using Holm correction when available.
+    Add adjusted p-values and reject flags.
+
+    Args:
+        df:
+            DataFrame containing p-values.
+        p_col:
+            Name of p-value column.
+        method:
+            Correction method passed to statsmodels.multipletests.
+        alpha:
+            Significance level.
+
+    Returns:
+        DataFrame with p_value_adjusted, reject_null_adjusted, and p_adjust_method.
     """
     if df.empty or p_col not in df.columns:
-        return df
+        return df.copy()
 
     out = df.copy()
+
     out["p_value_adjusted"] = np.nan
     out["reject_null_adjusted"] = False
     out["p_adjust_method"] = method
@@ -8801,20 +9960,111 @@ def apply_multiple_comparison_correction(
     pvals = out.loc[valid_mask, p_col].to_numpy(dtype=float)
 
     if HAS_STATSMODELS:
-        reject, p_adj, _, _ = multipletests(pvals, method=method)
+        reject, p_adj, _, _ = multipletests(
+            pvals,
+            alpha=alpha,
+            method=method,
+        )
+
         out.loc[valid_mask, "p_value_adjusted"] = p_adj
         out.loc[valid_mask, "reject_null_adjusted"] = reject
+
         return out
 
-    # Fallback: conservative Bonferroni-style adjustment.
+    # Conservative fallback.
     p_adj = np.minimum(pvals * len(pvals), 1.0)
+
     out.loc[valid_mask, "p_value_adjusted"] = p_adj
-    out.loc[valid_mask, "reject_null_adjusted"] = p_adj < 0.05
+    out.loc[valid_mask, "reject_null_adjusted"] = p_adj < alpha
     out.loc[valid_mask, "p_adjust_method"] = "bonferroni_fallback"
+
     return out
 
 # %% [markdown]
-# ### 14.3 Correlation-summary helpers
+# ### 14.8 P-value and significance formatting helpers
+
+# %%
+def significance_stars(p_value: float) -> str:
+    """
+    Return conventional significance stars for a p-value.
+    """
+    if not np.isfinite(p_value):
+        return ""
+
+    if p_value < 0.001:
+        return "***"
+
+    if p_value < 0.01:
+        return "**"
+
+    if p_value < 0.05:
+        return "*"
+
+    return ""
+
+
+def format_p_value(
+    p_value: float,
+    digits: int = 3,
+) -> str:
+    """
+    Format a p-value for paper tables.
+    """
+    if not np.isfinite(p_value):
+        return "nan"
+
+    if p_value < 0.001:
+        return "<0.001"
+
+    return f"{p_value:.{digits}f}"
+
+# %% [markdown]
+# ### 14.9 Correlation helpers
+# 
+# These helpers are used later for reliability analysis.
+# 
+# Reliability correlations should be computed within each seed/model-pair first,
+# then summarized across seeds.
+
+# %%
+def pearson_spearman_correlation(
+    x: Any,
+    y: Any,
+) -> dict:
+    """
+    Compute Pearson and Spearman correlation between two variables.
+
+    Args:
+        x:
+            First variable.
+        y:
+            Second variable.
+
+    Returns:
+        Dictionary with Pearson r/p and Spearman rho/p.
+    """
+    x_arr, y_arr = clean_paired_numeric(x, y)
+    n = int(len(x_arr))
+
+    if n < 3 or np.unique(x_arr).size < 2 or np.unique(y_arr).size < 2:
+        return {
+            "n": n,
+            "pearson_r": np.nan,
+            "pearson_p": np.nan,
+            "spearman_rho": np.nan,
+            "spearman_p": np.nan,
+        }
+
+    pearson_r, pearson_p = stats.pearsonr(x_arr, y_arr)
+    spearman_rho, spearman_p = stats.spearmanr(x_arr, y_arr)
+
+    return {
+        "n": n,
+        "pearson_r": float(pearson_r),
+        "pearson_p": float(pearson_p),
+        "spearman_rho": float(spearman_rho),
+        "spearman_p": float(spearman_p),
+    }
 
 # %%
 def fisher_z_mean_ci(
@@ -8822,19 +10072,30 @@ def fisher_z_mean_ci(
     confidence: float = 0.95,
 ) -> dict:
     """
-    Compute a Fisher-z mean and confidence interval for a collection of r values.
+    Compute Fisher-z mean and confidence interval for correlation coefficients.
+
+    Args:
+        correlations:
+            Sequence of correlation coefficients, usually one per seed.
+        confidence:
+            Confidence level.
+
+    Returns:
+        Dictionary with n, mean_r, ci_low, and ci_high.
     """
     arr = clean_numeric(correlations)
-    arr = np.clip(arr, -0.999999, 0.999999)
 
-    n = int(arr.size)
-    if n == 0:
+    if arr.size == 0:
         return {
             "n": 0,
             "mean_r": np.nan,
             "ci_low": np.nan,
             "ci_high": np.nan,
         }
+
+    arr = np.clip(arr, -0.999999, 0.999999)
+
+    n = int(arr.size)
 
     if n == 1:
         return {
@@ -8845,7 +10106,10 @@ def fisher_z_mean_ci(
         }
 
     z = np.arctanh(arr)
-    z_stats = mean_confidence_interval(z, confidence=confidence)
+    z_stats = mean_confidence_interval(
+        z,
+        confidence=confidence,
+    )
 
     return {
         "n": n,
@@ -8854,10 +10118,24 @@ def fisher_z_mean_ci(
         "ci_high": float(np.tanh(z_stats["ci_high"])),
     }
 
-
-def one_sample_t_test(values: Any, popmean: float = 0.0) -> dict:
+# %%
+def one_sample_t_test(
+    values: Any,
+    popmean: float = 0.0,
+) -> dict:
     """
     Run a one-sample t-test against a population mean.
+
+    This is useful for testing whether seed-level correlations differ from zero.
+
+    Args:
+        values:
+            Numeric values, usually one per seed.
+        popmean:
+            Null-hypothesis mean.
+
+    Returns:
+        Dictionary with n, df, t_value, and p_value.
     """
     arr = clean_numeric(values)
 
@@ -8869,7 +10147,11 @@ def one_sample_t_test(values: Any, popmean: float = 0.0) -> dict:
             "p_value": np.nan,
         }
 
-    t_value, p_value = stats.ttest_1samp(arr, popmean=popmean, nan_policy="omit")
+    t_value, p_value = stats.ttest_1samp(
+        arr,
+        popmean=popmean,
+        nan_policy="omit",
+    )
 
     return {
         "n": int(arr.size),
@@ -8878,677 +10160,343 @@ def one_sample_t_test(values: Any, popmean: float = 0.0) -> dict:
         "p_value": float(p_value),
     }
 
+# %% [markdown]
+# ### 14.10 Generic CSV summary helper
+# 
+# This helper is optional, but useful later when summarizing any raw CSV with
+# mean and CI by specified grouping columns.
 
-def df_to_latex_string(
-    df: pd.DataFrame,
-    index: bool = False,
-) -> str:
+# %%
+def summarize_csv_metrics_with_ci(
+    csv_path: str,
+    group_cols: List[str],
+    metrics: List[str],
+    status_col: Optional[str] = "status",
+    keep_status: Optional[str] = "ok",
+    dedupe_key_cols: Optional[List[str]] = None,
+    confidence: float = 0.95,
+    digits: int = 3,
+) -> pd.DataFrame:
     """
-    Convert a DataFrame to LaTeX, returning a safe fallback string on failure.
+    Load a CSV and summarize selected metrics with confidence intervals.
+
+    Args:
+        csv_path:
+            Raw CSV path.
+        group_cols:
+            Grouping columns.
+        metrics:
+            Metric columns.
+        status_col:
+            Optional status column.
+        keep_status:
+            Optional status value to keep.
+        dedupe_key_cols:
+            Optional key columns for deduplication.
+        confidence:
+            Confidence level.
+        digits:
+            Decimal places.
+
+    Returns:
+        Long-format summary DataFrame.
     """
+    df = read_csv_if_exists(csv_path)
+
     if df.empty:
-        return ""
+        return pd.DataFrame()
 
-    try:
-        return df.to_latex(index=index)
-    except Exception as e:
-        return f"% Failed to render LaTeX table: {repr(e)}"
+    if (
+        status_col is not None
+        and keep_status is not None
+        and status_col in df.columns
+    ):
+        df = df[df[status_col] == keep_status].copy()
+
+    if dedupe_key_cols is not None:
+        df = dedupe_latest_rows(
+            df=df,
+            key_cols=dedupe_key_cols,
+        )
+
+    return summarize_metrics_with_ci(
+        df=df,
+        group_cols=group_cols,
+        metrics=metrics,
+        confidence=confidence,
+        digits=digits,
+    )
+
+# %% [markdown]
+# ### 14.11 Statistical helper sanity checks
+# 
+# This cell only checks that the helper functions run on toy data.
+# It does not use model outputs or paper results.
+
+# %%
+toy_values = [0.60, 0.62, 0.61, 0.64, 0.63]
+toy_ci = mean_confidence_interval(toy_values)
+
+print("Toy mean/CI:")
+print(toy_ci)
+print(
+    format_mean_ci(
+        toy_ci["mean"],
+        toy_ci["ci_low"],
+        toy_ci["ci_high"],
+    )
+)
+
+toy_df = pd.DataFrame({
+    "method": ["A", "A", "A", "B", "B", "B"],
+    "seed": [1, 2, 3, 1, 2, 3],
+    "f1_macro": [0.60, 0.62, 0.61, 0.63, 0.64, 0.65],
+})
+
+toy_summary = summarize_metrics_with_ci(
+    df=toy_df,
+    group_cols=["method"],
+    metrics=["f1_macro"],
+)
+
+toy_test = paired_comparison_from_df(
+    df=toy_df,
+    group_col="method",
+    left_name="A",
+    right_name="B",
+    metric="f1_macro",
+    pair_on="seed",
+)
+
+print("\nToy summary:")
+display(toy_summary)
+
+print("\nToy paired test:")
+display(pd.DataFrame([toy_test]))
+
+print("\nSection 14 statistical helpers loaded.")
 
 # %% [markdown]
 # ## 15. Predictive Statistical Analysis
 # 
 # This section analyzes the raw predictive-results CSV.
 # 
-# It computes:
+# It will compute:
 # - Mean and 95% CI for each method and metric
 # - Paired t-tests for important method comparisons
 # - Effect sizes for important method comparisons
 # - Paper-ready predictive performance table
-
-# %% [markdown]
-# ### 15.1 Predictive summary tables
-
-# %%
-def summarize_predictive_results(
-    predictive_csv: str = PREDICTIVE_RAW_CSV,
-    metrics: Optional[List[str]] = None,
-) -> pd.DataFrame:
-    """
-    Summarize predictive raw rows by method with mean and 95% CI.
-    """
-    if metrics is None:
-        metrics = PREDICTIVE_METRIC_KEYS
-
-    df = load_predictive_raw_results(predictive_csv)
-
-    if df.empty:
-        return pd.DataFrame()
-
-    if "status" in df.columns:
-        df = df[df["status"] == "ok"].copy()
-
-    return summarize_metrics_with_ci(
-        df=df,
-        group_cols=["experiment_group", "method"],
-        metrics=[m for m in metrics if m in df.columns],
-    )
-
-
-predictive_summary_df = summarize_predictive_results(PREDICTIVE_RAW_CSV)
-
-if predictive_summary_df.empty:
-    print("No predictive summary available yet.")
-else:
-    predictive_summary_df.to_csv(SUMMARY_MEAN_CI_CSV, index=False)
-    display(predictive_summary_df.head(20))
-    print("Saved predictive mean/CI summary:", SUMMARY_MEAN_CI_CSV)
-
-# %% [markdown]
-# ### 15.2 Predictive paired comparisons
-
-# %%
-def build_predictive_comparison_specs(
-    predictive_summary_df: pd.DataFrame,
-    primary_metric: str = "f1_macro",
-) -> List[Tuple[str, str]]:
-    """
-    Build the main predictive comparison list, adding dynamic 'best method'
-    comparisons when enough data is available.
-    """
-    specs = [
-        ("FedAvg", "FedProx"),
-        ("FedAvg", "SCAFFOLD"),
-        ("FedAvg", "KD_StrongHeterogeneous"),
-        ("FedAvg", "KD_StrongHeterogeneous_SD"),
-        ("KD_Baseline_FedAvg", "KD_StrongHeterogeneous"),
-        ("KD_Baseline_FedAvg", "KD_StrongHeterogeneous_SD"),
-    ]
-
-    if predictive_summary_df.empty:
-        return specs
-
-    metric_df = predictive_summary_df[predictive_summary_df["metric"] == primary_metric].copy()
-
-    homogeneous_fl = metric_df[
-        metric_df["method"].isin(["FedAvg", "FedProx", "SCAFFOLD"])
-    ].copy()
-
-    if not homogeneous_fl.empty:
-        best_fl_method = homogeneous_fl.sort_values("mean", ascending=False).iloc[0]["method"]
-        specs.append(("Centralized", str(best_fl_method)))
-
-    kd_variants = metric_df[
-        metric_df["method"].isin(["KD_StrongHeterogeneous", "KD_StrongHeterogeneous_SD"])
-    ].copy()
-
-    if not kd_variants.empty:
-        best_kd_method = kd_variants.sort_values("mean", ascending=False).iloc[0]["method"]
-        specs.append(("KD_Baseline_FedAvg", str(best_kd_method)))
-
-    # Deduplicate while preserving order.
-    deduped = []
-    seen = set()
-
-    for left, right in specs:
-        key = (left, right)
-        if left == right or key in seen:
-            continue
-        seen.add(key)
-        deduped.append(key)
-
-    return deduped
-
-
-def run_predictive_pairwise_tests(
-    predictive_csv: str = PREDICTIVE_RAW_CSV,
-    metrics: Optional[List[str]] = None,
-    comparison_specs: Optional[List[Tuple[str, str]]] = None,
-) -> pd.DataFrame:
-    """
-    Run paired t-tests for predictive metrics.
-    """
-    if metrics is None:
-        metrics = PREDICTIVE_METRIC_KEYS
-
-    df = load_predictive_raw_results(predictive_csv)
-
-    if df.empty:
-        return pd.DataFrame()
-
-    if "status" in df.columns:
-        df = df[df["status"] == "ok"].copy()
-
-    if comparison_specs is None:
-        comparison_specs = build_predictive_comparison_specs(predictive_summary_df)
-
-    rows = []
-
-    for metric in metrics:
-        if metric not in df.columns:
-            continue
-
-        for left_name, right_name in comparison_specs:
-            row = paired_comparison_from_df(
-                df=df,
-                group_col="method",
-                left_name=left_name,
-                right_name=right_name,
-                metric=metric,
-                pair_on="seed",
-            )
-            row["comparison_family"] = "predictive"
-            rows.append(row)
-
-    out = pd.DataFrame(rows)
-    out = apply_multiple_comparison_correction(out, p_col="p_value", method="holm")
-    return out
-
-
-predictive_pairwise_df = run_predictive_pairwise_tests(PREDICTIVE_RAW_CSV)
-
-if predictive_pairwise_df.empty:
-    print("No predictive paired comparisons available yet.")
-else:
-    predictive_pairwise_df.to_csv(PAIRWISE_TESTS_CSV, index=False)
-    display(predictive_pairwise_df.head(20))
-    print("Saved predictive pairwise tests:", PAIRWISE_TESTS_CSV)
-
-# %% [markdown]
-# ### 15.3 Predictive wide paper table
-
-# %%
-predictive_paper_table_df = make_formatted_wide_table(
-    summary_df=predictive_summary_df,
-    index_cols=["experiment_group", "method"],
-)
-
-if not predictive_paper_table_df.empty:
-    display(predictive_paper_table_df)
-
-# %% [markdown]
-# ## 16. Attention and Rationale Statistical Analysis
 # 
-# This section analyzes the raw attention/rationale-results CSV.
-# 
-# It computes:
-# - Mean and 95% CI for token-level cosine similarity
-# - Mean and 95% CI for top-k Jaccard similarity
-# - Mean and 95% CI for phrase-level IoU
-# - Paired comparisons between model pairs
-# - Paper-ready rationale alignment table
+# Main metrics:
+# - AUC Macro
+# - AUC Micro
+# - F1 Macro
+# - F1 Micro
+# - PR-AUC Macro
+# - PR-AUC Micro
 
 # %% [markdown]
-# ### 16.1 Attention summary tables
+# ### 15.1 Predictive analysis configuration
+# 
+# This section defines which predictive metrics and method comparisons are used
+# for the statistical analysis.
 
 # %%
-ATTENTION_METRIC_KEYS = [
-    "cosine",
-    "jaccard",
-    "phrase_iou",
-    "fp_rate",
-    "avg_agreement",
-    "min_agreement",
+PREDICTIVE_STATS_METRICS = [
+    "auc_macro",
+    "auc_micro",
+    "f1_macro",
+    "f1_micro",
+    "pr_auc_macro",
+    "pr_auc_micro",
 ]
 
+PREDICTIVE_METRIC_DISPLAY_NAMES = {
+    "auc_macro": "AUC Macro",
+    "auc_micro": "AUC Micro",
+    "f1_macro": "F1 Macro",
+    "f1_micro": "F1 Micro",
+    "pr_auc_macro": "PR-AUC Macro",
+    "pr_auc_micro": "PR-AUC Micro",
+}
 
-def summarize_attention_results(
-    attention_csv: str = ATTENTION_RAW_CSV,
-    metrics: Optional[List[str]] = None,
-) -> pd.DataFrame:
-    """
-    Summarize seed-level attention pair rows with mean and 95% CI.
-    """
-    if metrics is None:
-        metrics = ATTENTION_METRIC_KEYS
+PREDICTIVE_SUMMARY_LONG_CSV = os.path.join(TABLES_DIR, "predictive_summary_mean_ci_long.csv")
+PREDICTIVE_SUMMARY_WIDE_CSV = os.path.join(TABLES_DIR, "predictive_summary_mean_ci_wide.csv")
+PREDICTIVE_MAIN_TABLE_CSV = os.path.join(TABLES_DIR, "predictive_main_table.csv")
+PREDICTIVE_PAIRWISE_TESTS_CSV = os.path.join(TABLES_DIR, "predictive_pairwise_tests.csv")
+PREDICTIVE_PAIRWISE_TESTS_FORMATTED_CSV = os.path.join(TABLES_DIR, "predictive_pairwise_tests_formatted.csv")
 
-    df = load_attention_raw_results(attention_csv)
-
-    if df.empty:
-        return pd.DataFrame()
-
-    if "status" in df.columns:
-        df = df[df["status"] == "ok"].copy()
-
-    return summarize_metrics_with_ci(
-        df=df,
-        group_cols=["pair", "model_a", "model_b"],
-        metrics=[m for m in metrics if m in df.columns],
-    )
-
-
-attention_summary_df = summarize_attention_results(ATTENTION_RAW_CSV)
-
-if attention_summary_df.empty:
-    print("No attention summary available yet.")
-else:
-    attention_summary_df.to_csv(ATTENTION_SUMMARY_CSV, index=False)
-    display(attention_summary_df.head(20))
-    print("Saved attention mean/CI summary:", ATTENTION_SUMMARY_CSV)
+print("Predictive statistical-analysis outputs:")
+print("  Long summary:", PREDICTIVE_SUMMARY_LONG_CSV)
+print("  Wide summary:", PREDICTIVE_SUMMARY_WIDE_CSV)
+print("  Main table:  ", PREDICTIVE_MAIN_TABLE_CSV)
+print("  Pairwise:    ", PREDICTIVE_PAIRWISE_TESTS_CSV)
 
 # %% [markdown]
-# ### 16.2 Attention paired comparisons
+# ### 15.2 Load and clean predictive raw results
+# 
+# This cell:
+# - loads `PREDICTIVE_RAW_CSV`
+# - keeps successful rows only
+# - deduplicates repeated successful runs by experiment/method/seed
+# - verifies the main metric columns are available
 
 # %%
-def build_attention_comparison_specs(
-    attention_df: pd.DataFrame,
-) -> List[Tuple[str, str]]:
-    """
-    Build attention comparison pairs using available pair names.
-    """
-    if attention_df.empty:
-        return []
-
-    available_pairs = set(attention_df["pair"].astype(str).unique().tolist())
-
-    specs = [
-        ("Centralized_vs_FedAvg", "Centralized_vs_FedProx"),
-        ("Centralized_vs_FedAvg", "Centralized_vs_SCAFFOLD"),
-        ("Centralized_vs_FedAvg", "Centralized_vs_KD_StrongHeterogeneous"),
-        ("Centralized_vs_FedAvg", "Centralized_vs_KD_StrongHeterogeneous_SD"),
-        ("Centralized_vs_KD_Baseline_FedAvg", "Centralized_vs_KD_StrongHeterogeneous"),
-        ("Centralized_vs_KD_Baseline_FedAvg", "Centralized_vs_KD_StrongHeterogeneous_SD"),
-    ]
-
-    return [
-        (left, right)
-        for left, right in specs
-        if left in available_pairs and right in available_pairs
-    ]
-
-
-def run_attention_pairwise_tests(
-    attention_csv: str = ATTENTION_RAW_CSV,
-    metrics: Optional[List[str]] = None,
+def load_clean_predictive_results(
+    predictive_csv: str = PREDICTIVE_RAW_CSV,
 ) -> pd.DataFrame:
     """
-    Run paired comparisons between seed-level attention pair rows.
+    Load successful predictive results and keep the latest successful row per
+    experiment/method/seed.
     """
-    if metrics is None:
-        metrics = ["cosine", "jaccard", "phrase_iou", "fp_rate"]
-
-    df = load_attention_raw_results(attention_csv)
+    df = read_csv_if_exists(predictive_csv)
 
     if df.empty:
-        return pd.DataFrame()
-
-    if "status" in df.columns:
-        df = df[df["status"] == "ok"].copy()
-
-    specs = build_attention_comparison_specs(df)
-    rows = []
-
-    for metric in metrics:
-        if metric not in df.columns:
-            continue
-
-        for left_pair, right_pair in specs:
-            row = paired_comparison_from_df(
-                df=df,
-                group_col="pair",
-                left_name=left_pair,
-                right_name=right_pair,
-                metric=metric,
-                pair_on="seed",
-            )
-            row["comparison_family"] = "attention"
-            rows.append(row)
-
-    out = pd.DataFrame(rows)
-    out = apply_multiple_comparison_correction(out, p_col="p_value", method="holm")
-    return out
-
-
-attention_pairwise_df = run_attention_pairwise_tests(ATTENTION_RAW_CSV)
-
-if not attention_pairwise_df.empty:
-    display(attention_pairwise_df.head(20))
-
-# %% [markdown]
-# ### 16.3 Attention wide paper table
-
-# %%
-attention_paper_table_df = make_formatted_wide_table(
-    summary_df=attention_summary_df,
-    index_cols=["pair", "model_a", "model_b"],
-)
-
-if not attention_paper_table_df.empty:
-    display(attention_paper_table_df)
-
-# %% [markdown]
-# ## 17. Reliability Statistical Analysis
-# 
-# This section analyzes whether attention agreement is related to prediction reliability.
-# 
-# It computes:
-# - False-positive rate by attention-agreement level
-# - Pearson correlation between attention agreement and false-positive behavior
-# - Spearman correlation between attention agreement and false-positive behavior
-# - Confidence intervals for reliability trends, if possible
-# 
-# The main goal is to support the claim that higher rationale agreement is
-# associated with lower false-positive rates.
-
-# %% [markdown]
-# ### 17.1 Reliability raw-result loaders
-
-# %%
-RELIABILITY_SEED_CORR_RAW_CSV = os.path.join(RUNS_DIR, "reliability_seed_correlations_raw.csv")
-RELIABILITY_BINS_SUMMARY_CSV = os.path.join(TABLES_DIR, "reliability_bins_mean_ci.csv")
-
-
-def load_reliability_raw_results(
-    reliability_csv: str = RELIABILITY_RAW_CSV,
-) -> pd.DataFrame:
-    """
-    Load sample-level reliability rows.
-    """
-    df = read_csv_if_exists(reliability_csv)
-
-    if df.empty:
+        print("No predictive raw results found:", predictive_csv)
         return df
 
-    for col in ["seed", "label_idx", "sample_idx"]:
-        if col in df.columns:
-            df[col] = df[col].astype(int)
+    if "status" in df.columns:
+        df = df[df["status"] == "ok"].copy()
+
+    if df.empty:
+        print("No successful predictive rows found.")
+        return df
+
+    if "seed" in df.columns:
+        df["seed"] = df["seed"].astype(int)
+
+    key_cols = [
+        c for c in ["experiment_id", "method", "seed"]
+        if c in df.columns
+    ]
+
+    if key_cols:
+        df = dedupe_latest_ok_runs(
+            df=df,
+            key_cols=key_cols,
+            status_col="status",
+        )
+
+    for metric in PREDICTIVE_STATS_METRICS:
+        if metric in df.columns:
+            df[metric] = pd.to_numeric(df[metric], errors="coerce")
 
     return df
 
 
-def build_reliability_seed_correlations(
-    reliability_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Compute within-seed reliability correlations for every seed/pair.
-    """
-    if reliability_df.empty:
-        return pd.DataFrame()
+predictive_stats_df = load_clean_predictive_results(PREDICTIVE_RAW_CSV)
 
-    rows = []
+print("Clean predictive results shape:", predictive_stats_df.shape)
 
-    for group_key, sub in reliability_df.groupby(["seed", "pair", "model_a", "model_b"]):
-        seed, pair, model_a, model_b = group_key
-        corr_df = reliability_correlations_from_rows(
-            rows=sub.to_dict(orient="records")
-        )
+if not predictive_stats_df.empty:
+    preview_cols = [
+        c for c in [
+            "experiment_group",
+            "method",
+            "seed",
+            "split",
+            "clients",
+            "rounds",
+            "local_epochs",
+            *PREDICTIVE_STATS_METRICS,
+        ]
+        if c in predictive_stats_df.columns
+    ]
 
-        if corr_df.empty:
-            continue
-
-        for row in corr_df.to_dict(orient="records"):
-            rows.append(to_serializable_row({
-                "seed": int(seed),
-                "pair": pair,
-                "model_a": model_a,
-                "model_b": model_b,
-                **row,
-            }))
-
-    return pd.DataFrame(rows)
-
-
-def summarize_reliability_correlations(
-    seed_corr_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Summarize seed-level reliability correlations across random seeds.
-    """
-    if seed_corr_df.empty:
-        return pd.DataFrame()
-
-    rows = []
-
-    for group_key, sub in seed_corr_df.groupby(["pair", "model_a", "model_b", "agreement_metric"]):
-        pair, model_a, model_b, agreement_metric = group_key
-
-        for corr_col, label in [("pearson_r", "pearson"), ("spearman_rho", "spearman")]:
-            if corr_col not in sub.columns:
-                continue
-
-            fisher_stats = fisher_z_mean_ci(sub[corr_col].to_numpy(dtype=float))
-            test_stats = one_sample_t_test(sub[corr_col].to_numpy(dtype=float), popmean=0.0)
-
-            rows.append({
-                "pair": pair,
-                "model_a": model_a,
-                "model_b": model_b,
-                "agreement_metric": agreement_metric,
-                "correlation_type": label,
-                "n_seeds": fisher_stats["n"],
-                "mean_r": fisher_stats["mean_r"],
-                "ci_low": fisher_stats["ci_low"],
-                "ci_high": fisher_stats["ci_high"],
-                "formatted": format_mean_ci(
-                    fisher_stats["mean_r"],
-                    fisher_stats["ci_low"],
-                    fisher_stats["ci_high"],
-                ),
-                "df": test_stats["df"],
-                "t_value": test_stats["t_value"],
-                "p_value": test_stats["p_value"],
-            })
-
-    out = pd.DataFrame(rows)
-    out = apply_multiple_comparison_correction(out, p_col="p_value", method="holm")
-    return out
-
-
-def summarize_reliability_bins(
-    reliability_bins_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Summarize false-positive-rate bins across seeds.
-    """
-    if reliability_bins_df.empty:
-        return pd.DataFrame()
-
-    rows = []
-
-    for group_key, sub in reliability_bins_df.groupby(
-        ["pair", "model_a", "model_b", "agreement_metric", "agreement_bin"]
-    ):
-        pair, model_a, model_b, agreement_metric, agreement_bin = group_key
-
-        fp_stats = mean_confidence_interval(sub["fp_rate"].to_numpy(dtype=float))
-        agree_stats = mean_confidence_interval(sub["agreement_mean"].to_numpy(dtype=float))
-
-        rows.append({
-            "pair": pair,
-            "model_a": model_a,
-            "model_b": model_b,
-            "agreement_metric": agreement_metric,
-            "agreement_bin": int(agreement_bin),
-            "n_seeds": fp_stats["n"],
-            "fp_rate_mean": fp_stats["mean"],
-            "fp_rate_ci_low": fp_stats["ci_low"],
-            "fp_rate_ci_high": fp_stats["ci_high"],
-            "agreement_mean": agree_stats["mean"],
-            "agreement_ci_low": agree_stats["ci_low"],
-            "agreement_ci_high": agree_stats["ci_high"],
-        })
-
-    return pd.DataFrame(rows)
-
-
-reliability_raw_df = load_reliability_raw_results(RELIABILITY_RAW_CSV)
-reliability_seed_corr_df = build_reliability_seed_correlations(reliability_raw_df)
-reliability_corr_summary_df = summarize_reliability_correlations(reliability_seed_corr_df)
-
-if not reliability_seed_corr_df.empty:
-    reliability_seed_corr_df.to_csv(RELIABILITY_SEED_CORR_RAW_CSV, index=False)
-    print("Saved raw seed-level reliability correlations:", RELIABILITY_SEED_CORR_RAW_CSV)
-
-if not reliability_corr_summary_df.empty:
-    reliability_corr_summary_df.to_csv(RELIABILITY_CORR_CSV, index=False)
-    display(reliability_corr_summary_df.head(20))
-    print("Saved reliability correlation summary:", RELIABILITY_CORR_CSV)
-
-reliability_bins_raw_df = read_csv_if_exists(RELIABILITY_BINS_RAW_CSV)
-reliability_bins_summary_df = summarize_reliability_bins(reliability_bins_raw_df)
-
-if not reliability_bins_summary_df.empty:
-    reliability_bins_summary_df.to_csv(RELIABILITY_BINS_SUMMARY_CSV, index=False)
-    display(reliability_bins_summary_df.head(20))
-    print("Saved reliability bin summary:", RELIABILITY_BINS_SUMMARY_CSV)
+    display(
+        predictive_stats_df[preview_cols]
+        .sort_values(["experiment_group", "method", "seed"])
+        .head(40)
+    )
 
 # %% [markdown]
-# ## 18. Paper-Ready Figures
+# ### 15.3 Predictive mean and 95% confidence intervals
 # 
-# This section creates figures with 95% confidence interval error bars.
-# 
-# Candidate figures:
-# - Macro-F1 comparison across methods
-# - AUC or PR-AUC comparison across methods
-# - KD vs FedAvg comparison
-# - Attention similarity comparison
-# - False-positive rate vs attention agreement
-# 
-# Figure captions should state:
-# Error bars show 95% confidence intervals across random seeds.
-
-# %% [markdown]
-# ### 18.1 Figure helpers
+# Confidence intervals are computed across seed-level results.
 
 # %%
-FIGURE_CAPTIONS_CSV = os.path.join(FIGURES_DIR, "figure_captions.csv")
-figure_caption_rows = []
+predictive_summary_long_df = summarize_metrics_with_ci(
+    df=predictive_stats_df,
+    group_cols=["experiment_group", "method"],
+    metrics=PREDICTIVE_STATS_METRICS,
+    confidence=0.95,
+    digits=3,
+)
 
+if predictive_summary_long_df.empty:
+    print("No predictive summary could be computed.")
+else:
+    predictive_summary_long_df["metric_display"] = predictive_summary_long_df["metric"].map(
+        PREDICTIVE_METRIC_DISPLAY_NAMES
+    ).fillna(predictive_summary_long_df["metric"])
 
-def register_figure_caption(filename: str, caption: str) -> None:
-    """
-    Store a figure caption for later export.
-    """
-    figure_caption_rows.append({
-        "filename": filename,
-        "caption": caption,
-    })
+    predictive_summary_long_df.to_csv(PREDICTIVE_SUMMARY_LONG_CSV, index=False)
+    predictive_summary_long_df.to_csv(SUMMARY_MEAN_CI_CSV, index=False)
 
+    print("Saved predictive long summary:")
+    print("  ", PREDICTIVE_SUMMARY_LONG_CSV)
+    print("  ", SUMMARY_MEAN_CI_CSV)
 
-def save_current_figure(
-    output_path: str,
-    caption: str,
-) -> None:
-    """
-    Save the active Matplotlib figure and register its caption.
-    """
-    ensure_dir(os.path.dirname(output_path))
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200, bbox_inches="tight")
-    register_figure_caption(os.path.basename(output_path), caption)
-    plt.close()
+    display(predictive_summary_long_df.head(30))
 
+# %%
+predictive_summary_wide_df = make_formatted_wide_table(
+    summary_df=predictive_summary_long_df,
+    index_cols=["experiment_group", "method"],
+    metric_col="metric",
+    value_col="formatted",
+)
 
-def plot_metric_ci_bar(
-    summary_df: pd.DataFrame,
-    metric: str,
-    label_col: str,
-    output_path: str,
-    title: str,
-    ylabel: Optional[str] = None,
-    order: Optional[List[str]] = None,
-) -> None:
-    """
-    Bar plot with 95% CI error bars for one summarized metric.
-    """
-    sub = summary_df[summary_df["metric"] == metric].copy()
+# Reorder metric columns for readability.
+ordered_cols = ["experiment_group", "method"] + [
+    m for m in PREDICTIVE_STATS_METRICS
+    if m in predictive_summary_wide_df.columns
+]
 
-    if sub.empty:
-        print(f"Skipping figure for metric={metric}; no summary rows available.")
-        return
+extra_cols = [
+    c for c in predictive_summary_wide_df.columns
+    if c not in ordered_cols
+]
 
-    if order is not None:
-        sub["_order"] = sub[label_col].apply(
-            lambda x: order.index(x) if x in order else len(order)
-        )
-        sub = sub.sort_values("_order")
-    else:
-        sub = sub.sort_values(label_col)
+predictive_summary_wide_df = predictive_summary_wide_df[ordered_cols + extra_cols]
 
-    labels = sub[label_col].astype(str).tolist()
-    means = sub["mean"].to_numpy(dtype=float)
-    ci_low = sub["ci_low"].to_numpy(dtype=float)
-    ci_high = sub["ci_high"].to_numpy(dtype=float)
+if predictive_summary_wide_df.empty:
+    print("No predictive wide summary table available.")
+else:
+    predictive_summary_wide_df.to_csv(PREDICTIVE_SUMMARY_WIDE_CSV, index=False)
 
-    lower = means - ci_low
-    upper = ci_high - means
+    print("Saved predictive wide summary:")
+    print("  ", PREDICTIVE_SUMMARY_WIDE_CSV)
 
-    x = np.arange(len(labels))
+    display(predictive_summary_wide_df)
 
-    plt.figure(figsize=(10, 5))
-    plt.bar(x, means, color="#4C78A8", alpha=0.85)
-    plt.errorbar(
-        x,
-        means,
-        yerr=np.vstack([lower, upper]),
-        fmt="none",
-        ecolor="black",
-        elinewidth=1.5,
-        capsize=5,
-    )
-    plt.xticks(x, labels, rotation=25, ha="right")
-    plt.title(title)
-    plt.ylabel(ylabel or metric)
-    plt.grid(axis="y", alpha=0.25)
+# %% [markdown]
+# ### 15.4 Paper-ready main predictive table
+# 
+# This table is meant to be copied into the manuscript.
+# 
+# By default, it includes:
+# - `main_table`
+# - `kd_main`
+# 
+# Controlled-FL and sensitivity experiments should usually be reported in
+# separate tables.
 
-    caption = "Error bars show 95% confidence intervals across random seeds."
-    save_current_figure(output_path, caption)
-    print("Saved figure:", output_path)
+# %%
+PREDICTIVE_MAIN_TABLE_GROUPS = [
+    "main_table",
+    "kd_main",
+]
 
+predictive_main_table_df = predictive_summary_wide_df.copy()
 
-def plot_reliability_bin_trend(
-    bins_summary_df: pd.DataFrame,
-    pair_name: str,
-    agreement_metric: str,
-    output_path: str,
-) -> None:
-    """
-    Plot false-positive rate versus agreement quantile with CI bars.
-    """
-    sub = bins_summary_df[
-        (bins_summary_df["pair"] == pair_name)
-        & (bins_summary_df["agreement_metric"] == agreement_metric)
+if not predictive_main_table_df.empty and "experiment_group" in predictive_main_table_df.columns:
+    predictive_main_table_df = predictive_main_table_df[
+        predictive_main_table_df["experiment_group"].isin(PREDICTIVE_MAIN_TABLE_GROUPS)
     ].copy()
 
-    if sub.empty:
-        print(
-            f"Skipping reliability trend figure for pair={pair_name}, "
-            f"agreement_metric={agreement_metric}; no rows available."
-        )
-        return
-
-    sub = sub.sort_values("agreement_bin")
-
-    x = sub["agreement_bin"].to_numpy(dtype=int)
-    y = sub["fp_rate_mean"].to_numpy(dtype=float)
-    low = y - sub["fp_rate_ci_low"].to_numpy(dtype=float)
-    high = sub["fp_rate_ci_high"].to_numpy(dtype=float) - y
-
-    plt.figure(figsize=(8, 5))
-    plt.plot(x, y, marker="o", color="#E45756", linewidth=2)
-    plt.errorbar(
-        x,
-        y,
-        yerr=np.vstack([low, high]),
-        fmt="none",
-        ecolor="black",
-        elinewidth=1.5,
-        capsize=5,
-    )
-    plt.xticks(x, [f"Q{int(i) + 1}" for i in x])
-    plt.xlabel(f"{agreement_metric} quantile")
-    plt.ylabel("False-positive rate")
-    plt.title(f"False-positive rate vs {agreement_metric} agreement | {pair_name}")
-    plt.grid(alpha=0.25)
-
-    caption = "Error bars show 95% confidence intervals across random seeds."
-    save_current_figure(output_path, caption)
-    print("Saved figure:", output_path)
-
-# %% [markdown]
-# ### 18.2 Generate main figures
-
-# %%
-PREDICTIVE_METHOD_ORDER = [
+# Optional display ordering.
+method_order = [
     "Centralized",
     "FedAvg",
     "FedProx",
@@ -9558,68 +10506,1557 @@ PREDICTIVE_METHOD_ORDER = [
     "KD_StrongHeterogeneous_SD",
 ]
 
-if not predictive_summary_df.empty:
-    plot_metric_ci_bar(
-        summary_df=predictive_summary_df,
-        metric="f1_macro",
-        label_col="method",
-        output_path=os.path.join(FIGURES_DIR, "predictive_f1_macro_ci.png"),
-        title="Macro-F1 comparison across methods",
-        ylabel="F1 Macro",
-        order=PREDICTIVE_METHOD_ORDER,
+if not predictive_main_table_df.empty:
+    predictive_main_table_df["method_order"] = predictive_main_table_df["method"].apply(
+        lambda m: method_order.index(m) if m in method_order else 999
     )
 
-    plot_metric_ci_bar(
-        summary_df=predictive_summary_df,
-        metric="auc_macro",
-        label_col="method",
-        output_path=os.path.join(FIGURES_DIR, "predictive_auc_macro_ci.png"),
-        title="Macro-AUC comparison across methods",
-        ylabel="AUC Macro",
-        order=PREDICTIVE_METHOD_ORDER,
+    predictive_main_table_df = (
+        predictive_main_table_df
+        .sort_values(["experiment_group", "method_order", "method"])
+        .drop(columns=["method_order"])
     )
 
-    kd_vs_fedavg_subset = predictive_summary_df[
-        predictive_summary_df["method"].isin(
-            ["FedAvg", "KD_Baseline_FedAvg", "KD_StrongHeterogeneous", "KD_StrongHeterogeneous_SD"]
-        )
-    ].copy()
+    predictive_main_table_df.to_csv(PREDICTIVE_MAIN_TABLE_CSV, index=False)
 
-    if not kd_vs_fedavg_subset.empty:
-        plot_metric_ci_bar(
-            summary_df=kd_vs_fedavg_subset,
-            metric="f1_macro",
-            label_col="method",
-            output_path=os.path.join(FIGURES_DIR, "kd_vs_fedavg_f1_macro_ci.png"),
-            title="KD vs FedAvg comparison",
-            ylabel="F1 Macro",
-            order=["FedAvg", "KD_Baseline_FedAvg", "KD_StrongHeterogeneous", "KD_StrongHeterogeneous_SD"],
-        )
+    print("Saved paper-ready predictive table:")
+    print("  ", PREDICTIVE_MAIN_TABLE_CSV)
 
-if not attention_summary_df.empty:
-    plot_metric_ci_bar(
-        summary_df=attention_summary_df,
-        metric="cosine",
-        label_col="pair",
-        output_path=os.path.join(FIGURES_DIR, "attention_cosine_ci.png"),
-        title="Attention similarity comparison",
-        ylabel="Token-level cosine similarity",
+    display(predictive_main_table_df)
+
+    print("\nLaTeX preview:")
+    print(df_to_latex_string(predictive_main_table_df, index=False, escape=False))
+else:
+    print("No main predictive table available.")
+
+# %% [markdown]
+# ### 15.5 Predictive pairwise comparison specifications
+# 
+# These comparisons use paired tests because each compared method is evaluated
+# on the same seed list.
+# 
+# A positive mean difference means:
+# 
+# `right_method - left_method > 0`
+
+# %%
+def build_predictive_comparison_specs(df: pd.DataFrame) -> List[dict]:
+    """
+    Build predictive method-comparison specs based on methods available in df.
+    """
+    if df.empty or "method" not in df.columns:
+        return []
+
+    available_methods = set(df["method"].astype(str).unique())
+
+    candidate_specs = [
+        {
+            "comparison_family": "main_fl",
+            "left": "FedAvg",
+            "right": "FedProx",
+            "label": "FedProx vs FedAvg",
+        },
+        {
+            "comparison_family": "main_fl",
+            "left": "FedAvg",
+            "right": "SCAFFOLD",
+            "label": "SCAFFOLD vs FedAvg",
+        },
+        {
+            "comparison_family": "central_vs_best_fl",
+            "left": "Centralized",
+            "right": "FedProx",
+            "label": "FedProx vs Centralized",
+        },
+        {
+            "comparison_family": "central_vs_fl",
+            "left": "Centralized",
+            "right": "SCAFFOLD",
+            "label": "SCAFFOLD vs Centralized",
+        },
+        {
+            "comparison_family": "kd",
+            "left": "KD_Baseline_FedAvg",
+            "right": "KD_StrongHeterogeneous",
+            "label": "Heterogeneous KD vs KD baseline FedAvg",
+        },
+        {
+            "comparison_family": "kd",
+            "left": "KD_StrongHeterogeneous",
+            "right": "KD_StrongHeterogeneous_SD",
+            "label": "Heterogeneous KD + server distillation vs heterogeneous KD",
+        },
+        {
+            "comparison_family": "fl_vs_kd",
+            "left": "FedAvg",
+            "right": "KD_StrongHeterogeneous",
+            "label": "Heterogeneous KD vs FedAvg",
+        },
+        {
+            "comparison_family": "controlled_fl",
+            "left": "FedAvg_K4_noniid",
+            "right": "FedProx_K4_noniid",
+            "label": "Controlled FedProx K4 non-IID vs Controlled FedAvg K4 non-IID",
+        },
+        {
+            "comparison_family": "controlled_fl",
+            "left": "FedAvg_K4_noniid",
+            "right": "SCAFFOLD_K4_noniid",
+            "label": "Controlled SCAFFOLD K4 non-IID vs Controlled FedAvg K4 non-IID",
+        },
+    ]
+
+    specs = []
+
+    for spec in candidate_specs:
+        if spec["left"] in available_methods and spec["right"] in available_methods:
+            specs.append(spec)
+
+    return specs
+
+
+PREDICTIVE_COMPARISON_SPECS = build_predictive_comparison_specs(predictive_stats_df)
+
+print("Predictive comparison specs:")
+for spec in PREDICTIVE_COMPARISON_SPECS:
+    print(f"  - {spec['label']}")
+
+# %% [markdown]
+# ### 15.6 Run predictive paired t-tests and effect sizes
+
+# %%
+def run_predictive_pairwise_tests(
+    df: pd.DataFrame,
+    comparison_specs: List[dict],
+    metrics: List[str] = PREDICTIVE_STATS_METRICS,
+) -> pd.DataFrame:
+    """
+    Run paired predictive comparisons for all requested specs and metrics.
+    """
+    rows = []
+
+    if df.empty:
+        return pd.DataFrame()
+
+    for spec in comparison_specs:
+        left = spec["left"]
+        right = spec["right"]
+
+        for metric in metrics:
+            if metric not in df.columns:
+                continue
+
+            result = paired_comparison_from_df(
+                df=df,
+                group_col="method",
+                left_name=left,
+                right_name=right,
+                metric=metric,
+                pair_on="seed",
+                extra_merge_cols=None,
+                dedupe=True,
+            )
+
+            result.update({
+                "comparison_family": spec.get("comparison_family"),
+                "comparison_label": spec.get("label", result.get("comparison_label")),
+                "left_method": left,
+                "right_method": right,
+                "metric_display": PREDICTIVE_METRIC_DISPLAY_NAMES.get(metric, metric),
+            })
+
+            rows.append(result)
+
+    tests_df = pd.DataFrame(rows)
+
+    if tests_df.empty:
+        return tests_df
+
+    tests_df = apply_multiple_comparison_correction(
+        df=tests_df,
+        p_col="p_value",
+        method="holm",
+        alpha=0.05,
     )
 
-if not reliability_bins_summary_df.empty:
-    available_pairs = reliability_bins_summary_df["pair"].astype(str).unique().tolist()
+    return tests_df
 
-    if available_pairs:
-        plot_reliability_bin_trend(
-            bins_summary_df=reliability_bins_summary_df,
-            pair_name=available_pairs[0],
-            agreement_metric="min_agreement",
-            output_path=os.path.join(FIGURES_DIR, "fp_rate_vs_min_agreement.png"),
+
+predictive_pairwise_tests_df = run_predictive_pairwise_tests(
+    df=predictive_stats_df,
+    comparison_specs=PREDICTIVE_COMPARISON_SPECS,
+    metrics=PREDICTIVE_STATS_METRICS,
+)
+
+if predictive_pairwise_tests_df.empty:
+    print("No predictive pairwise tests were computed.")
+else:
+    predictive_pairwise_tests_df.to_csv(PREDICTIVE_PAIRWISE_TESTS_CSV, index=False)
+    predictive_pairwise_tests_df.to_csv(PAIRWISE_TESTS_CSV, index=False)
+
+    print("Saved predictive pairwise tests:")
+    print("  ", PREDICTIVE_PAIRWISE_TESTS_CSV)
+    print("  ", PAIRWISE_TESTS_CSV)
+
+    display(
+        predictive_pairwise_tests_df[
+            [
+                "comparison_family",
+                "comparison_label",
+                "metric",
+                "n_pairs",
+                "df",
+                "mean_left",
+                "mean_right",
+                "mean_diff_right_minus_left",
+                "t_value",
+                "p_value",
+                "p_value_adjusted",
+                "cohens_dz",
+                "effect_size_interpretation",
+            ]
+        ].head(60)
+    )
+
+# %% [markdown]
+# ### 15.7 Paper-formatted predictive statistical test table
+
+# %%
+def format_pairwise_test_table(
+    tests_df: pd.DataFrame,
+    metric_display_map: Optional[dict] = None,
+    digits: int = 3,
+) -> pd.DataFrame:
+    """
+    Create a compact paper-friendly pairwise-test table.
+    """
+    if tests_df.empty:
+        return pd.DataFrame()
+
+    if metric_display_map is None:
+        metric_display_map = {}
+
+    rows = []
+
+    for _, row in tests_df.iterrows():
+        metric = row["metric"]
+        metric_display = metric_display_map.get(metric, metric)
+
+        df_val = row.get("df", np.nan)
+        t_val = row.get("t_value", np.nan)
+        p_val = row.get("p_value", np.nan)
+        p_adj = row.get("p_value_adjusted", np.nan)
+        d_val = row.get("cohens_dz", np.nan)
+
+        if np.isfinite(df_val) and np.isfinite(t_val):
+            t_text = f"t({int(df_val)}) = {t_val:.{digits}f}"
+        else:
+            t_text = "nan"
+
+        rows.append({
+            "Comparison": row.get("comparison_label", ""),
+            "Metric": metric_display,
+            "n": row.get("n_pairs", np.nan),
+            "Mean left": (
+                f"{row.get('mean_left'):.{digits}f}"
+                if np.isfinite(row.get("mean_left", np.nan))
+                else "nan"
+            ),
+            "Mean right": (
+                f"{row.get('mean_right'):.{digits}f}"
+                if np.isfinite(row.get("mean_right", np.nan))
+                else "nan"
+            ),
+            "Mean diff": (
+                f"{row.get('mean_diff_right_minus_left'):.{digits}f}"
+                if np.isfinite(row.get("mean_diff_right_minus_left", np.nan))
+                else "nan"
+            ),
+            "t-test": t_text,
+            "p": format_p_value(p_val),
+            "p Holm": format_p_value(p_adj),
+            "Cohen dz": (
+                f"{d_val:.{digits}f}"
+                if np.isfinite(d_val)
+                else "nan"
+            ),
+            "Effect": row.get("effect_size_interpretation", ""),
+            "Sig.": significance_stars(p_adj),
+        })
+
+    return pd.DataFrame(rows)
+
+
+predictive_pairwise_formatted_df = format_pairwise_test_table(
+    predictive_pairwise_tests_df,
+    metric_display_map=PREDICTIVE_METRIC_DISPLAY_NAMES,
+    digits=3,
+)
+
+if predictive_pairwise_formatted_df.empty:
+    print("No formatted predictive pairwise table available.")
+else:
+    predictive_pairwise_formatted_df.to_csv(PREDICTIVE_PAIRWISE_TESTS_FORMATTED_CSV, index=False)
+
+    print("Saved formatted predictive test table:")
+    print("  ", PREDICTIVE_PAIRWISE_TESTS_FORMATTED_CSV)
+
+    display(predictive_pairwise_formatted_df.head(80))
+
+    print("\nLaTeX preview:")
+    print(df_to_latex_string(predictive_pairwise_formatted_df, index=False, escape=False))
+
+# %% [markdown]
+# ### 15.8 Predictive analysis completion check
+
+# %%
+if predictive_stats_df.empty:
+    print("[Predictive analysis] No successful predictive runs are available yet.")
+else:
+    seed_count_by_method = (
+        predictive_stats_df
+        .groupby(["experiment_group", "method"])["seed"]
+        .nunique()
+        .reset_index(name="n_seeds")
+        .sort_values(["experiment_group", "method"])
+    )
+
+    print("Seed count by method:")
+    display(seed_count_by_method)
+
+    print("Predictive summary rows:", len(predictive_summary_long_df))
+    print("Predictive pairwise test rows:", len(predictive_pairwise_tests_df))
+
+# %% [markdown]
+# ## 16. Attention and Rationale Statistical Analysis
+# 
+# This section analyzes the raw attention/rationale-results CSV.
+# 
+# It will compute:
+# - Mean and 95% CI for token-level cosine similarity
+# - Mean and 95% CI for top-k Jaccard similarity
+# - Mean and 95% CI for phrase-level IoU
+# - Paired comparisons between model pairs
+# - Paper-ready rationale alignment table
+# 
+# The main goal is to test whether some federated methods preserve centralized
+# attention/rationale structure better than others.
+
+# %% [markdown]
+# ### 16.1 Attention statistical-analysis configuration
+
+# %%
+ATTENTION_STATS_METRICS = [
+    "token_cosine",
+    "token_jaccard",
+    "phrase_top1_iou",
+    "phrase_top5_max_iou",
+    "phrase_weighted_iou",
+    "phrase_unweighted_iou",
+    "phrase_rankaware_iou",
+    "reliability_fp_rate",
+]
+
+ATTENTION_METRIC_DISPLAY_NAMES = {
+    "token_cosine": "Token Cosine",
+    "token_jaccard": "Jaccard@15",
+    "phrase_top1_iou": "Phrase Top-1 IoU",
+    "phrase_top5_max_iou": "Phrase Top-5 Max IoU",
+    "phrase_weighted_iou": "Phrase Weighted IoU",
+    "phrase_unweighted_iou": "Phrase Unweighted IoU",
+    "phrase_rankaware_iou": "Phrase Rank-Aware IoU",
+    "reliability_fp_rate": "False-Positive Rate",
+}
+
+ATTENTION_SUMMARY_LONG_CSV = os.path.join(TABLES_DIR, "attention_summary_mean_ci_long.csv")
+ATTENTION_SUMMARY_WIDE_CSV = os.path.join(TABLES_DIR, "attention_summary_mean_ci_wide.csv")
+ATTENTION_PAIRWISE_TESTS_CSV = os.path.join(TABLES_DIR, "attention_pairwise_tests.csv")
+ATTENTION_PAIRWISE_TESTS_FORMATTED_CSV = os.path.join(TABLES_DIR, "attention_pairwise_tests_formatted.csv")
+ATTENTION_LABEL_SUMMARY_CSV = os.path.join(TABLES_DIR, "attention_label_level_summary.csv")
+
+print("Attention statistical-analysis outputs:")
+print("  Long summary:", ATTENTION_SUMMARY_LONG_CSV)
+print("  Wide summary:", ATTENTION_SUMMARY_WIDE_CSV)
+print("  Pairwise:    ", ATTENTION_PAIRWISE_TESTS_CSV)
+
+# %% [markdown]
+# ### 16.2 Load and clean attention raw results
+# 
+# This uses the seed/model-pair summary rows written by Section 13.
+
+# %%
+def load_clean_attention_results(
+    attention_csv: str = ATTENTION_RAW_CSV,
+) -> pd.DataFrame:
+    """
+    Load successful seed/pair attention summaries.
+    """
+    df = read_csv_if_exists(attention_csv)
+
+    if df.empty:
+        print("No attention raw results found:", attention_csv)
+        return df
+
+    if "status" in df.columns:
+        df = df[df["status"] == "ok"].copy()
+
+    if df.empty:
+        print("No successful attention rows found.")
+        return df
+
+    if "seed" in df.columns:
+        df["seed"] = df["seed"].astype(int)
+
+    if "mode" not in df.columns:
+        df["mode"] = "agree_positive"
+
+    key_cols = [
+        c for c in ["seed", "pair", "model_a", "model_b", "mode"]
+        if c in df.columns
+    ]
+
+    if key_cols:
+        df = dedupe_latest_ok_runs(
+            df=df,
+            key_cols=key_cols,
+            status_col="status",
         )
 
-if figure_caption_rows:
-    pd.DataFrame(figure_caption_rows).drop_duplicates().to_csv(FIGURE_CAPTIONS_CSV, index=False)
-    print("Saved figure captions:", FIGURE_CAPTIONS_CSV)
+    for metric in ATTENTION_STATS_METRICS:
+        if metric in df.columns:
+            df[metric] = pd.to_numeric(df[metric], errors="coerce")
+
+    return df
+
+
+attention_stats_df = load_clean_attention_results(ATTENTION_RAW_CSV)
+
+print("Clean attention results shape:", attention_stats_df.shape)
+
+if not attention_stats_df.empty:
+    preview_cols = [
+        c for c in [
+            "seed",
+            "pair",
+            "mode",
+            "token_total_kept",
+            "token_cosine",
+            "token_jaccard",
+            "phrase_weighted_iou",
+            "reliability_fp_rate",
+        ]
+        if c in attention_stats_df.columns
+    ]
+
+    display(
+        attention_stats_df[preview_cols]
+        .sort_values(["pair", "seed"])
+        .head(40)
+    )
+
+# %% [markdown]
+# ### 16.3 Attention/rationale mean and 95% confidence intervals
+# 
+# Confidence intervals are computed across seed-level pair summaries.
+
+# %%
+available_attention_metrics = [
+    m for m in ATTENTION_STATS_METRICS
+    if m in attention_stats_df.columns
+]
+
+attention_summary_long_df = summarize_metrics_with_ci(
+    df=attention_stats_df,
+    group_cols=["pair", "model_a", "model_b", "mode"],
+    metrics=available_attention_metrics,
+    confidence=0.95,
+    digits=3,
+)
+
+if attention_summary_long_df.empty:
+    print("No attention summary could be computed.")
+else:
+    attention_summary_long_df["metric_display"] = attention_summary_long_df["metric"].map(
+        ATTENTION_METRIC_DISPLAY_NAMES
+    ).fillna(attention_summary_long_df["metric"])
+
+    attention_summary_long_df.to_csv(ATTENTION_SUMMARY_LONG_CSV, index=False)
+    attention_summary_long_df.to_csv(ATTENTION_SUMMARY_CSV, index=False)
+
+    print("Saved attention long summary:")
+    print("  ", ATTENTION_SUMMARY_LONG_CSV)
+    print("  ", ATTENTION_SUMMARY_CSV)
+
+    display(attention_summary_long_df.head(40))
+
+# %%
+attention_summary_wide_df = make_formatted_wide_table(
+    summary_df=attention_summary_long_df,
+    index_cols=["pair", "model_a", "model_b", "mode"],
+    metric_col="metric",
+    value_col="formatted",
+)
+
+ordered_attention_cols = ["pair", "model_a", "model_b", "mode"] + [
+    m for m in ATTENTION_STATS_METRICS
+    if m in attention_summary_wide_df.columns
+]
+
+extra_attention_cols = [
+    c for c in attention_summary_wide_df.columns
+    if c not in ordered_attention_cols
+]
+
+attention_summary_wide_df = attention_summary_wide_df[
+    ordered_attention_cols + extra_attention_cols
+] if not attention_summary_wide_df.empty else attention_summary_wide_df
+
+if attention_summary_wide_df.empty:
+    print("No attention wide summary table available.")
+else:
+    attention_summary_wide_df.to_csv(ATTENTION_SUMMARY_WIDE_CSV, index=False)
+
+    print("Saved attention wide summary:")
+    print("  ", ATTENTION_SUMMARY_WIDE_CSV)
+
+    display(attention_summary_wide_df)
+
+    print("\nLaTeX preview:")
+    print(df_to_latex_string(attention_summary_wide_df, index=False, escape=False))
+
+# %% [markdown]
+# ### 16.4 Attention pairwise comparison specifications
+# 
+# These comparisons test whether one centralized-vs-method pair has higher
+# rationale alignment than another.
+# 
+# A positive mean difference means:
+# 
+# `right_pair - left_pair > 0`
+
+# %%
+def build_attention_comparison_specs(df: pd.DataFrame) -> List[dict]:
+    """
+    Build attention pair-comparison specs based on available pairs.
+    """
+    if df.empty or "pair" not in df.columns:
+        return []
+
+    available_pairs = set(df["pair"].astype(str).unique())
+
+    candidate_specs = [
+        {
+            "comparison_family": "centralized_alignment",
+            "left": "Centralized_vs_FedAvg",
+            "right": "Centralized_vs_FedProx",
+            "label": "Centralized-vs-FedProx alignment vs Centralized-vs-FedAvg",
+        },
+        {
+            "comparison_family": "centralized_alignment",
+            "left": "Centralized_vs_FedAvg",
+            "right": "Centralized_vs_SCAFFOLD",
+            "label": "Centralized-vs-SCAFFOLD alignment vs Centralized-vs-FedAvg",
+        },
+        {
+            "comparison_family": "centralized_alignment",
+            "left": "Centralized_vs_FedProx",
+            "right": "Centralized_vs_SCAFFOLD",
+            "label": "Centralized-vs-SCAFFOLD alignment vs Centralized-vs-FedProx",
+        },
+        {
+            "comparison_family": "kd_alignment",
+            "left": "Centralized_vs_FedAvg",
+            "right": "Centralized_vs_KD_StrongHeterogeneous",
+            "label": "Centralized-vs-Heterogeneous-KD alignment vs Centralized-vs-FedAvg",
+        },
+        {
+            "comparison_family": "kd_alignment",
+            "left": "Centralized_vs_KD_StrongHeterogeneous",
+            "right": "Centralized_vs_KD_StrongHeterogeneous_SD",
+            "label": "Centralized-vs-KD+server-distillation alignment vs Centralized-vs-KD",
+        },
+    ]
+
+    specs = []
+
+    for spec in candidate_specs:
+        if spec["left"] in available_pairs and spec["right"] in available_pairs:
+            specs.append(spec)
+
+    return specs
+
+
+ATTENTION_COMPARISON_SPECS = build_attention_comparison_specs(attention_stats_df)
+
+print("Attention comparison specs:")
+for spec in ATTENTION_COMPARISON_SPECS:
+    print(f"  - {spec['label']}")
+
+# %% [markdown]
+# ### 16.5 Run attention paired t-tests and effect sizes
+
+# %%
+def run_attention_pairwise_tests(
+    df: pd.DataFrame,
+    comparison_specs: List[dict],
+    metrics: List[str] = ATTENTION_STATS_METRICS,
+) -> pd.DataFrame:
+    """
+    Run paired tests between attention model-pair summaries.
+    """
+    rows = []
+
+    if df.empty:
+        return pd.DataFrame()
+
+    available_metrics = [
+        m for m in metrics
+        if m in df.columns
+    ]
+
+    for spec in comparison_specs:
+        left = spec["left"]
+        right = spec["right"]
+
+        for metric in available_metrics:
+            result = paired_comparison_from_df(
+                df=df,
+                group_col="pair",
+                left_name=left,
+                right_name=right,
+                metric=metric,
+                pair_on="seed",
+                extra_merge_cols=["mode"],
+                dedupe=True,
+            )
+
+            result.update({
+                "comparison_family": spec.get("comparison_family"),
+                "comparison_label": spec.get("label", result.get("comparison_label")),
+                "left_pair": left,
+                "right_pair": right,
+                "metric_display": ATTENTION_METRIC_DISPLAY_NAMES.get(metric, metric),
+            })
+
+            rows.append(result)
+
+    tests_df = pd.DataFrame(rows)
+
+    if tests_df.empty:
+        return tests_df
+
+    tests_df = apply_multiple_comparison_correction(
+        df=tests_df,
+        p_col="p_value",
+        method="holm",
+        alpha=0.05,
+    )
+
+    return tests_df
+
+
+attention_pairwise_tests_df = run_attention_pairwise_tests(
+    df=attention_stats_df,
+    comparison_specs=ATTENTION_COMPARISON_SPECS,
+    metrics=ATTENTION_STATS_METRICS,
+)
+
+if attention_pairwise_tests_df.empty:
+    print("No attention pairwise tests were computed.")
+else:
+    attention_pairwise_tests_df.to_csv(ATTENTION_PAIRWISE_TESTS_CSV, index=False)
+
+    print("Saved attention pairwise tests:")
+    print("  ", ATTENTION_PAIRWISE_TESTS_CSV)
+
+    display(
+        attention_pairwise_tests_df[
+            [
+                "comparison_family",
+                "comparison_label",
+                "metric",
+                "n_pairs",
+                "df",
+                "mean_left",
+                "mean_right",
+                "mean_diff_right_minus_left",
+                "t_value",
+                "p_value",
+                "p_value_adjusted",
+                "cohens_dz",
+                "effect_size_interpretation",
+            ]
+        ].head(80)
+    )
+
+# %% [markdown]
+# ### 16.6 Paper-formatted attention statistical test table
+
+# %%
+attention_pairwise_formatted_df = format_pairwise_test_table(
+    attention_pairwise_tests_df,
+    metric_display_map=ATTENTION_METRIC_DISPLAY_NAMES,
+    digits=3,
+)
+
+if attention_pairwise_formatted_df.empty:
+    print("No formatted attention pairwise table available.")
+else:
+    attention_pairwise_formatted_df.to_csv(ATTENTION_PAIRWISE_TESTS_FORMATTED_CSV, index=False)
+
+    print("Saved formatted attention test table:")
+    print("  ", ATTENTION_PAIRWISE_TESTS_FORMATTED_CSV)
+
+    display(attention_pairwise_formatted_df.head(80))
+
+    print("\nLaTeX preview:")
+    print(df_to_latex_string(attention_pairwise_formatted_df, index=False, escape=False))
+
+# %% [markdown]
+# ### 16.7 Optional label-level attention summary
+# 
+# This is descriptive. The primary statistical tests above use seed-level
+# pair summaries to avoid treating sample-level or label-level observations as
+# independent repeated experiments.
+
+# %%
+def load_clean_attention_label_results(
+    attention_label_csv: str = ATTENTION_LABEL_RAW_CSV,
+) -> pd.DataFrame:
+    """
+    Load label-level attention summaries from Section 13.
+    """
+    df = read_csv_if_exists(attention_label_csv)
+
+    if df.empty:
+        return df
+
+    if "seed" in df.columns:
+        df["seed"] = df["seed"].astype(int)
+
+    key_cols = [
+        c for c in ["seed", "pair", "mode", "label_idx"]
+        if c in df.columns
+    ]
+
+    if key_cols:
+        df = df.drop_duplicates(subset=key_cols, keep="last").copy()
+
+    return df
+
+
+attention_label_stats_df = load_clean_attention_label_results(ATTENTION_LABEL_RAW_CSV)
+
+if attention_label_stats_df.empty:
+    print("No label-level attention results found.")
+else:
+    label_metric_cols = [
+        c for c in [
+            "token_n_kept",
+            "token_cosine_mean",
+            "token_jaccard_mean",
+            "phrase_n_kept",
+            "phrase_weighted_iou_mean",
+        ]
+        if c in attention_label_stats_df.columns
+    ]
+
+    label_summary_df = (
+        attention_label_stats_df
+        .groupby(["pair", "mode", "label_idx", "label_code"], dropna=False)[label_metric_cols]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+    )
+
+    label_summary_df.to_csv(ATTENTION_LABEL_SUMMARY_CSV, index=False)
+
+    print("Saved descriptive label-level attention summary:")
+    print("  ", ATTENTION_LABEL_SUMMARY_CSV)
+
+    display(label_summary_df.head(30))
+
+# %% [markdown]
+# ### 16.8 Attention analysis completion check
+
+# %%
+if attention_stats_df.empty:
+    print("[Attention analysis] No successful attention runs are available yet.")
+else:
+    seed_count_by_pair = (
+        attention_stats_df
+        .groupby(["pair", "mode"])["seed"]
+        .nunique()
+        .reset_index(name="n_seeds")
+        .sort_values(["pair", "mode"])
+    )
+
+    print("Seed count by attention pair:")
+    display(seed_count_by_pair)
+
+    print("Attention summary rows:", len(attention_summary_long_df))
+    print("Attention pairwise test rows:", len(attention_pairwise_tests_df))
+
+# %% [markdown]
+# ## 17. Reliability Statistical Analysis
+# 
+# This section analyzes whether attention agreement is related to prediction reliability.
+# 
+# It will compute:
+# - False-positive rate by attention-agreement level
+# - Pearson correlation between attention agreement and false-positive behavior
+# - Spearman correlation between attention agreement and false-positive behavior
+# - Confidence intervals for reliability trends, if possible
+# 
+# The main goal is to support the claim that higher rationale agreement is
+# associated with lower false-positive rates.
+
+# %% [markdown]
+# ### 17.1 Reliability analysis configuration
+
+# %%
+RELIABILITY_AGREEMENT_COLUMNS = [
+    "cosine",
+    "jaccard",
+    "avg_agreement",
+    "min_agreement",
+]
+
+RELIABILITY_AGREEMENT_DISPLAY_NAMES = {
+    "cosine": "Token Cosine",
+    "jaccard": "Jaccard@15",
+    "avg_agreement": "Average Agreement",
+    "min_agreement": "Minimum Agreement",
+}
+
+RELIABILITY_SEED_CORR_CSV = os.path.join(TABLES_DIR, "reliability_seed_level_correlations.csv")
+RELIABILITY_CORR_SUMMARY_CSV = os.path.join(TABLES_DIR, "reliability_correlation_summary.csv")
+RELIABILITY_FP_RATE_CI_CSV = os.path.join(TABLES_DIR, "reliability_fp_rate_mean_ci.csv")
+RELIABILITY_BIN_SUMMARY_CSV = os.path.join(TABLES_DIR, "reliability_bins_mean_ci.csv")
+RELIABILITY_BIN_TREND_CSV = os.path.join(TABLES_DIR, "reliability_bin_trend_tests.csv")
+
+print("Reliability statistical-analysis outputs:")
+print("  Seed correlations:", RELIABILITY_SEED_CORR_CSV)
+print("  Corr summary:     ", RELIABILITY_CORR_SUMMARY_CSV)
+print("  FP-rate CI:       ", RELIABILITY_FP_RATE_CI_CSV)
+print("  Bin summary:      ", RELIABILITY_BIN_SUMMARY_CSV)
+
+# %% [markdown]
+# ### 17.2 False-positive rate summary from seed-level attention rows
+# 
+# This summarizes the agree-positive false-positive rate per model pair across
+# seeds.
+
+# %%
+reliability_fp_seed_df = attention_stats_df.copy()
+
+if reliability_fp_seed_df.empty or "reliability_fp_rate" not in reliability_fp_seed_df.columns:
+    print("No seed-level reliability FP-rate results available from attention summary.")
+    reliability_fp_summary_long_df = pd.DataFrame()
+    reliability_fp_summary_wide_df = pd.DataFrame()
+else:
+    reliability_fp_seed_df["reliability_fp_rate"] = pd.to_numeric(
+        reliability_fp_seed_df["reliability_fp_rate"],
+        errors="coerce",
+    )
+
+    reliability_fp_summary_long_df = summarize_metrics_with_ci(
+        df=reliability_fp_seed_df,
+        group_cols=["pair", "model_a", "model_b", "mode"],
+        metrics=["reliability_fp_rate"],
+        confidence=0.95,
+        digits=3,
+    )
+
+    reliability_fp_summary_wide_df = make_formatted_wide_table(
+        summary_df=reliability_fp_summary_long_df,
+        index_cols=["pair", "model_a", "model_b", "mode"],
+        metric_col="metric",
+        value_col="formatted",
+    )
+
+    reliability_fp_summary_long_df.to_csv(RELIABILITY_FP_RATE_CI_CSV, index=False)
+
+    print("Saved seed-level FP-rate CI summary:")
+    print("  ", RELIABILITY_FP_RATE_CI_CSV)
+
+    display(reliability_fp_summary_wide_df)
+
+# %% [markdown]
+# ### 17.3 Load sample-level reliability rows
+# 
+# These rows are produced by Section 13 from agree-positive cases.
+# 
+# Correlations are first computed within each seed/model-pair. Then those
+# seed-level correlation coefficients are summarized across seeds.
+
+# %%
+def load_clean_reliability_rows(
+    reliability_csv: str = RELIABILITY_RAW_CSV,
+) -> pd.DataFrame:
+    """
+    Load sample-level reliability rows.
+    """
+    df = read_csv_if_exists(reliability_csv)
+
+    if df.empty:
+        print("No reliability raw rows found:", reliability_csv)
+        return df
+
+    if "seed" in df.columns:
+        df["seed"] = df["seed"].astype(int)
+
+    if "mode" not in df.columns:
+        df["mode"] = "agree_positive"
+
+    for col in RELIABILITY_AGREEMENT_COLUMNS + ["is_false_positive", "is_true_positive"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    key_cols = [
+        c for c in ["seed", "pair", "mode", "sample_idx", "label_idx"]
+        if c in df.columns
+    ]
+
+    if key_cols:
+        df = df.drop_duplicates(subset=key_cols, keep="last").copy()
+
+    return df
+
+
+reliability_rows_df = load_clean_reliability_rows(RELIABILITY_RAW_CSV)
+
+print("Reliability sample-level rows shape:", reliability_rows_df.shape)
+
+if not reliability_rows_df.empty:
+    preview_cols = [
+        c for c in [
+            "seed",
+            "pair",
+            "mode",
+            "label_idx",
+            "cosine",
+            "jaccard",
+            "avg_agreement",
+            "min_agreement",
+            "is_false_positive",
+            "is_true_positive",
+        ]
+        if c in reliability_rows_df.columns
+    ]
+
+    display(reliability_rows_df[preview_cols].head(30))
+
+# %% [markdown]
+# ### 17.4 Compute within-seed reliability correlations
+# 
+# For each seed/model-pair/agreement metric, compute:
+# - Pearson correlation between attention agreement and false-positive indicator
+# - Spearman correlation between attention agreement and false-positive indicator
+# 
+# Expected direction:
+# - negative correlation means higher agreement is associated with fewer false positives.
+
+# %%
+def compute_seed_level_reliability_correlations(
+    reliability_df: pd.DataFrame,
+    agreement_cols: List[str] = RELIABILITY_AGREEMENT_COLUMNS,
+) -> pd.DataFrame:
+    """
+    Compute within-seed reliability correlations.
+    """
+    if reliability_df.empty:
+        return pd.DataFrame()
+
+    required = {"seed", "pair", "is_false_positive"}
+
+    missing = required - set(reliability_df.columns)
+    if missing:
+        raise ValueError(f"Reliability DataFrame missing required columns: {missing}")
+
+    group_cols = [
+        c for c in ["seed", "pair", "model_a", "model_b", "mode"]
+        if c in reliability_df.columns
+    ]
+
+    rows = []
+
+    for group_key, sub in reliability_df.groupby(group_cols, dropna=False):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+
+        group_dict = dict(zip(group_cols, group_key))
+
+        for agreement_col in agreement_cols:
+            if agreement_col not in sub.columns:
+                continue
+
+            corr = pearson_spearman_correlation(
+                x=sub[agreement_col].to_numpy(dtype=float),
+                y=sub["is_false_positive"].to_numpy(dtype=float),
+            )
+
+            rows.append({
+                **group_dict,
+                "agreement_metric": agreement_col,
+                "agreement_metric_display": RELIABILITY_AGREEMENT_DISPLAY_NAMES.get(
+                    agreement_col,
+                    agreement_col,
+                ),
+                **corr,
+            })
+
+    return pd.DataFrame(rows)
+
+
+reliability_seed_corr_df = compute_seed_level_reliability_correlations(
+    reliability_df=reliability_rows_df,
+    agreement_cols=RELIABILITY_AGREEMENT_COLUMNS,
+)
+
+if reliability_seed_corr_df.empty:
+    print("No seed-level reliability correlations were computed.")
+else:
+    reliability_seed_corr_df.to_csv(RELIABILITY_SEED_CORR_CSV, index=False)
+
+    print("Saved seed-level reliability correlations:")
+    print("  ", RELIABILITY_SEED_CORR_CSV)
+
+    display(reliability_seed_corr_df.head(40))
+
+# %% [markdown]
+# ### 17.5 Summarize reliability correlations across seeds
+# 
+# Correlation coefficients are summarized using Fisher-z confidence intervals.
+# 
+# For p-values across seeds, we test whether Fisher-z transformed correlations
+# differ from zero.
+
+# %%
+def summarize_reliability_correlations_across_seeds(
+    seed_corr_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Summarize seed-level correlations across seeds using Fisher-z intervals.
+    """
+    if seed_corr_df.empty:
+        return pd.DataFrame()
+
+    group_cols = [
+        c for c in ["pair", "model_a", "model_b", "mode", "agreement_metric", "agreement_metric_display"]
+        if c in seed_corr_df.columns
+    ]
+
+    rows = []
+
+    for group_key, sub in seed_corr_df.groupby(group_cols, dropna=False):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+
+        group_dict = dict(zip(group_cols, group_key))
+
+        pearson_vals = clean_numeric(sub["pearson_r"].to_numpy(dtype=float))
+        spearman_vals = clean_numeric(sub["spearman_rho"].to_numpy(dtype=float))
+
+        pearson_ci = fisher_z_mean_ci(pearson_vals)
+        spearman_ci = fisher_z_mean_ci(spearman_vals)
+
+        # One-sample test on Fisher-z transformed correlations.
+        pearson_z = np.arctanh(np.clip(pearson_vals, -0.999999, 0.999999))
+        spearman_z = np.arctanh(np.clip(spearman_vals, -0.999999, 0.999999))
+
+        pearson_test = one_sample_t_test(pearson_z, popmean=0.0)
+        spearman_test = one_sample_t_test(spearman_z, popmean=0.0)
+
+        rows.append({
+            **group_dict,
+
+            "pearson_n_seeds": pearson_ci["n"],
+            "pearson_mean_r": pearson_ci["mean_r"],
+            "pearson_ci_low": pearson_ci["ci_low"],
+            "pearson_ci_high": pearson_ci["ci_high"],
+            "pearson_t_value": pearson_test["t_value"],
+            "pearson_df": pearson_test["df"],
+            "pearson_p_value": pearson_test["p_value"],
+
+            "spearman_n_seeds": spearman_ci["n"],
+            "spearman_mean_rho": spearman_ci["mean_r"],
+            "spearman_ci_low": spearman_ci["ci_low"],
+            "spearman_ci_high": spearman_ci["ci_high"],
+            "spearman_t_value": spearman_test["t_value"],
+            "spearman_df": spearman_test["df"],
+            "spearman_p_value": spearman_test["p_value"],
+        })
+
+    out = pd.DataFrame(rows)
+
+    if out.empty:
+        return out
+
+    # Apply Holm correction separately to Pearson and Spearman p-values.
+    pearson_adj = apply_multiple_comparison_correction(
+        df=out.rename(columns={"pearson_p_value": "p_value"}),
+        p_col="p_value",
+        method="holm",
+        alpha=0.05,
+    )
+
+    out["pearson_p_value_adjusted"] = pearson_adj["p_value_adjusted"]
+    out["pearson_reject_null_adjusted"] = pearson_adj["reject_null_adjusted"]
+
+    spearman_adj = apply_multiple_comparison_correction(
+        df=out.rename(columns={"spearman_p_value": "p_value"}),
+        p_col="p_value",
+        method="holm",
+        alpha=0.05,
+    )
+
+    out["spearman_p_value_adjusted"] = spearman_adj["p_value_adjusted"]
+    out["spearman_reject_null_adjusted"] = spearman_adj["reject_null_adjusted"]
+
+    return out
+
+
+reliability_corr_summary_df = summarize_reliability_correlations_across_seeds(
+    reliability_seed_corr_df
+)
+
+if reliability_corr_summary_df.empty:
+    print("No reliability correlation summary available.")
+else:
+    reliability_corr_summary_df.to_csv(RELIABILITY_CORR_SUMMARY_CSV, index=False)
+    reliability_corr_summary_df.to_csv(RELIABILITY_CORR_CSV, index=False)
+
+    print("Saved reliability correlation summary:")
+    print("  ", RELIABILITY_CORR_SUMMARY_CSV)
+    print("  ", RELIABILITY_CORR_CSV)
+
+    display(
+        reliability_corr_summary_df[
+            [
+                c for c in [
+                    "pair",
+                    "mode",
+                    "agreement_metric",
+                    "pearson_n_seeds",
+                    "pearson_mean_r",
+                    "pearson_ci_low",
+                    "pearson_ci_high",
+                    "pearson_p_value",
+                    "pearson_p_value_adjusted",
+                    "spearman_n_seeds",
+                    "spearman_mean_rho",
+                    "spearman_ci_low",
+                    "spearman_ci_high",
+                    "spearman_p_value",
+                    "spearman_p_value_adjusted",
+                ]
+                if c in reliability_corr_summary_df.columns
+            ]
+        ].head(60)
+    )
+
+# %% [markdown]
+# ### 17.6 Paper-formatted reliability correlation table
+
+# %%
+def format_reliability_corr_table(
+    corr_summary_df: pd.DataFrame,
+    digits: int = 3,
+) -> pd.DataFrame:
+    """
+    Create a compact paper-friendly reliability correlation table.
+    """
+    if corr_summary_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for _, row in corr_summary_df.iterrows():
+        pearson_r = row.get("pearson_mean_r", np.nan)
+        pearson_lo = row.get("pearson_ci_low", np.nan)
+        pearson_hi = row.get("pearson_ci_high", np.nan)
+
+        spearman_rho = row.get("spearman_mean_rho", np.nan)
+        spearman_lo = row.get("spearman_ci_low", np.nan)
+        spearman_hi = row.get("spearman_ci_high", np.nan)
+
+        rows.append({
+            "Pair": row.get("pair", ""),
+            "Agreement metric": row.get("agreement_metric_display", row.get("agreement_metric", "")),
+            "Pearson r": format_mean_ci(
+                pearson_r,
+                pearson_lo,
+                pearson_hi,
+                digits=digits,
+                include_label=False,
+            ),
+            "Pearson p Holm": format_p_value(row.get("pearson_p_value_adjusted", np.nan)),
+            "Spearman rho": format_mean_ci(
+                spearman_rho,
+                spearman_lo,
+                spearman_hi,
+                digits=digits,
+                include_label=False,
+            ),
+            "Spearman p Holm": format_p_value(row.get("spearman_p_value_adjusted", np.nan)),
+            "n seeds": row.get("pearson_n_seeds", np.nan),
+        })
+
+    return pd.DataFrame(rows)
+
+
+reliability_corr_formatted_df = format_reliability_corr_table(
+    reliability_corr_summary_df,
+    digits=3,
+)
+
+if reliability_corr_formatted_df.empty:
+    print("No formatted reliability correlation table available.")
+else:
+    RELIABILITY_CORR_FORMATTED_CSV = os.path.join(TABLES_DIR, "reliability_correlation_table_formatted.csv")
+    reliability_corr_formatted_df.to_csv(RELIABILITY_CORR_FORMATTED_CSV, index=False)
+
+    print("Saved formatted reliability correlation table:")
+    print("  ", RELIABILITY_CORR_FORMATTED_CSV)
+
+    display(reliability_corr_formatted_df.head(80))
+
+    print("\nLaTeX preview:")
+    print(df_to_latex_string(reliability_corr_formatted_df, index=False, escape=False))
+
+# %% [markdown]
+# ### 17.7 False-positive rate by attention-agreement quantile
+# 
+# These rows come from Section 13's reliability-bin output.
+# 
+# The summary reports mean FP rate and 95% CI across seeds for each:
+# - model pair
+# - agreement metric
+# - quantile bin
+
+# %%
+def load_clean_reliability_bins(
+    bins_csv: str = RELIABILITY_BINS_RAW_CSV,
+) -> pd.DataFrame:
+    """
+    Load binned reliability rows.
+    """
+    df = read_csv_if_exists(bins_csv)
+
+    if df.empty:
+        print("No reliability-bin rows found:", bins_csv)
+        return df
+
+    if "seed" in df.columns:
+        df["seed"] = df["seed"].astype(int)
+
+    if "mode" not in df.columns:
+        df["mode"] = "agree_positive"
+
+    numeric_cols = [
+        "agreement_bin",
+        "n_cases",
+        "agreement_min",
+        "agreement_max",
+        "agreement_mean",
+        "fp_rate",
+        "tp_rate",
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    key_cols = [
+        c for c in ["seed", "pair", "mode", "agreement_metric", "agreement_bin"]
+        if c in df.columns
+    ]
+
+    if key_cols:
+        df = df.drop_duplicates(subset=key_cols, keep="last").copy()
+
+    return df
+
+
+reliability_bins_df = load_clean_reliability_bins(RELIABILITY_BINS_RAW_CSV)
+
+print("Reliability-bin rows shape:", reliability_bins_df.shape)
+
+if not reliability_bins_df.empty:
+    display(
+        reliability_bins_df
+        .sort_values(["pair", "seed", "agreement_metric", "agreement_bin"])
+        .head(40)
+    )
+
+# %%
+def summarize_reliability_bins_with_ci(
+    bins_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Summarize FP-rate and agreement values by pair/agreement metric/bin.
+    """
+    if bins_df.empty:
+        return pd.DataFrame()
+
+    group_cols = [
+        c for c in ["pair", "model_a", "model_b", "mode", "agreement_metric", "agreement_bin"]
+        if c in bins_df.columns
+    ]
+
+    rows = []
+
+    for group_key, sub in bins_df.groupby(group_cols, dropna=False):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+
+        group_dict = dict(zip(group_cols, group_key))
+
+        fp_stats = mean_confidence_interval(sub["fp_rate"].to_numpy(dtype=float))
+        tp_stats = mean_confidence_interval(sub["tp_rate"].to_numpy(dtype=float)) if "tp_rate" in sub.columns else {}
+        agreement_stats = mean_confidence_interval(sub["agreement_mean"].to_numpy(dtype=float))
+
+        rows.append({
+            **group_dict,
+            "agreement_metric_display": RELIABILITY_AGREEMENT_DISPLAY_NAMES.get(
+                group_dict.get("agreement_metric"),
+                group_dict.get("agreement_metric"),
+            ),
+            "n_seeds": fp_stats["n"],
+            "fp_rate_mean": fp_stats["mean"],
+            "fp_rate_ci_low": fp_stats["ci_low"],
+            "fp_rate_ci_high": fp_stats["ci_high"],
+            "fp_rate_formatted": format_mean_ci(
+                fp_stats["mean"],
+                fp_stats["ci_low"],
+                fp_stats["ci_high"],
+                digits=3,
+            ),
+            "tp_rate_mean": tp_stats.get("mean", np.nan),
+            "tp_rate_ci_low": tp_stats.get("ci_low", np.nan),
+            "tp_rate_ci_high": tp_stats.get("ci_high", np.nan),
+            "agreement_mean": agreement_stats["mean"],
+            "agreement_ci_low": agreement_stats["ci_low"],
+            "agreement_ci_high": agreement_stats["ci_high"],
+            "total_cases": int(sub["n_cases"].sum()) if "n_cases" in sub.columns else np.nan,
+        })
+
+    return pd.DataFrame(rows)
+
+
+reliability_bins_summary_df = summarize_reliability_bins_with_ci(
+    reliability_bins_df
+)
+
+if reliability_bins_summary_df.empty:
+    print("No reliability-bin summary available.")
+else:
+    reliability_bins_summary_df.to_csv(RELIABILITY_BIN_SUMMARY_CSV, index=False)
+
+    print("Saved reliability-bin summary:")
+    print("  ", RELIABILITY_BIN_SUMMARY_CSV)
+
+    display(
+        reliability_bins_summary_df
+        .sort_values(["pair", "agreement_metric", "agreement_bin"])
+        .head(60)
+    )
+
+# %% [markdown]
+# ### 17.8 Reliability trend test across agreement bins
+# 
+# This tests the expected trend:
+# 
+# higher attention agreement bin → lower false-positive rate
+# 
+# For each seed/model-pair/agreement metric, we compute a Spearman correlation
+# between agreement bin index and FP rate. Then we summarize those seed-level
+# trend correlations across seeds.
+
+# %%
+def compute_seed_level_reliability_bin_trends(
+    bins_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compute seed-level Spearman trend between agreement bin and FP rate.
+    """
+    if bins_df.empty:
+        return pd.DataFrame()
+
+    group_cols = [
+        c for c in ["seed", "pair", "model_a", "model_b", "mode", "agreement_metric"]
+        if c in bins_df.columns
+    ]
+
+    rows = []
+
+    for group_key, sub in bins_df.groupby(group_cols, dropna=False):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+
+        group_dict = dict(zip(group_cols, group_key))
+
+        sub = sub.dropna(subset=["agreement_bin", "fp_rate"]).copy()
+
+        if len(sub) < 3 or sub["agreement_bin"].nunique() < 2 or sub["fp_rate"].nunique() < 2:
+            rows.append({
+                **group_dict,
+                "agreement_metric_display": RELIABILITY_AGREEMENT_DISPLAY_NAMES.get(
+                    group_dict.get("agreement_metric"),
+                    group_dict.get("agreement_metric"),
+                ),
+                "n_bins": int(len(sub)),
+                "spearman_bin_fp_rho": np.nan,
+                "spearman_bin_fp_p": np.nan,
+            })
+            continue
+
+        rho, p_val = stats.spearmanr(
+            sub["agreement_bin"].to_numpy(dtype=float),
+            sub["fp_rate"].to_numpy(dtype=float),
+        )
+
+        rows.append({
+            **group_dict,
+            "agreement_metric_display": RELIABILITY_AGREEMENT_DISPLAY_NAMES.get(
+                group_dict.get("agreement_metric"),
+                group_dict.get("agreement_metric"),
+            ),
+            "n_bins": int(len(sub)),
+            "spearman_bin_fp_rho": float(rho),
+            "spearman_bin_fp_p": float(p_val),
+        })
+
+    return pd.DataFrame(rows)
+
+
+reliability_bin_trends_seed_df = compute_seed_level_reliability_bin_trends(
+    reliability_bins_df
+)
+
+if reliability_bin_trends_seed_df.empty:
+    print("No seed-level reliability bin trends computed.")
+else:
+    RELIABILITY_BIN_TRENDS_SEED_CSV = os.path.join(TABLES_DIR, "reliability_bin_trends_seed_level.csv")
+    reliability_bin_trends_seed_df.to_csv(RELIABILITY_BIN_TRENDS_SEED_CSV, index=False)
+
+    print("Saved seed-level reliability bin trends:")
+    print("  ", RELIABILITY_BIN_TRENDS_SEED_CSV)
+
+    display(reliability_bin_trends_seed_df.head(40))
+
+# %%
+def summarize_reliability_bin_trends_across_seeds(
+    seed_trend_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Summarize seed-level agreement-bin FP-rate trends across seeds.
+    """
+    if seed_trend_df.empty:
+        return pd.DataFrame()
+
+    group_cols = [
+        c for c in ["pair", "model_a", "model_b", "mode", "agreement_metric", "agreement_metric_display"]
+        if c in seed_trend_df.columns
+    ]
+
+    rows = []
+
+    for group_key, sub in seed_trend_df.groupby(group_cols, dropna=False):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+
+        group_dict = dict(zip(group_cols, group_key))
+
+        rho_vals = clean_numeric(sub["spearman_bin_fp_rho"].to_numpy(dtype=float))
+        rho_ci = fisher_z_mean_ci(rho_vals)
+
+        z_vals = np.arctanh(np.clip(rho_vals, -0.999999, 0.999999))
+        z_test = one_sample_t_test(z_vals, popmean=0.0)
+
+        rows.append({
+            **group_dict,
+            "n_seeds": rho_ci["n"],
+            "mean_spearman_bin_fp_rho": rho_ci["mean_r"],
+            "ci_low": rho_ci["ci_low"],
+            "ci_high": rho_ci["ci_high"],
+            "t_value": z_test["t_value"],
+            "df": z_test["df"],
+            "p_value": z_test["p_value"],
+        })
+
+    out = pd.DataFrame(rows)
+
+    if out.empty:
+        return out
+
+    out = apply_multiple_comparison_correction(
+        df=out,
+        p_col="p_value",
+        method="holm",
+        alpha=0.05,
+    )
+
+    return out
+
+
+reliability_bin_trend_summary_df = summarize_reliability_bin_trends_across_seeds(
+    reliability_bin_trends_seed_df
+)
+
+if reliability_bin_trend_summary_df.empty:
+    print("No reliability bin trend summary available.")
+else:
+    reliability_bin_trend_summary_df.to_csv(RELIABILITY_BIN_TREND_CSV, index=False)
+
+    print("Saved reliability bin trend summary:")
+    print("  ", RELIABILITY_BIN_TREND_CSV)
+
+    display(reliability_bin_trend_summary_df.head(60))
+
+# %% [markdown]
+# ### 17.9 Reliability analysis completion check
+
+# %%
+print("Reliability analysis summary:")
+
+if reliability_rows_df.empty:
+    print("  Sample-level reliability rows: none")
+else:
+    print("  Sample-level reliability rows:", len(reliability_rows_df))
+    print("  Seeds:", reliability_rows_df["seed"].nunique() if "seed" in reliability_rows_df.columns else "unknown")
+    print("  Pairs:", reliability_rows_df["pair"].nunique() if "pair" in reliability_rows_df.columns else "unknown")
+
+if reliability_seed_corr_df.empty:
+    print("  Seed-level correlations: none")
+else:
+    print("  Seed-level correlations:", len(reliability_seed_corr_df))
+
+if reliability_corr_summary_df.empty:
+    print("  Correlation summary: none")
+else:
+    print("  Correlation summary rows:", len(reliability_corr_summary_df))
+
+if reliability_bins_summary_df.empty:
+    print("  Reliability bin summary: none")
+else:
+    print("  Reliability bin summary rows:", len(reliability_bins_summary_df))
+
+# %% [markdown]
+# ## 18. Paper-Ready Figures
+# 
+# This section creates figures with 95% confidence interval error bars.
+# 
+# Candidate figures:
+# - Macro-F1 comparison across methods
+# - AUC or PR-AUC comparison across methods
+# - IID vs non-IID comparison
+# - KD vs FedAvg comparison
+# - Attention similarity comparison
+# - False-positive rate vs attention agreement
+# 
+# Figure captions should state:
+# Error bars show 95% confidence intervals across random seeds.
 
 # %% [markdown]
 # ## 19. Paper-Ready Tables
@@ -9632,62 +12069,14 @@ if figure_caption_rows:
 # - Attention/rationale alignment with 95% CIs
 # - Reliability correlation results
 # 
-# Tables are saved as CSV and also rendered as optional LaTeX text files.
-
-# %% [markdown]
-# ### 19.1 Export table files
-
-# %%
-PREDICTIVE_TABLE_CSV = os.path.join(TABLES_DIR, "predictive_paper_table.csv")
-PREDICTIVE_TABLE_TEX = os.path.join(TABLES_DIR, "predictive_paper_table.tex")
-ATTENTION_TABLE_CSV = os.path.join(TABLES_DIR, "attention_paper_table.csv")
-ATTENTION_TABLE_TEX = os.path.join(TABLES_DIR, "attention_paper_table.tex")
-RELIABILITY_TABLE_CSV = os.path.join(TABLES_DIR, "reliability_paper_table.csv")
-RELIABILITY_TABLE_TEX = os.path.join(TABLES_DIR, "reliability_paper_table.tex")
-ATTENTION_PAIRWISE_CSV = os.path.join(TABLES_DIR, "attention_pairwise_tests.csv")
-
-if not predictive_paper_table_df.empty:
-    predictive_paper_table_df.to_csv(PREDICTIVE_TABLE_CSV, index=False)
-    with open(PREDICTIVE_TABLE_TEX, "w", encoding="utf-8") as f:
-        f.write(df_to_latex_string(predictive_paper_table_df, index=False))
-
-if not attention_paper_table_df.empty:
-    attention_paper_table_df.to_csv(ATTENTION_TABLE_CSV, index=False)
-    with open(ATTENTION_TABLE_TEX, "w", encoding="utf-8") as f:
-        f.write(df_to_latex_string(attention_paper_table_df, index=False))
-
-if not reliability_corr_summary_df.empty:
-    reliability_corr_summary_df.to_csv(RELIABILITY_TABLE_CSV, index=False)
-    with open(RELIABILITY_TABLE_TEX, "w", encoding="utf-8") as f:
-        f.write(df_to_latex_string(reliability_corr_summary_df, index=False))
-
-if not attention_pairwise_df.empty:
-    attention_pairwise_df.to_csv(ATTENTION_PAIRWISE_CSV, index=False)
-
-print("Paper-ready table exports complete.")
-
-# %% [markdown]
-# ### 19.2 Display main paper tables
-
-# %%
-if not predictive_paper_table_df.empty:
-    print("Predictive paper table:")
-    display(predictive_paper_table_df)
-
-if not attention_paper_table_df.empty:
-    print("Attention paper table:")
-    display(attention_paper_table_df)
-
-if not reliability_corr_summary_df.empty:
-    print("Reliability correlation table:")
-    display(reliability_corr_summary_df)
+# Tables should be saved as CSV and optionally printed in LaTeX format.
 
 # %% [markdown]
 # ## 20. Final Sanity Checks
 # 
 # This section checks that the statistical results are complete.
 # 
-# It verifies:
+# It will verify:
 # - Expected number of seeds per method
 # - No missing main metrics
 # - No failed runs included in final tables
@@ -9696,133 +12085,4 @@ if not reliability_corr_summary_df.empty:
 # - Pairwise comparisons use matched seeds
 # 
 # This section should be run before copying results into the paper.
-
-# %% [markdown]
-# ### 20.1 Final statistical-rigor checks
-
-# %%
-def run_final_statistical_sanity_checks() -> pd.DataFrame:
-    """
-    Run a compact checklist over predictive, attention, and reliability outputs.
-    """
-    checks = []
-
-    predictive_df = load_predictive_raw_results(PREDICTIVE_RAW_CSV)
-    predictive_ok_df = predictive_df.copy()
-
-    if not predictive_ok_df.empty and "status" in predictive_ok_df.columns:
-        predictive_ok_df = predictive_ok_df[predictive_ok_df["status"] == "ok"].copy()
-
-    expected_predictive = len(PREDICTIVE_SWEEP_EXPERIMENTS) * len(PREDICTIVE_SWEEP_SEEDS)
-    observed_predictive_ok = len(predictive_ok_df)
-
-    checks.append({
-        "check": "predictive_ok_rows_present",
-        "passed": observed_predictive_ok > 0,
-        "detail": f"observed_ok={observed_predictive_ok}, expected_grid={expected_predictive}",
-    })
-
-    if not predictive_ok_df.empty:
-        missing_metric_counts = {
-            metric: int(predictive_ok_df[metric].isna().sum())
-            for metric in PREDICTIVE_METRIC_KEYS
-            if metric in predictive_ok_df.columns
-        }
-        checks.append({
-            "check": "predictive_main_metrics_nonmissing",
-            "passed": all(v == 0 for v in missing_metric_counts.values()),
-            "detail": json.dumps(missing_metric_counts),
-        })
-
-        missing_ckpts = 0
-        if "checkpoint_path" in predictive_ok_df.columns:
-            missing_ckpts = int(
-                (~predictive_ok_df["checkpoint_path"].astype(str).apply(os.path.exists)).sum()
-            )
-        checks.append({
-            "check": "predictive_checkpoints_exist",
-            "passed": missing_ckpts == 0,
-            "detail": f"missing_checkpoints={missing_ckpts}",
-        })
-
-    checks.append({
-        "check": "predictive_summary_has_ci",
-        "passed": (
-            not predictive_summary_df.empty
-            and predictive_summary_df["ci_low"].notna().any()
-            and predictive_summary_df["ci_high"].notna().any()
-        ),
-        "detail": f"summary_rows={len(predictive_summary_df)}",
-    })
-
-    checks.append({
-        "check": "predictive_pairwise_has_matches",
-        "passed": (
-            not predictive_pairwise_df.empty
-            and predictive_pairwise_df["n_pairs"].fillna(0).max() >= 2
-        ),
-        "detail": (
-            f"max_n_pairs={predictive_pairwise_df['n_pairs'].fillna(0).max()}"
-            if not predictive_pairwise_df.empty
-            else "no pairwise rows"
-        ),
-    })
-
-    checks.append({
-        "check": "attention_summary_rows_present",
-        "passed": not attention_raw_df.empty,
-        "detail": f"attention_rows={len(attention_raw_df)}",
-    })
-
-    checks.append({
-        "check": "attention_summary_has_ci",
-        "passed": (
-            not attention_summary_df.empty
-            and attention_summary_df["ci_low"].notna().any()
-            and attention_summary_df["ci_high"].notna().any()
-        ),
-        "detail": f"summary_rows={len(attention_summary_df)}",
-    })
-
-    checks.append({
-        "check": "reliability_raw_rows_present",
-        "passed": not reliability_raw_df.empty,
-        "detail": f"reliability_rows={len(reliability_raw_df)}",
-    })
-
-    checks.append({
-        "check": "reliability_corr_summary_present",
-        "passed": not reliability_corr_summary_df.empty,
-        "detail": f"corr_rows={len(reliability_corr_summary_df)}",
-    })
-
-    checks.append({
-        "check": "no_failed_predictive_rows_in_final_summary",
-        "passed": (
-            predictive_df.empty
-            or "status" not in predictive_df.columns
-            or int((predictive_df["status"] == "failed").sum()) == 0
-        ),
-        "detail": (
-            f"failed_rows={int((predictive_df['status'] == 'failed').sum())}"
-            if not predictive_df.empty and "status" in predictive_df.columns
-            else "no predictive CSV or no status column"
-        ),
-    })
-
-    return pd.DataFrame(checks)
-
-
-final_sanity_df = run_final_statistical_sanity_checks()
-display(final_sanity_df)
-
-if not final_sanity_df.empty:
-    failed_checks = final_sanity_df[~final_sanity_df["passed"]].copy()
-
-    if failed_checks.empty:
-        print("All final sanity checks passed.")
-    else:
-        print("Some final sanity checks still need attention:")
-        display(failed_checks)
-
 
