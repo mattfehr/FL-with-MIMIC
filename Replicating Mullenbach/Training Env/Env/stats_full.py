@@ -7697,6 +7697,7 @@ ATTENTION_TARGET_METHODS = [
     "FedAvg",
     "FedProx",
     "SCAFFOLD",
+    "KD_Baseline_FedAvg",
     "KD_StrongHeterogeneous",
     "KD_StrongHeterogeneous_SD",
 ]
@@ -8307,6 +8308,56 @@ if len(missing_attention_df) > 0:
 # ### 13.8 Label-level token, phrase, and reliability summarizer
 # 
 # This function computes all label-level summaries for one seed/model-pair.
+
+# %%
+def compute_reliability_rows_for_pair_label(
+    cache: Dict[str, dict],
+    X_tensor: torch.Tensor,
+    Y_tensor: torch.Tensor,
+    model_a: str,
+    model_b: str,
+    label_idx: int,
+    mode: str = "agree_positive",
+    top_k: int = BASE_CONFIG["attention_top_k"],
+    trim_context: bool = True,
+    window_size: int = BASE_CONFIG["window_size"],
+    max_samples: Optional[int] = None,
+) -> List[dict]:
+    """
+    Compute sample-level reliability rows for one model pair and label.
+    """
+
+    sample_indices = get_agree_indices(
+        cache=cache,
+        model_a=model_a,
+        model_b=model_b,
+        label_idx=label_idx,
+        mode=mode,
+    )
+
+    if max_samples is not None:
+        sample_indices = sample_indices[:max_samples]
+
+    rows = []
+
+    for sample_idx in sample_indices:
+        row = make_reliability_row_for_sample(
+            cache=cache,
+            X_tensor=X_tensor,
+            Y_tensor=Y_tensor,
+            sample_idx=sample_idx,
+            label_idx=label_idx,
+            model_a=model_a,
+            model_b=model_b,
+            top_k=top_k,
+            trim_context=trim_context,
+            window_size=window_size,
+        )
+
+        row["mode"] = mode
+        rows.append(row)
+
+    return rows
 
 # %%
 def compute_label_level_attention_outputs_for_pair(
@@ -12335,6 +12386,12 @@ def plot_reliability_fp_bins(
 
     if "metric" in plot_df.columns:
         plot_df = plot_df[plot_df["metric"] == "fp_rate"].copy()
+
+    plot_df = plot_df.rename(columns={
+        "fp_rate_mean": "mean",
+        "fp_rate_ci_low": "ci_low",
+        "fp_rate_ci_high": "ci_high",
+    })
 
     required = {"agreement_bin", "mean", "ci_low", "ci_high"}
     missing = required - set(plot_df.columns)
