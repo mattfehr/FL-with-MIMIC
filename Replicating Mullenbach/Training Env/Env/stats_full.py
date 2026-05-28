@@ -12384,6 +12384,142 @@ plot_metric_ci_bar(
     figsize=(8, 5),
 )
 
+# %%
+# %%
+# Figure 8: Publication-ready token-level rationale agreement
+# Main FL methods only: Centralized vs FedAvg/FedProx/SCAFFOLD
+
+import os
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+attention_summary_for_figures_df = _load_df_from_var_or_csv(
+    "attention_summary_long_df",
+    globals().get("ATTENTION_SUMMARY_LONG_CSV", None),
+)
+
+attention_fig_df = _extract_metric_summary_for_plot(
+    summary_long_df=attention_summary_for_figures_df,
+    metric="token_cosine",
+    group_cols=["pair", "mode"],
+)
+
+main_attention_pairs = [
+    "Centralized_vs_FedAvg",
+    "Centralized_vs_FedProx",
+    "Centralized_vs_SCAFFOLD",
+]
+
+pair_labels = {
+    "Centralized_vs_FedAvg": "FedAvg",
+    "Centralized_vs_FedProx": "FedProx",
+    "Centralized_vs_SCAFFOLD": "SCAFFOLD",
+}
+
+pair_colors = {
+    "Centralized_vs_FedAvg": "#2F6F9F",
+    "Centralized_vs_FedProx": "#B8753B",
+    "Centralized_vs_SCAFFOLD": "#5F8F5F",
+}
+
+mpl.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+    "font.size": 9,
+    "axes.labelsize": 9,
+    "axes.titlesize": 9,
+    "axes.linewidth": 0.8,
+    "axes.edgecolor": "#263845",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "xtick.direction": "out",
+    "ytick.direction": "out",
+    "grid.color": "#B8C2CC",
+    "grid.alpha": 0.22,
+    "grid.linewidth": 0.6,
+    "savefig.dpi": 600,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.04,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
+if attention_fig_df.empty:
+    print("No attention summary data found.")
+else:
+    plot_df = attention_fig_df[
+        attention_fig_df["pair"].isin(main_attention_pairs)
+    ].copy()
+
+    plot_df["_order"] = plot_df["pair"].apply(main_attention_pairs.index)
+    plot_df = plot_df.sort_values("_order")
+
+    fig, ax = plt.subplots(figsize=(3.55, 2.15))
+
+    y = np.arange(len(plot_df))
+
+    for i, (_, row) in enumerate(plot_df.iterrows()):
+        pair = row["pair"]
+        mean = float(row["mean"])
+        lo = float(row["ci_low"])
+        hi = float(row["ci_high"])
+
+        ax.errorbar(
+            mean,
+            i,
+            xerr=np.array([[mean - lo], [hi - mean]]),
+            fmt="s",
+            markersize=6.2,
+            markerfacecolor="white",
+            markeredgewidth=1.2,
+            color=pair_colors[pair],
+            ecolor=pair_colors[pair],
+            elinewidth=1.8,
+            capsize=4,
+            capthick=1.2,
+            zorder=3,
+        )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels([pair_labels[p] for p in plot_df["pair"]])
+    ax.invert_yaxis()
+
+    ax.set_xlabel("Mean Cosine Similarity")
+    ax.set_ylabel("Federated Method")
+    ax.set_title(
+        "Token-Level Rationale Agreement",
+        fontsize=8.7,
+        fontweight="bold",
+        pad=12,
+    )
+    ax.set_xlim(0.0, 0.75)
+
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+    ax.grid(True, axis="x")
+    ax.grid(False, axis="y")
+
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#263845")
+        ax.spines[spine].set_linewidth(0.8)
+
+    fig.tight_layout()
+
+    fig8_pdf = os.path.join(PAPER_FIGURE_DIR, "fig_attention_similarity_ci_horizontal.pdf")
+    fig8_png = os.path.join(PAPER_FIGURE_DIR, "fig_attention_similarity_ci_horiztonal.png")
+
+    fig.savefig(fig8_pdf)
+    fig.savefig(fig8_png, dpi=600)
+
+    print("Saved:")
+    print(" PDF:", fig8_pdf)
+    print(" PNG:", fig8_png)
+
+    plt.show()
+
 # %% [markdown]
 # ### 18.5 Reliability figure: false-positive rate by agreement bin
 
@@ -12545,6 +12681,248 @@ plot_reliability_fp_bins(
         "avg_agreement",
         "min_agreement",
     ],
+    pairs_to_keep=[
+        "Centralized_vs_FedAvg",
+        "Centralized_vs_FedProx",
+        "Centralized_vs_SCAFFOLD",
+    ],
+)
+
+# %%
+# %%
+# Figure 10/12: Publication-ready reliability plot
+# False-positive rate vs attention-agreement quantile
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+reliability_bins_for_figures_df = _load_df_from_var_or_csv(
+    "reliability_bins_summary_df",
+    globals().get("RELIABILITY_BIN_SUMMARY_CSV", None),
+)
+
+def set_ieee_reliability_style():
+    mpl.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+        "font.size": 9,
+
+        "axes.labelsize": 9,
+        "axes.titlesize": 9,
+        "axes.linewidth": 0.8,
+        "axes.edgecolor": "#263845",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+
+        "legend.fontsize": 7.2,
+        "legend.frameon": False,
+
+        "grid.color": "#B8C2CC",
+        "grid.alpha": 0.22,
+        "grid.linewidth": 0.6,
+
+        "savefig.dpi": 600,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.04,
+
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    })
+
+RELIABILITY_STYLE = {
+    "cosine": {
+        "label": "Cosine",
+        "color": "#2F6F9F",
+        "marker": "o",
+        "linestyle": "-",
+    },
+    "jaccard": {
+        "label": "Jaccard@15",
+        "color": "#B8753B",
+        "marker": "s",
+        "linestyle": "--",
+    },
+    "avg_agreement": {
+        "label": "Average",
+        "color": "#5F8F5F",
+        "marker": "^",
+        "linestyle": "-.",
+    },
+    "min_agreement": {
+        "label": "Minimum",
+        "color": "#8C4F7D",
+        "marker": "D",
+        "linestyle": ":",
+    },
+}
+
+def plot_reliability_fp_bins_ieee(
+    df: pd.DataFrame,
+    output_name: str = "fig_reliability_fp_by_agreement_bin",
+    agreement_metrics=None,
+    pairs_to_keep=None,
+):
+    set_ieee_reliability_style()
+
+    if df.empty:
+        print("[skip figure] No reliability bin summary available.")
+        return None
+
+    if agreement_metrics is None:
+        agreement_metrics = ["cosine", "jaccard", "avg_agreement", "min_agreement"]
+
+    if pairs_to_keep is None:
+        pairs_to_keep = [
+            "Centralized_vs_FedAvg",
+            "Centralized_vs_FedProx",
+            "Centralized_vs_SCAFFOLD",
+        ]
+
+    plot_df = df.copy()
+
+    if "pair" in plot_df.columns:
+        plot_df = plot_df[plot_df["pair"].isin(pairs_to_keep)].copy()
+
+    if "agreement_metric" in plot_df.columns:
+        plot_df = plot_df[plot_df["agreement_metric"].isin(agreement_metrics)].copy()
+
+    if "metric" in plot_df.columns:
+        plot_df = plot_df[plot_df["metric"] == "fp_rate"].copy()
+
+    plot_df = plot_df.rename(columns={
+        "fp_rate_mean": "mean",
+        "fp_rate_ci_low": "ci_low",
+        "fp_rate_ci_high": "ci_high",
+    })
+
+    required = {"agreement_bin", "agreement_metric", "mean", "ci_low", "ci_high"}
+    missing = required - set(plot_df.columns)
+
+    if missing:
+        print(f"[skip figure] Missing columns: {missing}")
+        return None
+
+    for col in ["agreement_bin", "mean", "ci_low", "ci_high"]:
+        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+
+    plot_df = plot_df.dropna(
+        subset=["agreement_bin", "agreement_metric", "mean", "ci_low", "ci_high"]
+    )
+
+    if plot_df.empty:
+        print("[skip figure] No reliability bin rows after filtering.")
+        return None
+
+    # Average across the three centralized-vs-FL pairs for readability.
+    agg_rows = []
+
+    for (agreement_metric, agreement_bin), sub in plot_df.groupby(
+        ["agreement_metric", "agreement_bin"],
+        dropna=False,
+    ):
+        agg_rows.append({
+            "agreement_metric": agreement_metric,
+            "agreement_bin": int(agreement_bin),
+            "mean": float(sub["mean"].mean()),
+            "ci_low": float(sub["ci_low"].mean()),
+            "ci_high": float(sub["ci_high"].mean()),
+        })
+
+    plot_df = pd.DataFrame(agg_rows).sort_values(["agreement_metric", "agreement_bin"])
+
+    fig, ax = plt.subplots(figsize=(3.75, 2.75))
+
+    for metric in agreement_metrics:
+        sub = plot_df[plot_df["agreement_metric"] == metric].sort_values("agreement_bin")
+
+        if sub.empty:
+            continue
+
+        style = RELIABILITY_STYLE[metric]
+
+        x = sub["agreement_bin"].astype(int).to_numpy()
+        y = sub["mean"].astype(float).to_numpy()
+        yerr = np.vstack([
+            y - sub["ci_low"].astype(float).to_numpy(),
+            sub["ci_high"].astype(float).to_numpy() - y,
+        ])
+
+        ax.errorbar(
+            x,
+            y,
+            yerr=yerr,
+            color=style["color"],
+            linestyle=style["linestyle"],
+            marker=style["marker"],
+            markersize=4.8,
+            markerfacecolor="white",
+            markeredgewidth=1.0,
+            linewidth=1.8,
+            elinewidth=1.1,
+            capsize=3,
+            capthick=1.0,
+            label=style["label"],
+        )
+
+    ax.set_title(
+        "False-Positive Rate vs. Rationale Agreement",
+        fontsize=8.7,
+        fontweight="bold",
+        pad=10,
+    )
+
+    ax.set_xlabel("Agreement Quantile Bin (Low \u2192 High)")
+    ax.set_ylabel("False-Positive Rate")
+
+    ax.set_xticks(sorted(plot_df["agreement_bin"].astype(int).unique()))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+
+    ax.grid(True, axis="y")
+    ax.grid(True, axis="x", alpha=0.10)
+
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#263845")
+        ax.spines[spine].set_linewidth(0.8)
+
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.30),
+        ncol=4,
+        handlelength=1.6,
+        handletextpad=0.4,
+        columnspacing=0.8,
+        borderaxespad=0.0,
+    )
+
+    fig.tight_layout(rect=[0.0, 0.05, 1.0, 1.0])
+
+    pdf_path = os.path.join(PAPER_FIGURE_DIR, f"{output_name}.pdf")
+    png_path = os.path.join(PAPER_FIGURE_DIR, f"{output_name}.png")
+
+    fig.savefig(pdf_path)
+    fig.savefig(png_path, dpi=600)
+
+    print("Saved:")
+    print(" PDF:", pdf_path)
+    print(" PNG:", png_path)
+
+    plt.show()
+
+    return pdf_path, png_path
+
+plot_reliability_fp_bins_ieee(
+    df=reliability_bins_for_figures_df,
+    output_name="fig_reliability_fp_by_agreement_bin_clean",
+    agreement_metrics=["cosine", "jaccard", "avg_agreement", "min_agreement"],
     pairs_to_keep=[
         "Centralized_vs_FedAvg",
         "Centralized_vs_FedProx",
