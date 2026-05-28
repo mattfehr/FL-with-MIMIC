@@ -11327,7 +11327,162 @@ else:
     display(label_summary_df.head(30))
 
 # %% [markdown]
-# ### 16.8 Attention analysis completion check
+# ### 16.8 Frequency-bin attention alignment with 95% CIs
+# 
+# 
+# 
+
+# %%
+# Matches the original Q3 logic:
+# - use training label frequency
+# - create frequency bins from unique labels
+# - filter low-coverage label-pair rows
+# - average labels within each seed × pair × bin
+# - compute 95% CIs across seeds
+
+# %%
+ATTENTION_FREQ_BIN_SUMMARY_CSV = os.path.join(
+    TABLES_DIR,
+    "attention_frequency_bin_summary_mean_ci.csv",
+)
+
+Q3_NUM_BINS = 5
+Q3_MIN_KEPT = 30
+
+def mean_ci_95(values):
+    values = pd.Series(values).dropna().astype(float).to_numpy()
+    n = len(values)
+
+    if n == 0:
+        return np.nan, np.nan, np.nan, 0
+
+    mean = float(np.mean(values))
+
+    if n == 1:
+        return mean, mean, mean, n
+
+    sem = stats.sem(values, nan_policy="omit")
+    ci = stats.t.ppf(0.975, df=n - 1) * sem
+
+    return mean, float(mean - ci), float(mean + ci), n
+
+
+def build_attention_frequency_bin_summary(
+    attention_label_csv: str = ATTENTION_LABEL_RAW_CSV,
+    output_csv: str = ATTENTION_FREQ_BIN_SUMMARY_CSV,
+    n_bins: int = Q3_NUM_BINS,
+    min_kept: int = Q3_MIN_KEPT,
+    mode: str = "agree_positive",
+) -> pd.DataFrame:
+    label_df = read_csv_if_exists(attention_label_csv)
+
+    if label_df.empty:
+        print("[skip] No label-level attention rows found:", attention_label_csv)
+        return pd.DataFrame()
+
+    label_df = label_df[label_df["mode"] == mode].copy()
+
+    # Match old Q3 train-frequency source.
+    freq_df = train_label_counts_df[["label_idx", "positive_count"]].copy()
+    freq_df["label_idx"] = freq_df["label_idx"].astype(int)
+
+    # Create bins ONCE from unique labels, not duplicated seed/pair rows.
+    label_bins = freq_df.copy()
+    label_bins["frequency_bin"] = pd.qcut(
+        label_bins["positive_count"].rank(method="first"),
+        q=n_bins,
+        labels=False,
+        duplicates="drop",
+    ).astype(int)
+
+    label_df["label_idx"] = label_df["label_idx"].astype(int)
+
+    merged = label_df.merge(
+        label_bins[["label_idx", "positive_count", "frequency_bin"]],
+        on="label_idx",
+        how="left",
+    )
+
+    merged = merged.dropna(
+        subset=[
+            "seed",
+            "pair",
+            "label_idx",
+            "positive_count",
+            "frequency_bin",
+            "token_cosine_mean",
+            "token_jaccard_mean",
+            "token_n_kept",
+        ]
+    )
+
+    # Match old Q3 low-coverage filter.
+    merged = merged[merged["token_n_kept"] >= min_kept].copy()
+
+    if merged.empty:
+        print("[skip] No rows left after min_kept filter.")
+        return pd.DataFrame()
+
+    # Match old Q3: unweighted mean across labels within each bin.
+    seed_bin_rows = []
+
+    for (seed, pair, bin_id), sub in merged.groupby(["seed", "pair", "frequency_bin"]):
+        sub_unique = sub.drop_duplicates("label_idx").copy()
+
+        seed_bin_rows.append({
+            "seed": int(seed),
+            "pair": pair,
+            "frequency_bin": int(bin_id),
+            "n_labels": int(sub_unique["label_idx"].nunique()),
+            "total_kept": int(sub_unique["token_n_kept"].sum()),
+            "freq_min": float(sub_unique["positive_count"].min()),
+            "freq_max": float(sub_unique["positive_count"].max()),
+            "mean_positive_count": float(sub_unique["positive_count"].mean()),
+            "token_cosine": float(sub_unique["token_cosine_mean"].mean()),
+            "token_jaccard": float(sub_unique["token_jaccard_mean"].mean()),
+        })
+
+    seed_bin_df = pd.DataFrame(seed_bin_rows)
+
+    summary_rows = []
+
+    for (pair, bin_id), sub in seed_bin_df.groupby(["pair", "frequency_bin"]):
+        cos_mean, cos_lo, cos_hi, n_cos = mean_ci_95(sub["token_cosine"])
+        jac_mean, jac_lo, jac_hi, n_jac = mean_ci_95(sub["token_jaccard"])
+
+        summary_rows.append({
+            "pair": pair,
+            "frequency_bin": int(bin_id),
+            "n_seeds": int(n_cos),
+            "n_labels_mean": float(sub["n_labels"].mean()),
+            "total_kept_mean": float(sub["total_kept"].mean()),
+            "freq_min_mean": float(sub["freq_min"].mean()),
+            "freq_max_mean": float(sub["freq_max"].mean()),
+            "mean_positive_count": float(sub["mean_positive_count"].mean()),
+
+            "token_cosine_mean": cos_mean,
+            "token_cosine_ci_low": cos_lo,
+            "token_cosine_ci_high": cos_hi,
+
+            "token_jaccard_mean": jac_mean,
+            "token_jaccard_ci_low": jac_lo,
+            "token_jaccard_ci_high": jac_hi,
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df = summary_df.sort_values(["pair", "frequency_bin"]).reset_index(drop=True)
+
+    summary_df.to_csv(output_csv, index=False)
+
+    print("Saved frequency-bin attention summary:", output_csv)
+    display(summary_df)
+
+    return summary_df
+
+attention_frequency_bin_summary_df = build_attention_frequency_bin_summary()
+
+# %% [markdown]
+# ### 16.9 Attention analysis completion check
 
 # %%
 if attention_stats_df.empty:
@@ -12521,7 +12676,167 @@ else:
     plt.show()
 
 # %% [markdown]
-# ### 18.5 Reliability figure: false-positive rate by agreement bin
+# ### 18.5 Frequency-bin attention alignment figure
+
+# %%
+# %%
+# Figure 10: Publication-ready frequency-bin attention alignment with 95% CIs
+
+import os
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+attention_frequency_bin_for_figures_df = _load_df_from_var_or_csv(
+    "attention_frequency_bin_summary_df",
+    globals().get("ATTENTION_FREQ_BIN_SUMMARY_CSV", None),
+)
+
+MAIN_FREQ_PAIRS = [
+    "Centralized_vs_FedAvg",
+    "Centralized_vs_FedProx",
+    "Centralized_vs_SCAFFOLD",
+]
+
+PAIR_STYLE = {
+    "Centralized_vs_FedAvg": {
+        "label": "FedAvg",
+        "color": "#2F6F9F",
+        "marker": "o",
+        "linestyle": "-",
+    },
+    "Centralized_vs_FedProx": {
+        "label": "FedProx",
+        "color": "#B8753B",
+        "marker": "s",
+        "linestyle": "--",
+    },
+    "Centralized_vs_SCAFFOLD": {
+        "label": "SCAFFOLD",
+        "color": "#5F8F5F",
+        "marker": "^",
+        "linestyle": "-.",
+    },
+}
+
+plt.rcdefaults()
+
+mpl.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+    "font.size": 8,
+    "axes.linewidth": 0.8,
+    "axes.edgecolor": "#263845",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "xtick.direction": "out",
+    "ytick.direction": "out",
+    "legend.frameon": True,
+    "legend.fancybox": False,
+    "legend.framealpha": 0.92,
+    "grid.color": "#B8C2CC",
+    "grid.alpha": 0.22,
+    "grid.linewidth": 0.6,
+    "savefig.dpi": 600,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.04,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
+if attention_frequency_bin_for_figures_df.empty:
+    print("[skip figure] No frequency-bin attention summary found.")
+else:
+    plot_df = attention_frequency_bin_for_figures_df[
+        attention_frequency_bin_for_figures_df["pair"].isin(MAIN_FREQ_PAIRS)
+    ].copy()
+
+    fig, ax = plt.subplots(figsize=(3.75, 2.85))
+
+    for pair in MAIN_FREQ_PAIRS:
+        sub = plot_df[plot_df["pair"] == pair].sort_values("frequency_bin")
+
+        if sub.empty:
+            continue
+
+        style = PAIR_STYLE[pair]
+
+        x = sub["frequency_bin"].astype(int).to_numpy()
+        y = sub["token_cosine_mean"].astype(float).to_numpy()
+
+        yerr = np.vstack([
+            y - sub["token_cosine_ci_low"].astype(float).to_numpy(),
+            sub["token_cosine_ci_high"].astype(float).to_numpy() - y,
+        ])
+
+        ax.errorbar(
+            x,
+            y,
+            yerr=yerr,
+            color=style["color"],
+            linestyle=style["linestyle"],
+            marker=style["marker"],
+            markersize=4.2,
+            markerfacecolor="white",
+            markeredgewidth=1.0,
+            linewidth=1.5,
+            elinewidth=0.85,
+            capsize=2.2,
+            capthick=0.8,
+            label=style["label"],
+        )
+
+    ax.set_title(
+        "Attention Alignment by Label Frequency",
+        fontsize=8.2,
+        fontweight="bold",
+        pad=7,
+    )
+
+    ax.set_xlabel("Label-Frequency Bin (Rare \u2192 Frequent)", fontsize=8.0, labelpad=3)
+    ax.set_ylabel("Cosine Similarity", fontsize=8.0, labelpad=3)
+
+    ax.tick_params(axis="both", labelsize=7.4)
+
+    ax.set_xticks(sorted(plot_df["frequency_bin"].astype(int).unique()))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+
+    ax.grid(True, axis="y")
+    ax.grid(True, axis="x", alpha=0.10)
+
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#263845")
+        ax.spines[spine].set_linewidth(0.8)
+
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.38),
+        ncol=3,
+        fontsize=6.4,
+        handlelength=1.5,
+        handletextpad=0.35,
+        columnspacing=0.7,
+        borderaxespad=0.0,
+        frameon=False,
+    )
+
+    fig.tight_layout(rect=[0.0, 0.10, 1.0, 1.0])
+
+    fig10_pdf = os.path.join(PAPER_FIGURE_DIR, "fig_frequency_alignment_cosine_ci.pdf")
+    fig10_png = os.path.join(PAPER_FIGURE_DIR, "fig_frequency_alignment_cosine_ci.png")
+
+    fig.savefig(fig10_pdf)
+    fig.savefig(fig10_png, dpi=600)
+
+    print("Saved:")
+    print(" PDF:", fig10_pdf)
+    print(" PNG:", fig10_png)
+
+    plt.show()
+
+# %% [markdown]
+# ### 18.6 Reliability figure: false-positive rate by agreement bin
 
 # %%
 reliability_bins_for_figures_df = _load_df_from_var_or_csv(
