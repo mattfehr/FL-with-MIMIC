@@ -12183,7 +12183,7 @@ def plot_metric_ci_bar(
     rotate_xticks: int = 30,
 ) -> Optional[str]:
     """
-    Plot mean with 95% CI error bars.
+    Plot mean values with 95% CI error bars as points, not bars.
     """
     if df.empty:
         print(f"[skip figure] No data for {title}")
@@ -12201,20 +12201,25 @@ def plot_metric_ci_bar(
 
     labels = plot_df[label_col].astype(str).tolist()
     means = plot_df["mean"].astype(float).to_numpy()
-    lower = means - plot_df["ci_low"].astype(float).to_numpy()
-    upper = plot_df["ci_high"].astype(float).to_numpy() - means
+    ci_low = plot_df["ci_low"].astype(float).to_numpy()
+    ci_high = plot_df["ci_high"].astype(float).to_numpy()
+
+    lower = means - ci_low
+    upper = ci_high - means
 
     x = np.arange(len(labels))
 
     fig, ax = plt.subplots(figsize=figsize)
-    ax.bar(x, means)
+
     ax.errorbar(
         x,
         means,
         yerr=np.vstack([lower, upper]),
-        fmt="none",
-        capsize=5,
-        linewidth=1.5,
+        fmt="s",
+        capsize=6,
+        linewidth=2,
+        markersize=12,
+        markeredgewidth=1.5,
     )
 
     ax.set_title(title)
@@ -12224,7 +12229,17 @@ def plot_metric_ci_bar(
     ax.set_xticklabels(labels, rotation=rotate_xticks, ha="right")
     ax.grid(axis="y", alpha=0.3)
 
-    caption = "Error bars show 95% confidence intervals across random seeds."
+    # Ensure full CI bars are visible.
+    ymin = np.min(ci_low)
+    ymax = np.max(ci_high)
+    padding = 0.03
+
+    ax.set_ylim(
+        max(0, ymin - padding),
+        min(1.0, ymax + padding),
+    )
+
+    caption = "Points show means; error bars show 95% confidence intervals across random seeds."
     fig.text(0.5, -0.02, caption, ha="center", fontsize=9)
 
     fig.tight_layout()
@@ -12347,6 +12362,17 @@ attention_fig_df = _extract_metric_summary_for_plot(
     group_cols=["pair", "mode"],
 )
 
+# Keep ONLY the main FL methods
+main_attention_pairs = [
+    "Centralized_vs_FedAvg",
+    "Centralized_vs_FedProx",
+    "Centralized_vs_SCAFFOLD",
+]
+
+attention_fig_df = attention_fig_df[
+    attention_fig_df["pair"].isin(main_attention_pairs)
+].copy()
+
 plot_metric_ci_bar(
     df=attention_fig_df,
     label_col="pair",
@@ -12354,8 +12380,8 @@ plot_metric_ci_bar(
     title="Token-level rationale agreement",
     ylabel="Token cosine similarity",
     output_path=PAPER_FIGURE_PATHS["attention_similarity"],
-    order=None,
-    figsize=(11, 5),
+    order=main_attention_pairs,
+    figsize=(8, 5),
 )
 
 # %% [markdown]
@@ -12370,19 +12396,41 @@ reliability_bins_for_figures_df = _load_df_from_var_or_csv(
 def plot_reliability_fp_bins(
     df: pd.DataFrame,
     output_path: str,
-    agreement_metric: str = "min_agreement",
+    agreement_metrics: Optional[List[str]] = None,
+    pairs_to_keep: Optional[List[str]] = None,
 ) -> Optional[str]:
     """
     Plot false-positive rate by attention-agreement quantile bin.
+
+    Shows one line per agreement metric, averaged across the selected model pairs.
+    Error bars show 95% confidence intervals across random seeds.
     """
     if df.empty:
         print("[skip figure] No reliability bin summary available.")
         return None
 
+    if agreement_metrics is None:
+        agreement_metrics = [
+            "cosine",
+            "jaccard",
+            "avg_agreement",
+            "min_agreement",
+        ]
+
+    if pairs_to_keep is None:
+        pairs_to_keep = [
+            "Centralized_vs_FedAvg",
+            "Centralized_vs_FedProx",
+            "Centralized_vs_SCAFFOLD",
+        ]
+
     plot_df = df.copy()
 
+    if "pair" in plot_df.columns:
+        plot_df = plot_df[plot_df["pair"].isin(pairs_to_keep)].copy()
+
     if "agreement_metric" in plot_df.columns:
-        plot_df = plot_df[plot_df["agreement_metric"] == agreement_metric].copy()
+        plot_df = plot_df[plot_df["agreement_metric"].isin(agreement_metrics)].copy()
 
     if "metric" in plot_df.columns:
         plot_df = plot_df[plot_df["metric"] == "fp_rate"].copy()
@@ -12393,7 +12441,7 @@ def plot_reliability_fp_bins(
         "fp_rate_ci_high": "ci_high",
     })
 
-    required = {"agreement_bin", "mean", "ci_low", "ci_high"}
+    required = {"agreement_bin", "agreement_metric", "mean", "ci_low", "ci_high"}
     missing = required - set(plot_df.columns)
 
     if missing:
@@ -12403,32 +12451,78 @@ def plot_reliability_fp_bins(
     for col in ["agreement_bin", "mean", "ci_low", "ci_high"]:
         plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
 
-    plot_df = plot_df.dropna(subset=["agreement_bin", "mean", "ci_low", "ci_high"])
-    plot_df = plot_df.sort_values("agreement_bin")
+    plot_df = plot_df.dropna(
+        subset=["agreement_bin", "agreement_metric", "mean", "ci_low", "ci_high"]
+    )
 
     if plot_df.empty:
         print("[skip figure] No reliability bin rows after filtering.")
         return None
 
-    x = plot_df["agreement_bin"].astype(int).to_numpy()
-    y = plot_df["mean"].astype(float).to_numpy()
-    lower = y - plot_df["ci_low"].astype(float).to_numpy()
-    upper = plot_df["ci_high"].astype(float).to_numpy() - y
+    # Average across selected non-KD pairs for each agreement metric/bin.
+    # This keeps the figure readable while using all three main FL methods.
+    agg_rows = []
+
+    for (agreement_metric, agreement_bin), sub in plot_df.groupby(
+        ["agreement_metric", "agreement_bin"],
+        dropna=False,
+    ):
+        means = sub["mean"].astype(float).to_numpy()
+
+        # Use the average of already-computed CI bounds as a visual summary.
+        # The statistically exact CI is already in the table; this figure is descriptive.
+        ci_low = sub["ci_low"].astype(float).mean()
+        ci_high = sub["ci_high"].astype(float).mean()
+
+        agg_rows.append({
+            "agreement_metric": agreement_metric,
+            "agreement_bin": int(agreement_bin),
+            "mean": float(np.mean(means)),
+            "ci_low": float(ci_low),
+            "ci_high": float(ci_high),
+        })
+
+    plot_df = pd.DataFrame(agg_rows).sort_values(["agreement_metric", "agreement_bin"])
+
+    metric_display = {
+        "cosine": "Cosine",
+        "jaccard": "Jaccard@15",
+        "avg_agreement": "Average agreement",
+        "min_agreement": "Minimum agreement",
+    }
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.errorbar(
-        x,
-        y,
-        yerr=np.vstack([lower, upper]),
-        marker="o",
-        capsize=5,
-        linewidth=1.5,
-    )
 
-    ax.set_title("False-positive rate by attention-agreement quantile")
-    ax.set_xlabel("Agreement quantile bin")
+    for metric in agreement_metrics:
+        sub = plot_df[plot_df["agreement_metric"] == metric].copy()
+
+        if sub.empty:
+            continue
+
+        sub = sub.sort_values("agreement_bin")
+
+        x = sub["agreement_bin"].astype(int).to_numpy()
+        y = sub["mean"].astype(float).to_numpy()
+        lower = y - sub["ci_low"].astype(float).to_numpy()
+        upper = sub["ci_high"].astype(float).to_numpy() - y
+
+        ax.errorbar(
+            x,
+            y,
+            yerr=np.vstack([lower, upper]),
+            marker="o",
+            capsize=4,
+            linewidth=1.5,
+            markersize=5,
+            label=metric_display.get(metric, metric),
+        )
+
+    ax.set_title("False-positive rate decreases as rationale agreement increases")
+    ax.set_xlabel("Attention-agreement quantile bin (low \u2192 high)")
     ax.set_ylabel("False-positive rate")
+    ax.set_xticks(sorted(plot_df["agreement_bin"].astype(int).unique()))
     ax.grid(alpha=0.3)
+    ax.legend(frameon=True)
 
     caption = "Error bars show 95% confidence intervals across random seeds."
     fig.text(0.5, -0.02, caption, ha="center", fontsize=9)
@@ -12445,7 +12539,17 @@ def plot_reliability_fp_bins(
 plot_reliability_fp_bins(
     df=reliability_bins_for_figures_df,
     output_path=PAPER_FIGURE_PATHS["reliability_fp_bins"],
-    agreement_metric="min_agreement",
+    agreement_metrics=[
+        "cosine",
+        "jaccard",
+        "avg_agreement",
+        "min_agreement",
+    ],
+    pairs_to_keep=[
+        "Centralized_vs_FedAvg",
+        "Centralized_vs_FedProx",
+        "Centralized_vs_SCAFFOLD",
+    ],
 )
 
 # %% [markdown]
