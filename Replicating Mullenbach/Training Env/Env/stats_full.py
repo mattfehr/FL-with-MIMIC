@@ -11482,7 +11482,372 @@ def build_attention_frequency_bin_summary(
 attention_frequency_bin_summary_df = build_attention_frequency_bin_summary()
 
 # %% [markdown]
-# ### 16.9 Attention analysis completion check
+# ### 16.9 Q4 repeated-seed method closeness to centralized
+
+# %%
+# Recomputes Q4 using repeated seeds instead of the original single-seed notebook.
+# For each seed, only labels where all three centralized-vs-FL comparisons have
+# sufficient agree-positive coverage are retained.
+
+# %%
+import os
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+ATTENTION_Q4_SEED_LEVEL_CSV = os.path.join(
+    TABLES_DIR,
+    "attention_q4_closest_to_centralized_seed_level.csv",
+)
+
+ATTENTION_Q4_METHOD_SUMMARY_CSV = os.path.join(
+    TABLES_DIR,
+    "attention_q4_closest_to_centralized_summary.csv",
+)
+
+ATTENTION_Q4_WIN_COUNTS_CSV = os.path.join(
+    TABLES_DIR,
+    "attention_q4_closest_to_centralized_win_counts.csv",
+)
+
+ATTENTION_Q4_PAIRWISE_CSV = os.path.join(
+    TABLES_DIR,
+    "attention_q4_closest_to_centralized_pairwise_tests.csv",
+)
+
+Q4_MAIN_PAIRS = [
+    "Centralized_vs_FedAvg",
+    "Centralized_vs_FedProx",
+    "Centralized_vs_SCAFFOLD",
+]
+
+Q4_FED_METHODS = ["FedAvg", "FedProx", "SCAFFOLD"]
+Q4_MIN_KEPT_PER_LABEL = 30
+Q4_MODE = "agree_positive"
+
+
+def q4_pair_to_method(pair: str) -> str:
+    pair = str(pair)
+    if pair.endswith("_FedAvg") or "FedAvg" in pair:
+        return "FedAvg"
+    if pair.endswith("_FedProx") or "FedProx" in pair:
+        return "FedProx"
+    if pair.endswith("_SCAFFOLD") or "SCAFFOLD" in pair:
+        return "SCAFFOLD"
+    return pair
+
+
+def q4_mean_ci_95(values):
+    arr = pd.Series(values).dropna().astype(float).to_numpy()
+    n = len(arr)
+
+    if n == 0:
+        return np.nan, np.nan, np.nan, 0
+
+    mean = float(np.mean(arr))
+
+    if n == 1:
+        return mean, mean, mean, n
+
+    sem = stats.sem(arr, nan_policy="omit")
+    ci = stats.t.ppf(0.975, df=n - 1) * sem
+
+    return mean, float(mean - ci), float(mean + ci), n
+
+
+def q4_weighted_mean(values, weights):
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+
+    mask = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+
+    if mask.sum() == 0:
+        return np.nan
+
+    return float(np.sum(values[mask] * weights[mask]) / np.sum(weights[mask]))
+
+
+def build_repeated_seed_q4(
+    attention_label_csv: str = ATTENTION_LABEL_RAW_CSV,
+    mode: str = Q4_MODE,
+    min_kept_per_label: int = Q4_MIN_KEPT_PER_LABEL,
+):
+    label_df = read_csv_if_exists(attention_label_csv)
+
+    if label_df.empty:
+        print("[skip] No label-level attention results found:", attention_label_csv)
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df = label_df.copy()
+
+    if "mode" in df.columns:
+        df = df[df["mode"] == mode].copy()
+
+    df = df[df["pair"].isin(Q4_MAIN_PAIRS)].copy()
+    df["fed_method"] = df["pair"].apply(q4_pair_to_method)
+
+    required = {
+        "seed",
+        "pair",
+        "fed_method",
+        "label_idx",
+        "token_n_kept",
+        "token_cosine_mean",
+        "token_jaccard_mean",
+    }
+
+    missing = required - set(df.columns)
+    if missing:
+        print("[skip] Q4 label-level table missing columns:", missing)
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    for col in ["seed", "label_idx", "token_n_kept", "token_cosine_mean", "token_jaccard_mean"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(
+        subset=[
+            "seed",
+            "label_idx",
+            "token_n_kept",
+            "token_cosine_mean",
+            "token_jaccard_mean",
+        ]
+    )
+
+    df["seed"] = df["seed"].astype(int)
+    df["label_idx"] = df["label_idx"].astype(int)
+
+    seed_level_rows = []
+    win_rows = []
+
+    for seed, seed_df in df.groupby("seed"):
+        kept_pivot = seed_df.pivot_table(
+            index="label_idx",
+            columns="fed_method",
+            values="token_n_kept",
+            aggfunc="max",
+        )
+
+        valid_labels = kept_pivot.dropna().index[
+            (kept_pivot.dropna() >= min_kept_per_label).all(axis=1)
+        ]
+
+        seed_valid = seed_df[seed_df["label_idx"].isin(valid_labels)].copy()
+
+        for method in Q4_FED_METHODS:
+            sub = seed_valid[seed_valid["fed_method"] == method].copy()
+
+            seed_level_rows.append({
+                "seed": int(seed),
+                "fed_method": method,
+                "n_valid_labels": int(sub["label_idx"].nunique()),
+                "total_kept": int(sub["token_n_kept"].sum()),
+                "cosine_weighted": q4_weighted_mean(
+                    sub["token_cosine_mean"],
+                    sub["token_n_kept"],
+                ),
+                "jaccard_weighted": q4_weighted_mean(
+                    sub["token_jaccard_mean"],
+                    sub["token_n_kept"],
+                ),
+            })
+
+        cos_pivot = seed_valid.pivot_table(
+            index="label_idx",
+            columns="fed_method",
+            values="token_cosine_mean",
+            aggfunc="mean",
+        )
+
+        jac_pivot = seed_valid.pivot_table(
+            index="label_idx",
+            columns="fed_method",
+            values="token_jaccard_mean",
+            aggfunc="mean",
+        )
+
+        common_labels = cos_pivot.dropna().index.intersection(jac_pivot.dropna().index)
+
+        for label_idx in common_labels:
+            cos_winner = cos_pivot.loc[label_idx, Q4_FED_METHODS].idxmax()
+            jac_winner = jac_pivot.loc[label_idx, Q4_FED_METHODS].idxmax()
+
+            win_rows.append({
+                "seed": int(seed),
+                "label_idx": int(label_idx),
+                "cosine_winner": cos_winner,
+                "jaccard_winner": jac_winner,
+            })
+
+    q4_seed_level_df = pd.DataFrame(seed_level_rows)
+    q4_win_raw_df = pd.DataFrame(win_rows)
+
+    summary_rows = []
+
+    for method, sub in q4_seed_level_df.groupby("fed_method"):
+        cos_mean, cos_lo, cos_hi, n_cos = q4_mean_ci_95(sub["cosine_weighted"])
+        jac_mean, jac_lo, jac_hi, n_jac = q4_mean_ci_95(sub["jaccard_weighted"])
+
+        summary_rows.append({
+            "fed_method": method,
+            "n_seeds": int(n_cos),
+            "n_valid_labels_mean": float(sub["n_valid_labels"].mean()),
+            "total_kept_mean": float(sub["total_kept"].mean()),
+
+            "cosine_mean": cos_mean,
+            "cosine_ci_low": cos_lo,
+            "cosine_ci_high": cos_hi,
+
+            "jaccard_mean": jac_mean,
+            "jaccard_ci_low": jac_lo,
+            "jaccard_ci_high": jac_hi,
+        })
+
+    q4_summary_df = (
+        pd.DataFrame(summary_rows)
+        .sort_values("cosine_mean", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    win_counts_rows = []
+
+    if not q4_win_raw_df.empty:
+        for metric_col, out_col in [
+            ("cosine_winner", "cosine_win_count"),
+            ("jaccard_winner", "jaccard_win_count"),
+        ]:
+            counts = q4_win_raw_df[metric_col].value_counts()
+
+            for method in Q4_FED_METHODS:
+                win_counts_rows.append({
+                    "fed_method": method,
+                    "metric": metric_col.replace("_winner", ""),
+                    "win_count": int(counts.get(method, 0)),
+                    "total_seed_label_cases": int(len(q4_win_raw_df)),
+                    "win_rate": float(counts.get(method, 0) / max(len(q4_win_raw_df), 1)),
+                })
+
+    q4_win_counts_df = pd.DataFrame(win_counts_rows)
+
+    q4_seed_level_df.to_csv(ATTENTION_Q4_SEED_LEVEL_CSV, index=False)
+    q4_summary_df.to_csv(ATTENTION_Q4_METHOD_SUMMARY_CSV, index=False)
+    q4_win_counts_df.to_csv(ATTENTION_Q4_WIN_COUNTS_CSV, index=False)
+
+    print("Saved Q4 repeated-seed outputs:")
+    print(" Seed level:", ATTENTION_Q4_SEED_LEVEL_CSV)
+    print(" Summary:   ", ATTENTION_Q4_METHOD_SUMMARY_CSV)
+    print(" Win counts:", ATTENTION_Q4_WIN_COUNTS_CSV)
+
+    print("\nQ4 summary:")
+    display(q4_summary_df)
+
+    print("\nQ4 win counts:")
+    display(q4_win_counts_df)
+
+    return q4_seed_level_df, q4_summary_df, q4_win_counts_df, q4_win_raw_df
+
+
+q4_seed_level_df, q4_summary_df, q4_win_counts_df, q4_win_raw_df = build_repeated_seed_q4()
+
+# %% [markdown]
+# ### 16.10 Q4 paired statistical comparisons
+
+# %%
+# Paired tests compare methods across the same random seeds.
+
+# %%
+def q4_cohens_dz(diff_values):
+    diff = pd.Series(diff_values).dropna().astype(float).to_numpy()
+
+    if len(diff) < 2:
+        return np.nan
+
+    sd = np.std(diff, ddof=1)
+
+    if sd == 0:
+        return np.nan
+
+    return float(np.mean(diff) / sd)
+
+
+def q4_paired_tests(seed_level_df: pd.DataFrame) -> pd.DataFrame:
+    if seed_level_df.empty:
+        print("[skip] No Q4 seed-level rows available.")
+        return pd.DataFrame()
+
+    comparisons = [
+        ("FedAvg", "FedProx"),
+        ("FedAvg", "SCAFFOLD"),
+        ("FedProx", "SCAFFOLD"),
+    ]
+
+    metrics = ["cosine_weighted", "jaccard_weighted"]
+    rows = []
+
+    for metric in metrics:
+        pivot = seed_level_df.pivot_table(
+            index="seed",
+            columns="fed_method",
+            values=metric,
+            aggfunc="mean",
+        )
+
+        for left, right in comparisons:
+            if left not in pivot.columns or right not in pivot.columns:
+                continue
+
+            paired = pivot[[left, right]].dropna()
+
+            if len(paired) < 2:
+                rows.append({
+                    "metric": metric,
+                    "left": left,
+                    "right": right,
+                    "n": int(len(paired)),
+                    "mean_left": np.nan,
+                    "mean_right": np.nan,
+                    "mean_diff_left_minus_right": np.nan,
+                    "t_value": np.nan,
+                    "p_value": np.nan,
+                    "cohens_dz": np.nan,
+                })
+                continue
+
+            diff = paired[left] - paired[right]
+            t_value, p_value = stats.ttest_rel(paired[left], paired[right], nan_policy="omit")
+
+            rows.append({
+                "metric": metric,
+                "left": left,
+                "right": right,
+                "n": int(len(paired)),
+                "mean_left": float(paired[left].mean()),
+                "mean_right": float(paired[right].mean()),
+                "mean_diff_left_minus_right": float(diff.mean()),
+                "t_value": float(t_value),
+                "p_value": float(p_value),
+                "cohens_dz": q4_cohens_dz(diff),
+            })
+
+    out = pd.DataFrame(rows)
+
+    if not out.empty and HAS_STATSMODELS:
+        out["p_value_holm"] = multipletests(out["p_value"].fillna(1.0), method="holm")[1]
+    elif not out.empty:
+        out["p_value_holm"] = np.nan
+
+    out.to_csv(ATTENTION_Q4_PAIRWISE_CSV, index=False)
+
+    print("Saved Q4 paired tests:", ATTENTION_Q4_PAIRWISE_CSV)
+    display(out)
+
+    return out
+
+
+q4_pairwise_df = q4_paired_tests(q4_seed_level_df)
+
+# %% [markdown]
+# ### 16.11 Attention analysis completion check
 
 # %%
 if attention_stats_df.empty:
@@ -13244,6 +13609,138 @@ plot_reliability_fp_bins_ieee(
         "Centralized_vs_SCAFFOLD",
     ],
 )
+
+# %% [markdown]
+# ### 18.7 Q4 publication figure
+
+# %%
+# Optional figure showing repeated-seed Q4 closeness to centralized.
+
+# %%
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
+Q4_FIGURE_PDF = os.path.join(PAPER_FIGURE_DIR, "fig_q4_closest_to_centralized_repeated_seed.pdf")
+Q4_FIGURE_PNG = os.path.join(PAPER_FIGURE_DIR, "fig_q4_closest_to_centralized_repeated_seed.png")
+
+Q4_STYLE = {
+    "FedAvg": {
+        "color": "#2F6F9F",
+        "marker": "o",
+        "label": "FedAvg",
+    },
+    "FedProx": {
+        "color": "#B8753B",
+        "marker": "s",
+        "label": "FedProx",
+    },
+    "SCAFFOLD": {
+        "color": "#5F8F5F",
+        "marker": "^",
+        "label": "SCAFFOLD",
+    },
+}
+
+plt.rcdefaults()
+
+mpl.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+    "font.size": 8,
+    "axes.labelsize": 8,
+    "axes.titlesize": 8.5,
+    "axes.linewidth": 0.8,
+    "axes.edgecolor": "#263845",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "xtick.labelsize": 7.5,
+    "ytick.labelsize": 7.5,
+    "xtick.direction": "out",
+    "ytick.direction": "out",
+    "legend.fontsize": 7,
+    "legend.frameon": False,
+    "grid.color": "#B8C2CC",
+    "grid.alpha": 0.22,
+    "grid.linewidth": 0.6,
+    "savefig.dpi": 600,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.04,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
+if q4_summary_df.empty:
+    print("[skip figure] q4_summary_df is empty.")
+else:
+    plot_df = q4_summary_df.copy()
+    plot_df["fed_method"] = pd.Categorical(
+        plot_df["fed_method"],
+        categories=Q4_FED_METHODS,
+        ordered=True,
+    )
+    plot_df = plot_df.sort_values("fed_method")
+
+    fig, ax = plt.subplots(figsize=(3.65, 2.45))
+
+    y_positions = np.arange(len(plot_df))
+
+    for i, (_, row) in enumerate(plot_df.iterrows()):
+        method = row["fed_method"]
+        style = Q4_STYLE[str(method)]
+
+        mean = float(row["cosine_mean"])
+        xerr = np.array([
+            [mean - float(row["cosine_ci_low"])],
+            [float(row["cosine_ci_high"]) - mean],
+        ])
+
+        ax.errorbar(
+            mean,
+            i,
+            xerr=xerr,
+            color=style["color"],
+            marker=style["marker"],
+            markersize=5.0,
+            markerfacecolor="white",
+            markeredgewidth=1.1,
+            linewidth=1.8,
+            elinewidth=1.2,
+            capsize=3,
+            capthick=1.0,
+            linestyle="none",
+            label=style["label"],
+        )
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(plot_df["fed_method"].astype(str).tolist())
+    ax.invert_yaxis()
+
+    ax.set_title(
+        "Closest to Centralized Attention",
+        fontsize=8.7,
+        fontweight="bold",
+        pad=8,
+    )
+    ax.set_xlabel("Coverage-Weighted Cosine Similarity")
+    ax.set_ylabel("Federated Method")
+
+    ax.grid(True, axis="x")
+    ax.grid(False, axis="y")
+
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#263845")
+        ax.spines[spine].set_linewidth(0.8)
+
+    fig.tight_layout()
+
+    fig.savefig(Q4_FIGURE_PDF)
+    fig.savefig(Q4_FIGURE_PNG, dpi=600)
+
+    print("Saved:")
+    print(" PDF:", Q4_FIGURE_PDF)
+    print(" PNG:", Q4_FIGURE_PNG)
+
+    plt.show()
 
 # %% [markdown]
 # ## 19. Paper-Ready Tables
