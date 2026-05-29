@@ -13957,6 +13957,216 @@ print("  ", PAPER_ARTIFACT_INDEX_CSV)
 display(paper_artifact_index_df)
 
 # %% [markdown]
+# ### 19.8 Paper-ready phrase-level IoU table with repeated-seed CIs
+
+# %%
+PHRASE_TABLE_CSV = os.path.join(TABLES_DIR, "phrase_iou_table_mean_ci.csv")
+PHRASE_TABLE_LATEX_TXT = os.path.join(TABLES_DIR, "phrase_iou_table_latex.txt")
+
+PHRASE_TABLE_PAIRS = [
+    "Centralized_vs_FedAvg",
+    "Centralized_vs_FedProx",
+    "Centralized_vs_SCAFFOLD",
+    "FedAvg_vs_FedProx",
+    "FedAvg_vs_SCAFFOLD",
+    "FedProx_vs_SCAFFOLD",
+]
+
+PHRASE_TABLE_METRICS = [
+    "phrase_top1_iou",
+    "phrase_top5_max_iou",
+    "phrase_weighted_iou",
+    "phrase_unweighted_iou",
+    "phrase_rankaware_iou",
+]
+
+PHRASE_TABLE_DISPLAY = {
+    "phrase_top1_iou": "Top-1",
+    "phrase_top5_max_iou": "Top-5 Max",
+    "phrase_weighted_iou": "Weighted",
+    "phrase_unweighted_iou": "Unweighted",
+    "phrase_rankaware_iou": "Rank-Aware",
+}
+
+PAIR_DISPLAY = {
+    "Centralized_vs_FedAvg": "Centralized vs FedAvg",
+    "Centralized_vs_FedProx": "Centralized vs FedProx",
+    "Centralized_vs_SCAFFOLD": "Centralized vs SCAFFOLD",
+    "FedAvg_vs_FedProx": "FedAvg vs FedProx",
+    "FedAvg_vs_SCAFFOLD": "FedAvg vs SCAFFOLD",
+    "FedProx_vs_SCAFFOLD": "FedProx vs SCAFFOLD",
+}
+
+def ci95_from_seed_values(values):
+    values = pd.Series(values).dropna().astype(float).to_numpy()
+    n = len(values)
+
+    if n == 0:
+        return np.nan, np.nan, np.nan, 0
+
+    mean = float(np.mean(values))
+
+    if n == 1:
+        return mean, mean, mean, n
+
+    sem = stats.sem(values, nan_policy="omit")
+    ci = stats.t.ppf(0.975, df=n - 1) * sem
+
+    return mean, float(mean - ci), float(mean + ci), n
+
+
+phrase_seed_df = attention_stats_df.copy()
+
+phrase_seed_df = phrase_seed_df[
+    (phrase_seed_df["mode"] == "agree_positive")
+    & (phrase_seed_df["pair"].isin(PHRASE_TABLE_PAIRS))
+].copy()
+
+for metric in PHRASE_TABLE_METRICS:
+    phrase_seed_df[metric] = pd.to_numeric(phrase_seed_df[metric], errors="coerce")
+
+phrase_rows = []
+
+for pair in PHRASE_TABLE_PAIRS:
+    sub = phrase_seed_df[phrase_seed_df["pair"] == pair].copy()
+    row = {
+        "Pair": PAIR_DISPLAY.get(pair, pair),
+        "n_seeds": int(sub["seed"].nunique()),
+    }
+
+    for metric in PHRASE_TABLE_METRICS:
+        mean, lo, hi, n = ci95_from_seed_values(sub[metric])
+        row[PHRASE_TABLE_DISPLAY[metric]] = mean
+        row[f"{PHRASE_TABLE_DISPLAY[metric]}_ci_low"] = lo
+        row[f"{PHRASE_TABLE_DISPLAY[metric]}_ci_high"] = hi
+        row[f"{PHRASE_TABLE_DISPLAY[metric]}_formatted"] = (
+            f"{mean:.3f} [{lo:.3f}, {hi:.3f}]" if np.isfinite(mean) else "NA"
+        )
+
+    phrase_rows.append(row)
+
+phrase_table_df = pd.DataFrame(phrase_rows)
+phrase_table_df.to_csv(PHRASE_TABLE_CSV, index=False)
+
+display_cols = [
+    "Pair",
+    "n_seeds",
+    "Top-1_formatted",
+    "Top-5 Max_formatted",
+    "Weighted_formatted",
+    "Unweighted_formatted",
+    "Rank-Aware_formatted",
+]
+
+phrase_table_display_df = phrase_table_df[display_cols].copy()
+display(phrase_table_display_df)
+
+latex_df = phrase_table_display_df.rename(columns={
+    "Top-1_formatted": "Top-1",
+    "Top-5 Max_formatted": "Top-5 Max",
+    "Weighted_formatted": "Weighted",
+    "Unweighted_formatted": "Unweighted",
+    "Rank-Aware_formatted": "Rank-Aware",
+})
+
+latex_str = latex_df.to_latex(index=False, escape=False)
+
+with open(PHRASE_TABLE_LATEX_TXT, "w") as f:
+    f.write(latex_str)
+
+print("Saved phrase table CSV:", PHRASE_TABLE_CSV)
+print("Saved LaTeX preview:", PHRASE_TABLE_LATEX_TXT)
+print(latex_str)
+
+# %%
+PHRASE_CENTRAL_PAIRWISE_CSV = os.path.join(TABLES_DIR, "phrase_centralized_pairwise_tests.csv")
+
+CENTRAL_PHRASE_PAIRS = [
+    "Centralized_vs_FedAvg",
+    "Centralized_vs_FedProx",
+    "Centralized_vs_SCAFFOLD",
+]
+
+CENTRAL_PHRASE_COMPARISONS = [
+    ("Centralized_vs_SCAFFOLD", "Centralized_vs_FedAvg"),
+    ("Centralized_vs_SCAFFOLD", "Centralized_vs_FedProx"),
+    ("Centralized_vs_FedProx", "Centralized_vs_FedAvg"),
+]
+
+def cohens_dz_from_diff(diff):
+    diff = pd.Series(diff).dropna().astype(float).to_numpy()
+    if len(diff) < 2:
+        return np.nan
+    sd = np.std(diff, ddof=1)
+    if sd <= 1e-12:
+        return np.nan
+    return float(np.mean(diff) / sd)
+
+test_rows = []
+
+central_phrase_df = phrase_seed_df[
+    phrase_seed_df["pair"].isin(CENTRAL_PHRASE_PAIRS)
+].copy()
+
+for metric in PHRASE_TABLE_METRICS:
+    pivot = central_phrase_df.pivot_table(
+        index="seed",
+        columns="pair",
+        values=metric,
+        aggfunc="mean",
+    )
+
+    for left, right in CENTRAL_PHRASE_COMPARISONS:
+        paired = pivot[[left, right]].dropna()
+
+        if len(paired) < 2:
+            test_rows.append({
+                "metric": metric,
+                "left": left,
+                "right": right,
+                "n": int(len(paired)),
+                "mean_left": np.nan,
+                "mean_right": np.nan,
+                "mean_diff_left_minus_right": np.nan,
+                "t_value": np.nan,
+                "p_value": np.nan,
+                "cohens_dz": np.nan,
+            })
+            continue
+
+        diff = paired[left] - paired[right]
+        t_value, p_value = stats.ttest_rel(paired[left], paired[right], nan_policy="omit")
+
+        test_rows.append({
+            "metric": metric,
+            "metric_display": PHRASE_TABLE_DISPLAY.get(metric, metric),
+            "left": PAIR_DISPLAY.get(left, left),
+            "right": PAIR_DISPLAY.get(right, right),
+            "n": int(len(paired)),
+            "mean_left": float(paired[left].mean()),
+            "mean_right": float(paired[right].mean()),
+            "mean_diff_left_minus_right": float(diff.mean()),
+            "t_value": float(t_value),
+            "p_value": float(p_value),
+            "cohens_dz": cohens_dz_from_diff(diff),
+        })
+
+phrase_pairwise_df = pd.DataFrame(test_rows)
+
+if not phrase_pairwise_df.empty and HAS_STATSMODELS:
+    phrase_pairwise_df["p_value_holm"] = multipletests(
+        phrase_pairwise_df["p_value"].fillna(1.0),
+        method="holm",
+    )[1]
+else:
+    phrase_pairwise_df["p_value_holm"] = np.nan
+
+phrase_pairwise_df.to_csv(PHRASE_CENTRAL_PAIRWISE_CSV, index=False)
+
+print("Saved phrase paired tests:", PHRASE_CENTRAL_PAIRWISE_CSV)
+display(phrase_pairwise_df)
+
+# %% [markdown]
 # ## 20. Final Sanity Checks
 # 
 # This section checks that the statistical results are complete.
