@@ -1966,6 +1966,271 @@ plot_metric_all_methods(sens_all, "noniid", metric="pr_auc_macro", bw=False)
 # plot_metric_all_methods(sens_all, "noniid", metric="f1_macro", bw=True)
 
 # %%
+# %%
+# Publication-ready plotting for Figures 4 and 5
+# Figure 4: standard regime, R=100, E=3
+# Figure 5: communication-constrained regime, R=30, E=10
+
+import os
+import pandas as pd
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+# -----------------------------
+# Paths
+# -----------------------------
+
+STANDARD_TAG = "a05_l10_b085_min100_r100_e3"
+COMM_TAG     = "a05_l10_b085_min100_r30_e10"
+
+STANDARD_CSV = os.path.join(
+    KD_DIRS["baseline_fl_sensitivity"],
+    f"baseline_sensitivity_results_{STANDARD_TAG}.csv"
+)
+
+COMM_CSV = os.path.join(
+    KD_DIRS["baseline_fl_sensitivity"],
+    f"baseline_sensitivity_results_{COMM_TAG}.csv"
+)
+
+PAPER_FIG_DIR = ensure_dir(
+    os.path.join(KD_DIRS["baseline_fl_sensitivity"], "paper_figures")
+)
+
+standard_df = pd.read_csv(STANDARD_CSV)
+comm_df = pd.read_csv(COMM_CSV)
+
+print("Loaded standard:", STANDARD_CSV, "rows=", len(standard_df))
+print("Loaded communication-constrained:", COMM_CSV, "rows=", len(comm_df))
+print("Saving figures to:", PAPER_FIG_DIR)
+
+# -----------------------------
+# Shared style
+# -----------------------------
+
+METHOD_STYLE = {
+    "FedAvg": {
+        "color": "#2F6F9F",
+        "marker": "o",
+        "linestyle": "-",
+        "label": "FedAvg",
+    },
+    "FedProx": {
+        "color": "#B8753B",
+        "marker": "s",
+        "linestyle": "--",
+        "label": "FedProx",
+    },
+    "SCAFFOLD": {
+        "color": "#5F8F5F",
+        "marker": "^",
+        "linestyle": "-.",
+        "label": "SCAFFOLD",
+    },
+}
+
+def set_ieee_figure_style():
+    mpl.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+        "font.size": 9,
+
+        "axes.labelsize": 9,
+        "axes.titlesize": 9,
+        "axes.linewidth": 0.8,
+        "axes.edgecolor": "#263845",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "xtick.major.size": 3,
+        "ytick.major.size": 3,
+
+        "legend.fontsize": 7.5,
+        "legend.frameon": False,
+
+        "lines.linewidth": 2.1,
+        "lines.markersize": 5.4,
+
+        "grid.color": "#B8C2CC",
+        "grid.alpha": 0.22,
+        "grid.linewidth": 0.6,
+
+        "figure.dpi": 120,
+        "savefig.dpi": 600,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.04,
+
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    })
+
+def metric_label(metric: str) -> str:
+    labels = {
+        "f1_macro": "Macro-F1",
+        "f1_micro": "Micro-F1",
+        "pr_auc_macro": "Macro PR-AUC",
+        "pr_auc_micro": "Micro PR-AUC",
+        "auc_macro": "Macro AUC",
+        "auc_micro": "Micro AUC",
+    }
+    return labels.get(metric, metric.replace("_", " ").title())
+
+def plot_client_sensitivity_ieee(
+    df: pd.DataFrame,
+    metric: str,
+    output_name: str,
+    methods_order=None,
+    show: bool = True,
+    figure_title=None,
+):
+    set_ieee_figure_style()
+
+    if methods_order is None:
+        methods_order = ["FedAvg", "FedProx", "SCAFFOLD"]
+
+    plot_df = df.copy()
+    plot_df = plot_df.dropna(subset=[metric, "clients", "split", "method"])
+    methods_order = [m for m in methods_order if m in set(plot_df["method"])]
+
+    fig, axes = plt.subplots(
+        nrows=2,
+        ncols=1,
+        figsize=(3.55, 4.25),
+        sharex=True,
+        sharey=True,
+    )
+
+    split_specs = [
+        ("iid", "(a) IID partition"),
+        ("noniid", "(b) Non-IID partition"),
+    ]
+
+    y_min = float(plot_df[metric].min())
+    y_max = float(plot_df[metric].max())
+    y_pad = max((y_max - y_min) * 0.08, 0.002)
+
+    for ax, (split_key, panel_title) in zip(axes, split_specs):
+        d_split = plot_df[plot_df["split"] == split_key].copy()
+
+        for method in methods_order:
+            g = d_split[d_split["method"] == method].sort_values("clients")
+
+            if g.empty:
+                continue
+
+            style = METHOD_STYLE[method]
+
+            ax.plot(
+                g["clients"],
+                g[metric],
+                color=style["color"],
+                linestyle=style["linestyle"],
+                marker=style["marker"],
+                label=style["label"],
+                linewidth=2.1,
+                markersize=5.4,
+                markerfacecolor="white",
+                markeredgewidth=1.1,
+                markeredgecolor=style["color"],
+            )
+
+        ax.set_title(panel_title, fontsize=8.5, fontweight="bold", pad=3)
+        ax.set_ylabel(metric_label(metric))
+        ax.set_ylim(y_min - y_pad, y_max + y_pad)
+
+        ax.grid(True, axis="y")
+        ax.grid(True, axis="x", alpha=0.10)
+
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+        for spine in ["left", "bottom"]:
+            ax.spines[spine].set_color("#263845")
+            ax.spines[spine].set_linewidth(0.8)
+
+    axes[-1].set_xlabel("Number of Clients")
+
+    if figure_title is not None:
+        fig.suptitle(
+        figure_title,
+        fontsize=8.7,
+        fontweight="bold",
+        y=0.992
+    )
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=len(labels),
+        bbox_to_anchor=(0.5, 0.955),
+        columnspacing=1.2,
+        handlelength=2.2,
+        handletextpad=0.5,
+    )
+
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.965], h_pad=1.15)
+
+    pdf_path = os.path.join(PAPER_FIG_DIR, f"{output_name}.pdf")
+    png_path = os.path.join(PAPER_FIG_DIR, f"{output_name}.png")
+
+    fig.savefig(pdf_path)
+    fig.savefig(png_path, dpi=600)
+
+    print("Saved:")
+    print(" PDF:", pdf_path)
+    print(" PNG:", png_path)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig, (pdf_path, png_path)
+
+# -----------------------------
+# Generate paper figures
+# -----------------------------
+
+fig4, fig4_paths = plot_client_sensitivity_ieee(
+    standard_df,
+    metric="f1_macro",
+    output_name=f"Figure4_f1_standard_regime_{STANDARD_TAG}",
+    figure_title="Standard Federated Regime (100 Rounds, 3 Local Epochs)",
+)
+
+fig5, fig5_paths = plot_client_sensitivity_ieee(
+    comm_df,
+    metric="f1_macro",
+    output_name=f"Figure5_f1_communication_constrained_{COMM_TAG}",
+    figure_title="Communication-Constrained Regime (30 Rounds, 10 Local Epochs)",
+)
+
+# Optional companion PR-AUC versions, useful if needed later
+fig4_pr, fig4_pr_paths = plot_client_sensitivity_ieee(
+    standard_df,
+    metric="pr_auc_macro",
+    output_name=f"Figure4_pr_auc_standard_regime_{STANDARD_TAG}",
+    figure_title="Standard Federated Regime (100 Rounds, 3 Local Epochs)",
+    show=False,
+)
+
+fig5_pr, fig5_pr_paths = plot_client_sensitivity_ieee(
+    comm_df,
+    metric="pr_auc_macro",
+    output_name=f"Figure5_pr_auc_communication_constrained_{COMM_TAG}",
+    figure_title="Communication-Constrained Regime (30 Rounds, 10 Local Epochs)",
+    show=False,
+)
+
+# %%
 # IID vs non-IID delta tables (non-IID minus IID)
 
 out_csv = BASELINE_SENS_CSV
@@ -2138,7 +2403,7 @@ print("\n=== Pivot: Δ PR-AUC Macro ===")
 display(pivot_delta_pr)
 
 # %% [markdown]
-# ## Knowledge Distillation Extensions (Option 1 and Option 3)
+# # Knowledge Distillation Extensions (Option 1 and Option 3)
 # 
 # This section adds two KD-based federated training variants for the multi-label ICD task:
 # 
@@ -3060,102 +3325,102 @@ KD_METHODS = [
 out_path = os.path.join(KD_HISTORY_DIR, "kd_client_sweep_results_r10_e1.csv")
 
 # %%
-# # Sweep runner with resume / skip-completed support
+# Sweep runner with resume / skip-completed support
 
-# if os.path.exists(out_path):
-#     kd_sweep_df_existing = pd.read_csv(out_path)
-#     all_rows = kd_sweep_df_existing.to_dict(orient="records")
-#     completed_keys = set(
-#         zip(
-#             kd_sweep_df_existing["split"],
-#             kd_sweep_df_existing["method_name"],
-#             kd_sweep_df_existing["clients"]
-#         )
-#     )
-#     print(f"Found existing results at {out_path}")
-#     print(f"Loaded {len(kd_sweep_df_existing)} completed rows.")
-# else:
-#     all_rows = []
-#     completed_keys = set()
-#     print("No existing results found. Starting fresh.")
+if os.path.exists(out_path):
+    kd_sweep_df_existing = pd.read_csv(out_path)
+    all_rows = kd_sweep_df_existing.to_dict(orient="records")
+    completed_keys = set(
+        zip(
+            kd_sweep_df_existing["split"],
+            kd_sweep_df_existing["method_name"],
+            kd_sweep_df_existing["clients"]
+        )
+    )
+    print(f"Found existing results at {out_path}")
+    print(f"Loaded {len(kd_sweep_df_existing)} completed rows.")
+else:
+    all_rows = []
+    completed_keys = set()
+    print("No existing results found. Starting fresh.")
 
-# for split_mode in ["iid", "noniid"]:
-#     for m in KD_METHODS:
-#         for k in client_counts:
-#             run_key = (split_mode, m["method_name"], k)
+for split_mode in ["iid", "noniid"]:
+    for m in KD_METHODS:
+        for k in client_counts:
+            run_key = (split_mode, m["method_name"], k)
 
-#             if run_key in completed_keys:
-#                 print(f"Skipping completed run: {split_mode} | {m['method_name']} | K={k}")
-#                 continue
+            if run_key in completed_keys:
+                print(f"Skipping completed run: {split_mode} | {m['method_name']} | K={k}")
+                continue
 
-#             print(f"\n=== {split_mode.upper()} | {m['method_name']} | K={k} ===")
+            print(f"\n=== {split_mode.upper()} | {m['method_name']} | K={k} ===")
 
-#             try:
-#                 metrics, elapsed = run_fl_kd_once(
-#                     split_mode=split_mode,
-#                     num_clients=k,
-#                     local_epochs=1,   # or 3 if you want the heavier final setting
-#                     config=sweep_config,
-#                     kd_config=kd_config,
-#                     train_dataset=train_dataset,
-#                     val_loader=val_loader,
-#                     test_loader=test_loader,
-#                     device=device,
-#                     seed=42,
-#                     method=m["method"],
-#                     base_algo=m["base_algo"],
-#                     mu=m["mu"],
-#                     server_distill=m["server_distill"],
-#                     **(noniid_params if split_mode == "noniid" else {})
-#                 )
+            try:
+                metrics, elapsed = run_fl_kd_once(
+                    split_mode=split_mode,
+                    num_clients=k,
+                    local_epochs=1,   # or 3 if you want the heavier final setting
+                    config=sweep_config,
+                    kd_config=kd_config,
+                    train_dataset=train_dataset,
+                    val_loader=val_loader,
+                    test_loader=test_loader,
+                    device=device,
+                    seed=42,
+                    method=m["method"],
+                    base_algo=m["base_algo"],
+                    mu=m["mu"],
+                    server_distill=m["server_distill"],
+                    **(noniid_params if split_mode == "noniid" else {})
+                )
 
-#                 row = {
-#                     "split": split_mode,
-#                     "clients": k,
+                row = {
+                    "split": split_mode,
+                    "clients": k,
 
-#                     "method_name": m["method_name"],
-#                     "method": m["method"],
-#                     "base_algo": m["base_algo"],
-#                     "mu": m["mu"],
-#                     "server_distill": m["server_distill"],
+                    "method_name": m["method_name"],
+                    "method": m["method"],
+                    "base_algo": m["base_algo"],
+                    "mu": m["mu"],
+                    "server_distill": m["server_distill"],
 
-#                     "local_epochs": 1,
-#                     "rounds": sweep_config["rounds"],
+                    "local_epochs": 1,
+                    "rounds": sweep_config["rounds"],
 
-#                     "kd_alpha": kd_config["kd_alpha"],
-#                     "kd_temperature": kd_config["kd_temperature"],
-#                     "server_distill_steps": kd_config.get("server_distill_steps", None),
-#                     "server_distill_lr": kd_config.get("server_distill_lr", None),
+                    "kd_alpha": kd_config["kd_alpha"],
+                    "kd_temperature": kd_config["kd_temperature"],
+                    "server_distill_steps": kd_config.get("server_distill_steps", None),
+                    "server_distill_lr": kd_config.get("server_distill_lr", None),
 
-#                     "f1_macro": metrics.get("f1_macro"),
-#                     "f1_micro": metrics.get("f1_micro"),
-#                     "pr_auc_macro": metrics.get("pr_auc_macro"),
-#                     "pr_auc_micro": metrics.get("pr_auc_micro"),
-#                     "auc_macro": metrics.get("auc_macro"),
-#                     "auc_micro": metrics.get("auc_micro"),
-#                     "best_f1_micro": metrics.get("best_f1_micro"),
-#                     "best_thr": metrics.get("best_thr"),
+                    "f1_macro": metrics.get("f1_macro"),
+                    "f1_micro": metrics.get("f1_micro"),
+                    "pr_auc_macro": metrics.get("pr_auc_macro"),
+                    "pr_auc_micro": metrics.get("pr_auc_micro"),
+                    "auc_macro": metrics.get("auc_macro"),
+                    "auc_micro": metrics.get("auc_micro"),
+                    "best_f1_micro": metrics.get("best_f1_micro"),
+                    "best_thr": metrics.get("best_thr"),
 
-#                     "time_sec": elapsed,
-#                 }
+                    "time_sec": elapsed,
+                }
 
-#                 if split_mode == "noniid":
-#                     row.update(noniid_params)
+                if split_mode == "noniid":
+                    row.update(noniid_params)
 
-#                 all_rows.append(row)
-#                 completed_keys.add(run_key)
+                all_rows.append(row)
+                completed_keys.add(run_key)
 
-#                 pd.DataFrame(all_rows).to_csv(out_path, index=False)
-#                 print(f"Saved result to {out_path}")
+                pd.DataFrame(all_rows).to_csv(out_path, index=False)
+                print(f"Saved result to {out_path}")
 
-#             except Exception as e:
-#                 print(f"FAILED: {split_mode} | {m['method_name']} | K={k}")
-#                 print(f"Reason: {e}")
+            except Exception as e:
+                print(f"FAILED: {split_mode} | {m['method_name']} | K={k}")
+                print(f"Reason: {e}")
 
-# print(f"\nSweep finished. Results saved to: {out_path}")
+print(f"\nSweep finished. Results saved to: {out_path}")
 
-# kd_sweep_df = pd.DataFrame(all_rows)
-# display(kd_sweep_df.head())
+kd_sweep_df = pd.DataFrame(all_rows)
+display(kd_sweep_df.head())
 
 # %%
 # Reload saved CSV later if needed

@@ -3465,6 +3465,217 @@ plot_final_noniid_presentation(final_opt3_noniid_df, metric="f1_macro")
 print("Generating Final Non-IID Plot for PR-AUC Macro...")
 plot_final_noniid_presentation(final_opt3_noniid_df, metric="pr_auc_macro")
 
+# %%
+# %%
+# Publication-ready Figure 7: Heterogeneous KD under Non-IID conditions
+
+import os
+import pandas as pd
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+# -----------------------------
+# Load final non-IID results
+# -----------------------------
+
+final_opt3_noniid_df = pd.read_csv(KD_HET_FINAL_NONIID_CSV)
+print("Loaded:", KD_HET_FINAL_NONIID_CSV, "rows=", len(final_opt3_noniid_df))
+
+FIG7_DIR = ensure_dir(os.path.join(HET_KD_FINAL_DIR, "paper_figures"))
+print("Saving Figure 7 outputs to:", FIG7_DIR)
+
+# -----------------------------
+# Shared journal-style settings
+# -----------------------------
+
+METHOD_STYLE_FIG7 = {
+    "Baseline_FedAvg": {
+        "color": "#263845",
+        "marker": "o",
+        "linestyle": "-",
+        "linewidth": 2.35,
+        "label": "Baseline FedAvg",
+        "zorder": 3,
+    },
+    "Opt3_StrongHeterogeneous_Tuned": {
+        "color": "#2F6F9F",
+        "marker": "s",
+        "linestyle": "--",
+        "linewidth": 2.15,
+        "label": "Heterogeneous KD",
+        "zorder": 4,
+    },
+    "Opt3_StrongHeterogeneous_Tuned_SD": {
+        "color": "#5F8F5F",
+        "marker": "^",
+        "linestyle": "-.",
+        "linewidth": 2.15,
+        "label": "KD + Server Distill.",
+        "zorder": 4,
+    },
+}
+
+def set_ieee_figure_style():
+    mpl.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+        "font.size": 9,
+
+        "axes.labelsize": 9,
+        "axes.titlesize": 9,
+        "axes.linewidth": 0.8,
+        "axes.edgecolor": "#263845",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "xtick.major.size": 3,
+        "ytick.major.size": 3,
+
+        "legend.fontsize": 7.3,
+        "legend.frameon": False,
+
+        "grid.color": "#B8C2CC",
+        "grid.alpha": 0.22,
+        "grid.linewidth": 0.6,
+
+        "figure.dpi": 120,
+        "savefig.dpi": 600,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.04,
+
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    })
+
+def metric_label(metric: str) -> str:
+    labels = {
+        "f1_macro": "Macro-F1",
+        "f1_micro": "Micro-F1",
+        "pr_auc_macro": "Macro PR-AUC",
+        "pr_auc_micro": "Micro PR-AUC",
+        "auc_macro": "Macro AUC",
+        "auc_micro": "Micro AUC",
+    }
+    return labels.get(metric, metric.replace("_", " ").title())
+
+def plot_heterogeneous_kd_noniid_ieee(
+    df: pd.DataFrame,
+    metric: str = "f1_macro",
+    output_name: str = "Figure7_heterogeneous_kd_noniid",
+    show: bool = True,
+):
+    set_ieee_figure_style()
+
+    methods = [
+        "Baseline_FedAvg",
+        "Opt3_StrongHeterogeneous_Tuned",
+        "Opt3_StrongHeterogeneous_Tuned_SD",
+    ]
+
+    plot_df = df.copy()
+    plot_df = plot_df.dropna(subset=[metric, "clients", "method_name"])
+
+    fig, ax = plt.subplots(figsize=(4.1, 2.95))
+
+    for method in methods:
+        g = plot_df[plot_df["method_name"] == method].sort_values("clients")
+
+        if g.empty:
+            print(f"Warning: no rows found for {method}; skipping.")
+            continue
+
+        style = METHOD_STYLE_FIG7[method]
+
+        ax.plot(
+            g["clients"],
+            g[metric],
+            color=style["color"],
+            linestyle=style["linestyle"],
+            marker=style["marker"],
+            linewidth=style["linewidth"],
+            markersize=5.4,
+            markerfacecolor="white",
+            markeredgewidth=1.1,
+            markeredgecolor=style["color"],
+            label=style["label"],
+            zorder=style["zorder"],
+        )
+
+    y_min = float(plot_df[metric].min())
+    y_max = float(plot_df[metric].max())
+    y_pad = max((y_max - y_min) * 0.10, 0.002)
+
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+    ax.set_xlabel("Number of Hospital Clients")
+    ax.set_ylabel(metric_label(metric))
+    ax.set_title(
+        "Non-IID Heterogeneous Collaboration",
+        fontsize=8.8,
+        fontweight="bold",
+        pad=4,
+    )
+
+    valid_clients = sorted(plot_df["clients"].unique())
+    ax.set_xticks(valid_clients)
+
+    ax.grid(True, axis="y")
+    ax.grid(True, axis="x", alpha=0.10)
+
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#263845")
+        ax.spines[spine].set_linewidth(0.8)
+
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.24),
+        ncol=3,
+        handlelength=1.8,
+        handletextpad=0.4,
+        columnspacing=1.0,
+        borderaxespad=0.0,
+    )
+
+    fig.tight_layout(rect=[0.0, 0.05, 1.0, 0.97])
+
+    pdf_path = os.path.join(FIG7_DIR, f"{output_name}.pdf")
+    png_path = os.path.join(FIG7_DIR, f"{output_name}.png")
+
+    fig.savefig(pdf_path)
+    fig.savefig(png_path, dpi=600)
+
+    print("Saved:")
+    print(" PDF:", pdf_path)
+    print(" PNG:", png_path)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig, (pdf_path, png_path)
+
+# Primary Figure 7
+fig7, fig7_paths = plot_heterogeneous_kd_noniid_ieee(
+    final_opt3_noniid_df,
+    metric="f1_macro",
+    output_name="Figure7_f1_heterogeneous_kd_noniid",
+)
+
+# Optional companion PR-AUC version
+fig7_pr, fig7_pr_paths = plot_heterogeneous_kd_noniid_ieee(
+    final_opt3_noniid_df,
+    metric="pr_auc_macro",
+    output_name="Figure7_pr_auc_heterogeneous_kd_noniid",
+)
+
 # %% [markdown]
 # ### Final IID Sweep
 
@@ -3488,95 +3699,95 @@ else:
     print("No existing final IID results found. Starting fresh.")
 
 # %%
-# Uncomment to run the final IID sweep.
+# # Uncomment to run the final IID sweep.
 
-for m in FINAL_HET_METHODS:
-    for k in final_client_counts:
-        run_key = (m["method_name"], k)
+# for m in FINAL_HET_METHODS:
+#     for k in final_client_counts:
+#         run_key = (m["method_name"], k)
 
-        if run_key in final_iid_completed:
-            print(f"Skipping completed run: {m['method_name']} | K={k}")
-            continue
+#         if run_key in final_iid_completed:
+#             print(f"Skipping completed run: {m['method_name']} | K={k}")
+#             continue
 
-        print("\n" + "=" * 100)
-        print(f"FINAL IID | {m['method_name']} | K={k}")
-        print("=" * 100)
+#         print("\n" + "=" * 100)
+#         print(f"FINAL IID | {m['method_name']} | K={k}")
+#         print("=" * 100)
 
-        try:
-            metrics, elapsed = run_fl_kd_once(
-                split_mode="iid",
-                num_clients=k,
-                local_epochs=final_local_epochs,
-                config=final_config,
-                kd_config=final_opt3_kd_config,
-                train_dataset=train_dataset,
-                val_loader=val_loader,
-                test_loader=test_loader,
-                device=device,
-                seed=42,
-                method=m["method"],
-                base_algo=m["base_algo"],
-                mu=m["mu"],
-                server_distill=m["server_distill"]
-            )
+#         try:
+#             metrics, elapsed = run_fl_kd_once(
+#                 split_mode="iid",
+#                 num_clients=k,
+#                 local_epochs=final_local_epochs,
+#                 config=final_config,
+#                 kd_config=final_opt3_kd_config,
+#                 train_dataset=train_dataset,
+#                 val_loader=val_loader,
+#                 test_loader=test_loader,
+#                 device=device,
+#                 seed=42,
+#                 method=m["method"],
+#                 base_algo=m["base_algo"],
+#                 mu=m["mu"],
+#                 server_distill=m["server_distill"]
+#             )
 
-            row = {
-                "split": "iid",
-                "clients": k,
+#             row = {
+#                 "split": "iid",
+#                 "clients": k,
 
-                "method_name": m["method_name"],
-                "method": m["method"],
-                "base_algo": m["base_algo"],
-                "mu": m["mu"],
-                "server_distill": m["server_distill"],
+#                 "method_name": m["method_name"],
+#                 "method": m["method"],
+#                 "base_algo": m["base_algo"],
+#                 "mu": m["mu"],
+#                 "server_distill": m["server_distill"],
 
-                "local_epochs": final_local_epochs,
-                "rounds": final_config["rounds"],
+#                 "local_epochs": final_local_epochs,
+#                 "rounds": final_config["rounds"],
 
-                "kd_alpha": final_opt3_kd_config["kd_alpha"],
-                "kd_temperature": final_opt3_kd_config["kd_temperature"],
-                "teacher_pool_name": final_opt3_kd_config["teacher_pool_name"],
-                "teacher_assignment": final_opt3_kd_config.get("teacher_assignment", None),
-                "teacher_steps_per_batch": final_opt3_kd_config.get("teacher_steps_per_batch", None),
-                "server_distill_steps": (
-                    final_opt3_kd_config["server_distill_steps"] if m["server_distill"] else None
-                ),
-                "server_distill_lr": (
-                    final_opt3_kd_config["server_distill_lr"] if m["server_distill"] else None
-                ),
+#                 "kd_alpha": final_opt3_kd_config["kd_alpha"],
+#                 "kd_temperature": final_opt3_kd_config["kd_temperature"],
+#                 "teacher_pool_name": final_opt3_kd_config["teacher_pool_name"],
+#                 "teacher_assignment": final_opt3_kd_config.get("teacher_assignment", None),
+#                 "teacher_steps_per_batch": final_opt3_kd_config.get("teacher_steps_per_batch", None),
+#                 "server_distill_steps": (
+#                     final_opt3_kd_config["server_distill_steps"] if m["server_distill"] else None
+#                 ),
+#                 "server_distill_lr": (
+#                     final_opt3_kd_config["server_distill_lr"] if m["server_distill"] else None
+#                 ),
 
-                "f1_macro": metrics.get("f1_macro"),
-                "f1_micro": metrics.get("f1_micro"),
-                "pr_auc_macro": metrics.get("pr_auc_macro"),
-                "pr_auc_micro": metrics.get("pr_auc_micro"),
-                "auc_macro": metrics.get("auc_macro"),
-                "auc_micro": metrics.get("auc_micro"),
-                "best_f1_micro": metrics.get("best_f1_micro"),
-                "best_thr": metrics.get("best_thr"),
+#                 "f1_macro": metrics.get("f1_macro"),
+#                 "f1_micro": metrics.get("f1_micro"),
+#                 "pr_auc_macro": metrics.get("pr_auc_macro"),
+#                 "pr_auc_micro": metrics.get("pr_auc_micro"),
+#                 "auc_macro": metrics.get("auc_macro"),
+#                 "auc_micro": metrics.get("auc_micro"),
+#                 "best_f1_micro": metrics.get("best_f1_micro"),
+#                 "best_thr": metrics.get("best_thr"),
 
-                "student_param_count": metrics.get("student_param_count"),
-                "teacher_param_count_mean": metrics.get("teacher_param_count_mean"),
-                "teacher_param_count_min": metrics.get("teacher_param_count_min"),
-                "teacher_param_count_max": metrics.get("teacher_param_count_max"),
+#                 "student_param_count": metrics.get("student_param_count"),
+#                 "teacher_param_count_mean": metrics.get("teacher_param_count_mean"),
+#                 "teacher_param_count_min": metrics.get("teacher_param_count_min"),
+#                 "teacher_param_count_max": metrics.get("teacher_param_count_max"),
 
-                "time_sec": elapsed,
-            }
+#                 "time_sec": elapsed,
+#             }
 
-            final_iid_rows.append(row)
-            final_iid_completed.add(run_key)
+#             final_iid_rows.append(row)
+#             final_iid_completed.add(run_key)
 
-            save_dict_rows_to_csv(final_iid_rows, KD_HET_FINAL_IID_CSV)
-            save_json(
-                {"rows": [to_serializable_row(r) for r in final_iid_rows]},
-                KD_HET_FINAL_IID_JSON
-            )
+#             save_dict_rows_to_csv(final_iid_rows, KD_HET_FINAL_IID_CSV)
+#             save_json(
+#                 {"rows": [to_serializable_row(r) for r in final_iid_rows]},
+#                 KD_HET_FINAL_IID_JSON
+#             )
 
-            print(f"Saved result to {KD_HET_FINAL_IID_CSV}")
-            print(f"Saved result to {KD_HET_FINAL_IID_JSON}")
+#             print(f"Saved result to {KD_HET_FINAL_IID_CSV}")
+#             print(f"Saved result to {KD_HET_FINAL_IID_JSON}")
 
-        except Exception as e:
-            print(f"FAILED: {m['method_name']} | K={k}")
-            print(f"Reason: {e}")
+#         except Exception as e:
+#             print(f"FAILED: {m['method_name']} | K={k}")
+#             print(f"Reason: {e}")
 
 # %%
 final_opt3_iid_df = pd.read_csv(KD_HET_FINAL_IID_CSV)

@@ -905,7 +905,7 @@ FED_THRESHOLDS_PT = FED_PATHS["thresholds_pt"]
 fed_local_loss_rows = []
 fed_eval_rows = []
 
-resume_fed = False
+resume_fed = True
 start_round = 0
 
 if (
@@ -1201,7 +1201,7 @@ CENTRAL_THRESHOLDS_PT = CENTRAL_PATHS["thresholds_pt"]
 central_train_rows = []
 central_eval_rows = []
 
-resume_central = False
+resume_central = True
 start_round = 0
 
 if (
@@ -1625,6 +1625,197 @@ val_loss, metrics = eval_model(
     alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
     gamma=central_config["gamma"]
 )
+
+# %%
+# %%
+# Publication-ready Figure 6: Sigmoid output distribution under BCE training
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+from scipy.stats import gaussian_kde
+
+# -----------------------------
+# Evaluate model + thresholds
+# -----------------------------
+
+macro_f1, per_label_thr = find_best_thresholds_per_label(
+    central_model,
+    val_loader,
+    device
+)
+
+# Do NOT use sigmoid=True here, because eval_model's built-in histogram is draft style.
+val_loss, metrics = eval_model(
+    central_model,
+    device,
+    val_loader,
+    per_label_thr=per_label_thr,
+    sigmoid=False,
+    use_focal=central_config["use_focal"],
+    alpha=torch.clamp(pos_weight / pos_weight.max(), min=0.1, max=0.9).to(device),
+    gamma=central_config["gamma"]
+)
+
+# -----------------------------
+# Collect sigmoid probabilities
+# -----------------------------
+
+@torch.no_grad()
+def collect_sigmoid_outputs(model, data_loader, device):
+    model.eval()
+    model.to(device)
+
+    probs = []
+
+    for X_batch, _ in data_loader:
+        X_batch = X_batch.to(device)
+        logits, _ = model(X_batch)
+        probs.append(torch.sigmoid(logits).detach().cpu())
+
+    return torch.cat(probs, dim=0).numpy().ravel()
+
+sigmoid_probs = collect_sigmoid_outputs(
+    central_model,
+    val_loader,
+    device
+)
+
+# Optional: save raw values for reproducibility
+FIGURE6_DIR = ensure_dir(os.path.join(OUTPUT_DIR, "paper_figures"))
+figure6_values_csv = os.path.join(FIGURE6_DIR, "Figure6_sigmoid_output_values.csv")
+
+pd.DataFrame({"sigmoid_probability": sigmoid_probs}).to_csv(
+    figure6_values_csv,
+    index=False
+)
+
+print("Saved Figure 6 values:", figure6_values_csv)
+
+# -----------------------------
+# Shared IEEE-style plot settings
+# -----------------------------
+
+mpl.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+    "font.size": 9,
+
+    "axes.labelsize": 9,
+    "axes.titlesize": 9,
+    "axes.linewidth": 0.8,
+    "axes.edgecolor": "#263845",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "xtick.direction": "out",
+    "ytick.direction": "out",
+
+    "legend.fontsize": 7.5,
+    "legend.frameon": False,
+
+    "grid.color": "#B8C2CC",
+    "grid.alpha": 0.22,
+    "grid.linewidth": 0.6,
+
+    "figure.dpi": 120,
+    "savefig.dpi": 600,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.04,
+
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
+# -----------------------------
+# Plot polished histogram
+# -----------------------------
+
+fig, ax = plt.subplots(figsize=(3.45, 2.55))
+
+bins = np.linspace(0.0, 1.0, 55)
+
+counts, bin_edges, _ = ax.hist(
+    sigmoid_probs,
+    bins=bins,
+    color="#2F6F9F",
+    alpha=0.48,
+    edgecolor="white",
+    linewidth=0.35,
+    label="Sigmoid outputs",
+)
+
+# KDE overlay scaled to histogram counts
+# Use a subsample if needed to keep KDE fast.
+rng = np.random.default_rng(42)
+kde_sample = sigmoid_probs
+
+if len(kde_sample) > 50000:
+    kde_sample = rng.choice(kde_sample, size=50000, replace=False)
+
+x_grid = np.linspace(0.0, 1.0, 400)
+# kde = gaussian_kde(kde_sample)
+# bin_width = bin_edges[1] - bin_edges[0]
+# kde_counts = kde(x_grid) * len(sigmoid_probs) * bin_width
+
+# ax.plot(
+#     x_grid,
+#     kde_counts,
+#     color="#263845",
+#     linewidth=1.8,
+#     label="Smoothed density",
+# )
+
+# Optional visual cue for common global threshold
+ax.axvline(
+    0.5,
+    color="#B8753B",
+    linestyle="--",
+    linewidth=1.2,
+    alpha=0.85,
+    label="0.5 threshold",
+)
+
+ax.set_yscale("log")
+ax.set_xlabel("Predicted Probability")
+ax.set_ylabel("Count (log scale)")
+ax.set_title("Sigmoid Output Distribution", fontsize=9, fontweight="bold", pad=4)
+
+ax.set_xlim(0.0, 1.0)
+ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
+ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+
+ax.grid(True, axis="y")
+ax.grid(True, axis="x", alpha=0.10)
+
+for spine in ["left", "bottom"]:
+    ax.spines[spine].set_color("#263845")
+    ax.spines[spine].set_linewidth(0.8)
+
+ax.legend(
+    loc="upper right",
+    # handlelength=1.8,
+    # handletextpad=0.5,
+)
+
+fig.tight_layout()
+
+figure6_pdf = os.path.join(FIGURE6_DIR, "Figure6_sigmoid_output_distribution.pdf")
+figure6_png = os.path.join(FIGURE6_DIR, "Figure6_sigmoid_output_distribution.png")
+
+fig.savefig(figure6_pdf)
+fig.savefig(figure6_png, dpi=600)
+
+print("Saved:")
+print(" PDF:", figure6_pdf)
+print(" PNG:", figure6_png)
+
+plt.show()
 
 # %%
 print("Per-label thresholds:\n", per_label_thr)
